@@ -26,7 +26,9 @@ Each package is fed its output location the way the real one is:
 Every location above has to be absolute (Cinema 4D takes none). A relative
 path resolves against the renderer's own working directory, and this app does
 not get to assume what that is, so a relative output path is refused with
-exit 20.
+exit 20. Blender's `-o` has to carry a `#` run as well: without one the frame
+number is appended to the string it was given, which is how a folder handed
+over as an output path turns into `<folder>0001.png`.
 
 Scene files are JSON, exactly like a real scene carries its own settings:
 
@@ -142,10 +144,14 @@ def parse_blender(argv):
         fail(EXIT_BAD_COMMAND,
              f'Error: --render-output is relative, so it resolves against the renderer '
              f'cwd and not the caller: {options["output"]!r}')
+    if '#' not in os.path.basename(options['output']):
+        fail(EXIT_BAD_COMMAND,
+             f'Error: --render-output has no # frame placeholder, so the frame number '
+             f'would be appended to the path itself: {options["output"]!r}')
 
     start = int(options.get('start', 1))
     end = int(options.get('end', options.get('single', start)))
-    return project, options['output'], None, start, end
+    return project, options['output'], os.path.dirname(options['output']), start, end
 
 
 MEL_VALUE = re.compile(r'"((?:\\.|[^"\\])*)"')
@@ -323,21 +329,28 @@ def render(dcc, project, output, output_dir, start, last, scene):
         time.sleep(float(scene.get('hang_seconds', 3600)))
         sys.exit(EXIT_OK)
 
-    # A bare output name with no folder in it means "write where I am running" -
-    # that is what dirname() of one really hands a batch renderer.
-    directory = (scene.get('output_dir') or output_dir
+    # Where the frames go. Whatever the command line carried wins over the scene,
+    # because the command line is the thing under test; Cinema 4D's carries
+    # nothing, so its own scene settings decide, which is how it really behaves.
+    # A bare output name has no folder in it, and that means "write here".
+    directory = (output_dir or scene.get('output_dir')
                  or os.path.dirname(output or '') or os.getcwd())
-    if not directory:
-        fail(EXIT_MISSING_SCENE_VALUE,
-             f'Error: {NAMES[dcc]} was given nowhere to write frames')
     if not os.path.isdir(directory):
         fail(EXIT_NO_OUTPUT_DIR, f'Error: output directory does not exist: {directory}')
 
-    # Cinema 4D and Unreal get no output name on the command line at all, so the
-    # scene supplies it, the way their own render-queue settings would.
-    stem = scene.get('prefix') or (os.path.splitext(os.path.basename(output))[0]
-                                   if output else 'frame')
+    # Blender puts the frame number where the # run is, so the name in the file
+    # is the text in front of it. Cinema 4D and Unreal get no output name on the
+    # command line at all, so their scene supplies it, the way their own
+    # render-queue settings would.
     suffix = 'exr' if scene.get('format') == 'exr' else 'png'
+    if dcc == 'blender':
+        hashes = re.search(r'#+', os.path.basename(output))
+        head = os.path.basename(output[:output.rindex(hashes.group(0))])
+        digits = len(hashes.group(0))
+    else:
+        head = (scene.get('prefix') or (os.path.splitext(os.path.basename(output))[0]
+                                        if output else 'frame')) + '_'
+        digits = 4
     report = log_error if scene.get('stderr_progress') else log
     for position, frame in enumerate(frames, start=1):
         if not scene.get('silent'):
@@ -348,7 +361,7 @@ def render(dcc, project, output, output_dir, start, last, scene):
             log(f'Log: shading frame {frame} ' + 'x' * 200)
             log_error(f'Warning: sample discarded ' + 'x' * 200)
         if scene.get('write_files', True):
-            path = os.path.join(directory, f'{stem}_{frame:04d}.{suffix}')
+            path = os.path.join(directory, f'{head}{frame:0{digits}d}.{suffix}')
             with open(path, 'wb') as handle:
                 handle.write(b'\x89PNG\r\n\x1a\n' + json.dumps(
                     {'dcc': dcc, 'project': os.path.basename(project),

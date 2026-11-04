@@ -10,6 +10,7 @@ from typing import List, Dict, Optional, Tuple, Callable
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+import time
 import logging
 
 import cv2
@@ -18,8 +19,14 @@ from PIL import Image, ImageDraw, ImageFont
 import trimesh
 
 from ..core.models import PostProcessingSettings, RenderJob
+from .render_engines import frame_stem, output_spec
 
 logger = logging.getLogger(__name__)
+
+# How old a `renderfox_*` entry in the system temp folder has to be before a
+# cleanup sweep may delete it. Every RenderFox window shares one temp folder, and
+# a sweep without this age deletes the scratch directory of a render running now.
+STALE_TEMP_SECONDS = 24 * 3600
 
 
 @dataclass
@@ -374,7 +381,7 @@ class FileOrganizer:
             parts.append(date_part)
         
         if settings.create_subfolders:
-            parts.append(job.name)
+            parts.append(frame_stem(job.name))
         
         if settings.organize_by_format:
             file_ext = os.path.splitext(file_path)[1][1:].lower()
@@ -403,7 +410,7 @@ class FileOrganizer:
                 pass
         
         format_vars = {
-            'job_name': job.name,
+            'job_name': frame_stem(job.name),
             'timestamp': timestamp,
             'frame': frame_num,
             'width': job.resolution[0],
@@ -574,7 +581,7 @@ class PostProcessor:
             if settings.auto_organize and not cancelled():
                 report(90, "Organizing files...")
                 organized_files = self.organizer.organize_files(
-                    output_files, job.output_path, job, settings
+                    output_files, output_spec(job)[0], job, settings
                 )
                 processed_files.extend(organized_files)
                 completed_steps += len(organized_files)
@@ -598,7 +605,7 @@ class PostProcessor:
                 report(99, "Archiving old files...")
                 try:
                     archived_count = self.organizer.archive_old_files(
-                        os.path.dirname(job.output_path) or job.output_path,
+                        output_spec(job)[0],
                         settings.archive_after_days,
                         settings.compress_archives
                     )
@@ -836,7 +843,7 @@ class PostProcessor:
         """Clean up temporary files created during processing."""
         try:
             # Clean up job-specific temp files
-            temp_dir = os.path.join(os.path.dirname(job.output_path) or job.output_path, "temp")
+            temp_dir = os.path.join(output_spec(job)[0], "temp")
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
             
@@ -846,9 +853,18 @@ class PostProcessor:
             
             # Look for RenderFox temp files
             system_temp = tempfile.gettempdir()
+            cutoff = time.time() - STALE_TEMP_SECONDS
+            temp_files = []
             for filename in os.listdir(system_temp):
-                if filename.startswith("renderfox_"):
-                    temp_files.append(os.path.join(system_temp, filename))
+                if not filename.startswith("renderfox_"):
+                    continue
+                candidate = os.path.join(system_temp, filename)
+                try:
+                    if os.path.getmtime(candidate) >= cutoff:
+                        continue
+                except OSError:
+                    continue
+                temp_files.append(candidate)
             
             for temp_file in temp_files:
                 try:

@@ -80,6 +80,12 @@ SUITES = [
         "description": "Drives the real JobManager thread against the mock renderers: configured engines are discovered, a queued job renders with live progress, stop returns it to pending"
     },
     {
+        "id": "postprocessor_paths",
+        "name": "Post-Processing Output Folder",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],
+        "description": "Requires organizing, archiving and temp cleanup to stay inside the job's output folder and to survive a job name containing slashes or colons"
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

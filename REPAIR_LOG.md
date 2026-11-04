@@ -15,24 +15,40 @@
 
 ## Code size (for reference)
 
+Counted over `git ls-files "*.py"` - tracked source only, so build output, vendored
+binaries and `patch_script/` are not in it. "Raw" is every line; "Code" skips
+blank lines and whole-line comments, and is the honest answer to "how many lines
+did you write" because a docstring counts as code here.
+
 | Bucket | Files | Raw | Code |
 |---|---|---|---|
-| `src/` | 73 | 56,111 | 41,523 |
-| entry + tooling scripts | 5 | 545 | 421 |
+| `src/` at the pre-repair baseline (`1727f94`) | 73 | 56,111 | 41,523 |
+| `src/` now | 73 | 56,990 | 42,360 |
+| `tests/` (incl. `tests/mock_dcc/`) at baseline | 22 | 2,257 | 1,620 |
+| `tests/` now | 32 | 4,610 | 3,582 |
+| entry + tooling scripts at the root | 5 | 581 | ~450 |
 | `installer.nsi` + `RenderFox.spec` | 2 | 210 | 158 |
-| `tests/` | 22 | 2,257 | 1,620 |
 | dead code inside `src/` (to be deleted) | 10 | 6,081 | 4,624 |
 
-Claimable: ~56k raw / ~42k code lines. After dead-code removal: ~50k / ~37k.
+Headline for a README or a conversation: **~57k lines of application code in
+`src/` (~42k non-blank), plus ~4.6k of tests.** Say "application code" and
+"tests" separately - folding them together invites the reply "so half of it was
+generated?". The repair pass itself is +879 raw in `src/` and +2,353 in `tests/`
+(the mock renderers, the harness, the contract and mutation suites), which is
+the honest answer to "what did the AI write": the app, every tab and every
+feature are the user's; the harness and the fixes are the difference.
 
 ## Verification commands
 
 ```bash
-python run_audit.py                       # 9-suite health audit (~111s)
+python run_audit.py                       # 11-suite health audit (~88s)
 python -X utf8 tests/test_mesh_tools_contract.py   # clicks every Mesh Tools control
 python -X utf8 tests/test_pymeshlab_calls.py       # every filter/param/enum/method name vs the installed build
 python -X utf8 tests/test_texture_bake.py          # bakes 3 maps and reads the pixels back
 python -X utf8 tests/test_renderfox.py    # LOD/QEM/format/queue
+python -X utf8 tests/test_mock_dcc.py     # every engine command line against a stand-in renderer
+python -X utf8 tests/test_job_manager.py  # the real queue thread against those stand-ins
+python -X utf8 tests/test_postprocessor_paths.py   # organize/archive/cleanup stay inside the job folder
 QT_QPA_PLATFORM=offscreen python -X utf8 tests/test_all_tabs_headless.py
 ```
 
@@ -48,7 +64,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 1 | Mesh Tools UI-to-backend contract | DONE |
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
-| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b DONE (every configured engine reaches the queue), 4c queue, 4d dashboard wiring |
+| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b DONE (every configured engine reaches the queue), 4c-1 DONE (output path, frame names, post-processing folder), 4c-2 queue (priority, retry, concurrency), 4d dashboard wiring |
 | 5 | FBX/DAE claims + requirements gaps | not started |
 | 6 | Fabricated results presented as real | not started |
 | 7 | 22s startup | not started |
@@ -73,7 +89,8 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 **Confirmed by code reading**
 
 - ~~`job_manager.py:340` uses `sys.platform` but `sys` is never imported (harmless on Windows, `NameError` on mac/linux).~~ **Fixed in Phase 4b** - the read is now `system_name(os.name, sys.platform)` with `sys` imported, and the branch it lived in was rewritten.
-- ~~`render_engines.py:229` `os.path.dirname(job.output_path)` while the dialog returns a directory (`dashboard_tab.py:235`).~~ **Worse than the inventory said, and only half fixed:** `browse_output` uses `getExistingDirectory`, so `job.output_path` from both `AddJobDialog` (`:546`) and imported job JSON (`:781`) is a **directory**, and `dirname()` of a directory is its parent - frames land one level up, and Blender is handed `--render-output D:\Renders`, which writes `D:\Renders0001.png`. Phase 4a removed the `makedirs('')` crash and made every path absolute; normalising "directory vs prefix" into a real output prefix is Phase 4c.
+- ~~`render_engines.py:229` `os.path.dirname(job.output_path)` while the dialog returns a directory (`dashboard_tab.py:235`).~~ **Worse than the inventory said, and only half fixed:** `browse_output` uses `getExistingDirectory`, so `job.output_path` from both `AddJobDialog` (`:546`) and imported job JSON (`:781`) is a **directory**, and `dirname()` of a directory is its parent - frames land one level up, and Blender is handed `--render-output D:\Renders`, which writes `D:\Renders0001.png`. Phase 4a removed the `makedirs('')` crash and made every path absolute; `output_spec` + `frame_stem` + Blender's `#` run are Phase 4c-1.
+- **Found while fixing that, also fixed in Phase 4c-1:** `postprocessor.py` used `os.path.dirname(job.output_path) or job.output_path` for archiving and temp cleanup, i.e. the folder *above* the render folder - `archive_old_files` walks its argument and **deletes** every file older than the threshold, so a UI job whose output was `D:\Renders` archived the old files of `D:\`. Two more in the same shape: the system-temp sweep matched the `renderfox_` prefix with no age check, so it deleted the scratch folder of a render running in another window, and `job.name` (free text) went untreated into a folder *and* a file name, where on Windows `Elsewhere: 1` becomes an alternate data stream on a file named `Elsewhere` and the copy "succeeds" invisibly.
 - `render_engines.py:413-442` Unreal writes a 3-key `MoviePipelineConfig.json` its own comment calls "Simplified"; UE does not consume it. `:513-525` C4D flags `-nogui -render -frame a..b` do not exist in C4D's CLI.
 - `dashboard_tab.py:909` `update_progress` never connected → the visible queue progress bar never moves. `:669` Set Priority mutates `job.priority` the queue never sorts on.
 - `automation_tab.py:1350-1366` `simulate_file_event` logs `random.choice([...])` fake file events as live watching. `automation_engine.py:172-175` `generate_lod` returns "Generated N LODs" without calling `LODGenerator`.
@@ -226,7 +243,7 @@ The queue could not show progress because nothing read the renderer while it was
 - `render_job` in all four classes is now `return self.execute(self.get_render_command(job), job)`. The 143 deleted lines are those four duplicated bodies (~33 each), the constant `get_progress()` it replaces, the three imports none of them used (`time`, `dataclasses.dataclass`, `enum.Enum` - all already dead before this change), the function-local `import re` in `Cinema4DEngine.get_version`, and the raw `os.path.dirname(...)` expressions that `_output_directory`/`_mel_string` replaced. No behaviour was dropped: each body's `should_stop` check, return-code check and stderr capture are all in `execute()`, plus the two verdicts they did not have.
 - Verdict rules, in order: user stopped → failed; non-zero exit → failed with the renderer's own stderr; **exit 0 with neither a frame line nor a new file** → failed ("exited cleanly without reporting a frame or writing anything to …"); exit 0 with new files but no recognised frame line → **success**, and progress closes at 100.
 - That fourth rule is the safety net for the constraint this machine imposes: the parsers are written against syntax the mock records, and a real build of any of these packages could word its lines differently. Size + `st_mtime_ns` per file is evidence that does not depend on matching a string, so a differently-worded renderer costs a still bar, not a false failure. A re-render over the same filenames still shows up, because the mtimes move.
-- `_output_directory` (`abspath(dirname(output_path))`) removes the `os.makedirs('')` crash the inventory noted at `render_engines.py:229` for a bare output filename, and hands every engine an **absolute** directory. A relative path is resolved against the *renderer's* cwd, which this app does not control, so Blender's `--render-output` is absolutized too and `test_15` renders a bare `blender_hero.png` through all four packages.
+- `_output_directory` (`abspath(dirname(output_path))`) removes the `os.makedirs('')` crash the inventory noted at `render_engines.py:229` for a bare output filename, and hands every engine an **absolute** directory. A relative path is resolved against the *renderer's* cwd, which this app does not control, so Blender's `--render-output` is absolutized too and `test_15` renders a bare `blender_hero.png` through all four packages. *(Kept as the reason the directory is absolute; the method itself became `output_spec` in Phase 4c-1, which is also what fixed its `dirname` reading.)*
 
 **A MEL quoting bug the bare-name test exposed** - `tests/mock_dcc/mock_dcc.py` read Maya's settings with `workspace -fr "images" "(.*)";`, and `.*` is greedy: the captured "directory" was the path plus everything up to the *last* quoted value in the command. That produced `Error: output directory does not exist: C:\Users\AYUSHM~1\..."; setAttr -type "string" defaultRenderGlobals.imageFilePrefix "maya_hero`. Two sides fixed:
 
@@ -310,6 +327,45 @@ Phase 4a made a render readable; it did not make one *startable*. Three separate
 - `python -X utf8 tests/test_job_manager.py` → `Ran 12 tests ... OK` (15.3 s); `tests/test_mock_dcc.py` → `Ran 24 tests ... OK` (9.8 s).
 - `run_audit.py` grew a tenth suite (`job_queue`, "Render Queue & Software Discovery") → `100% (10/10 suites passed in 83.33s)`.
 - `config/batch_templates.json`, `tests/test_data/repaired.obj` and `tests/test_data/simplified.obj` were `git restore`d again after the audit run (see Known-deferred).
+
+### Phase 4c-1 - one job's output means one thing
+
+`job.output_path` meant two different things depending on who made the job, and every consumer picked a reading by guessing. `browse_output` in the dialog uses `getExistingDirectory`, so UI jobs and imported job JSON carry a **folder**; the scripting API carries a **file name** (`output_path="render.png"`). `dirname()` of a folder is the folder above it, and that single mismatch was three separate bugs: frames landing outside the chosen folder, Blender writing `D:\Renders0001.png`, and post-processing archiving/deleting the chosen folder's *parent*.
+
+**`src/processing/render_engines.py`**
+
+- `frame_stem(value)` (`:40`) and `output_spec(job) -> (absolute directory, frame-name stem)` (`:52`) are module-level functions, not `BaseRenderEngine` classmethods, because `postprocessor.py` has to answer the same question. A path that exists as a directory, or ends in a separator, is a directory and the stem is the job name; otherwise the stem is the file's own name without its extension, and the directory is `dirname` of it - made absolute by `os.path.abspath`, which is also what turns `''` ("right here") into the working directory instead of a crash.
+- The stem is always the sanitized one: `_STEM_UNSAFE` (`[\\/:*?"<>|\r\n\t]+` → `_`), trailing spaces/dots stripped (Windows refuses them), empty → `render`. `job.name` is free text from the dialog.
+- `BlenderEngine._output_template(job)` (`:350`) returns `<dir>/<stem>_` + `#` * `max(4, len(str(abs(last_frame))))`. Without a `#` run Blender appends the frame number to whatever string `-o` was handed and writes `<dir>0001.png`; the run also fixes the padding, so a 12,000-frame shot does not sort `frame_10.png` before `frame_2.png`.
+- Maya's MEL gets the folder in `workspace -fr "images"` and the stem in `defaultRenderGlobals.imageFilePrefix` (`:472-473`); Unreal's generated config gets `OutputDirectory` from the same call (`:563`); `execute()` takes `output_spec(job)[0]` for its `makedirs` and for the before/after file evidence (`:193`).
+- **Honest gap, unchanged:** Cinema 4D's command line carries no output path at all, so for C4D the app cannot choose the folder or the frame names. Its renders are proven by progress lines, not by file evidence.
+
+**`src/processing/postprocessor.py` (+23 / -7)** - `organize_files`, `archive_old_files` and `_cleanup_temp_files` now all receive `output_spec(job)[0]` (`:584`, `:608`, `:846`), and `job.name` passes through `frame_stem` at both places it becomes a path (the subfolder at `:384`, the `{job_name}` token at `:413`). Two extra guards found while reading, not from the inventory: `archive_old_files` deletes what it archives, so the folder-above bug was data loss outside the render tree; and the system-temp sweep matched `renderfox_*` with no age check, so it removed the live scratch folder of another RenderFox window - it now skips anything newer than `STALE_TEMP_SECONDS` (`:29`, 24 h).
+
+**`tests/mock_dcc/mock_dcc.py`** - directory precedence flipped to **command line first, scene second**, because the command line is the thing under test and the old order let a scene value mask whatever the app asked for; Cinema 4D, whose line carries nothing, still falls back to its own scene. The Blender parser now refuses a `--render-output` with no `#` run (exit 20), which is how `D:\Renders0001.png` became a test failure instead of a silent wrong folder, and frame names are built from the `#` run's position and length.
+
+**`tests/test_mock_dcc.py` (24 → 27 tests)** - `test_18` a folder `output_path` keeps every frame inside that folder and puts nothing in the process cwd, for Blender/Maya/Unreal; `test_19` the Blender template carries a `#` run whose length follows the last frame (`(1, 3)` → 4, `(1, 12000)` → 5); `test_20` the job name `Hero/Shot: 1` reaches the frame files as `Hero_Shot_ 1` and does not create a folder. `test_05` was rewritten rather than deleted: it used a scene value to express a missing folder, which the new precedence ignores, and now it asks the real question - the raw command line refuses a folder that isn't there *and* does not create it, while `render_job` creates it first and renders, and a file in its way produces "Cannot create output directory" instead of a crash. `test_15` lost its file-name half for the same reason (a folder picker's value is a folder) and keeps the "no directory in it means right here" half.
+
+**`tests/test_postprocessor_paths.py` (new, 6 tests, no renderer needed)** - organizing into a folder-shaped and a file-shaped `output_path`; archiving removing an old frame inside the job folder while a 40-day-old file in the parent survives; temp cleanup removing `<out>/temp` and not a neighbour's; the sweep keeping a fresh `renderfox_` folder and taking a day-old one; the free-text job name pinned in both folder and file position.
+
+**`run_audit.py`** - eleventh suite `postprocessor_paths`.
+
+**Proof** - control run green, then nine defects injected one at a time, each caught by a named test, both files restored byte-identically, scratch runner `_probe_4c.py` deleted:
+
+| injected defect | caught by |
+|---|---|
+| organize base_dir is the raw `output_path` (a file path) | test_02 (postprocessor) |
+| archive walks the folder above the output | test_04 (postprocessor) |
+| temp cleanup targets the folder above | test_05 (postprocessor) |
+| organised file name keeps the raw job name | test_03 (postprocessor) |
+| organised subfolder keeps the raw job name | test_03 (postprocessor) |
+| temp sweep deletes every `renderfox_` entry | test_06 (postprocessor) |
+| `output_spec` treats a folder as a file name | test_18 (mock), test_15 |
+| Blender template drops the `#` run | test_01, test_02, test_19 (mock) |
+| frame stem is not sanitized | test_20 (mock) |
+
+- `tests/test_mock_dcc.py` → `Ran 27 tests ... OK` (11.1 s); `tests/test_job_manager.py` → `Ran 12 tests ... OK` (15.3 s); `tests/test_postprocessor_paths.py` → `Ran 6 tests ... OK` (0.03 s); `run_audit.py` → `100% (11/11 suites passed in 88.33s)`.
+- Two lessons from the pass itself. The first runner compared a *decoded string* digest to the *raw bytes* on restore, refused to write, and left `postprocessor.py` mutated one step longer than it should have been - repaired by hand and the runner now keeps the original bytes and verifies after writing. And "stayed inside the output folder" was not strong evidence: under the raw-`output_path` defect Windows happily created a **folder named `hero.png`** inside the render folder, so the tests now pin the folder list and the file prefix, not just the ancestor.
 
 ## Known-deferred
 

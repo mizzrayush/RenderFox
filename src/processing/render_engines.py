@@ -34,6 +34,45 @@ try:
 except ImportError:
     FAST_SIMPLIFICATION_AVAILABLE = False
 
+_STEM_UNSAFE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+
+def frame_stem(value: str) -> str:
+    """A job name turned into something safe to put inside a frame's filename.
+
+    `job.name` is free text from the Batch Render dialog, and it becomes part of
+    every path handed to a renderer: `Hero/Shot 1` would otherwise write frames
+    into a folder nobody asked for, and `:` is not legal in a Windows filename
+    at all. A trailing dot or space is dropped because Windows refuses to store
+    either.
+    """
+    return _STEM_UNSAFE.sub('_', (value or '').strip()).rstrip(' .') or 'render'
+
+
+def output_spec(job: RenderJob) -> Tuple[str, str]:
+    """(absolute directory, frame-name stem) for a job.
+
+    `job.output_path` means two different things depending on who made the job,
+    and getting it wrong is silent: the Batch Render dialog's Browse button uses
+    `getExistingDirectory`, so `output_path` is a *folder* for nearly every job
+    the UI creates and for every job imported from JSON, while the scripting API
+    passes a file name (`output_path="render.png"`). Reading a folder as a file
+    name takes its `dirname`, which is the folder above it, and the frames
+    appear there instead.
+
+    Absolute, because a renderer resolves a relative path against *its own*
+    working directory, which this app does not control, and because an empty
+    directory ("right here") is what `abspath('')` already gives.
+    """
+    raw = (job.output_path or '').strip()
+    if os.path.isdir(raw) or raw.endswith(('/', '\\')):
+        directory, stem = raw, job.name
+    else:
+        directory = os.path.dirname(raw)
+        stem = os.path.splitext(os.path.basename(raw))[0] or job.name
+    return os.path.abspath(directory), frame_stem(stem)
+
+
 class RenderEngine(ABC):
     """Abstract base class for render engines."""
     
@@ -125,18 +164,6 @@ class RenderEngine(ABC):
                 self.progress_callback(progress)
 
     @staticmethod
-    def _output_directory(job: RenderJob) -> str:
-        """The absolute directory a job's frames belong in.
-
-        `os.path.dirname('hero.png')` is the empty string, and `makedirs('')`
-        raises, so a bare filename means "right here" - which is also what
-        `abspath` of an empty path gives. Absolute matters as well: a renderer
-        resolves a relative path against *its own* working directory, and this
-        app does not get to assume what that is.
-        """
-        return os.path.abspath(os.path.dirname(job.output_path))
-
-    @staticmethod
     def _files_in(directory: str) -> Dict[str, Tuple[int, int]]:
         """Size and modified-time of every file in a directory.
 
@@ -163,7 +190,7 @@ class RenderEngine(ABC):
         """Run one render, reporting progress from live output."""
         self.should_stop = False
         self._progress = 0.0
-        output_dir = self._output_directory(job)
+        output_dir = output_spec(job)[0]
         try:
             os.makedirs(output_dir, exist_ok=True)
         except OSError as error:
@@ -320,13 +347,27 @@ class BlenderEngine(RenderEngine):
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError, Exception):
             return "Unknown"
     
+    def _output_template(self, job: RenderJob) -> str:
+        """Blender's `-o` value: the chosen folder, the job's name, a `#` run.
+
+        Without `#`, Blender appends the frame number to whatever string it was
+        handed, so a folder used as the output path yields `<folder>0001.png` -
+        one level above where the frames belong. The run also sets the padding,
+        so it has to be wide enough for the last frame number or a long shot
+        loses its leading zeros and the frames no longer sort in order.
+        """
+        directory, stem = output_spec(job)
+        last = job.frame_range[1] if job.frame_range else 1
+        digits = max(4, len(str(abs(last))))
+        return os.path.join(directory, f'{stem}_' + '#' * digits)
+
     def get_render_command(self, job: RenderJob) -> List[str]:
         """Generate Blender render command."""
         cmd = [
             self.executable_path,
             "--background",  # Run in background mode
             job.project_file,  # Blend file
-            "--render-output", os.path.abspath(job.output_path),  # Output path
+            "--render-output", self._output_template(job),  # <dir>/<stem>_####
             "--render-format", job.output_format.upper(),  # Output format
         ]
         
@@ -335,7 +376,7 @@ class BlenderEngine(RenderEngine):
             "--python-expr",
             f"import bpy; bpy.context.scene.render.resolution_x = {job.resolution[0]}; bpy.context.scene.render.resolution_y = {job.resolution[1]}"
         ])
-        
+
         # Add frame range if specified
         if job.frame_range:
             start_frame, end_frame = job.frame_range
@@ -428,9 +469,8 @@ class MayaEngine(RenderEngine):
         ])
         
         # Set output path and format
-        output_dir = self._mel_string(self._output_directory(job))
-        output_name = self._mel_string(
-            os.path.splitext(os.path.basename(job.output_path))[0])
+        output_dir = self._mel_string(output_spec(job)[0])
+        output_name = self._mel_string(output_spec(job)[1])
         
         mel_commands.extend([
             f"workspace -fr \"images\" \"{output_dir}\";",
@@ -520,7 +560,7 @@ class UnrealEngine(RenderEngine):
         # This would create a JSON config for UE's Movie Render Pipeline
         # Simplified implementation
         config = {
-            "OutputDirectory": self._output_directory(job),
+            "OutputDirectory": output_spec(job)[0],
             "OutputFormat": job.output_format,
             "Resolution": job.resolution,
             # The command line carries no frame range for Unreal, so the config

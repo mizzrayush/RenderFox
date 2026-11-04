@@ -87,7 +87,7 @@ class MockDCCCase(unittest.TestCase):
         self.live.append(engine)
         return engine
 
-    def job(self, key, frames=None, name='hero', **scene):
+    def job(self, key, frames=None, name='hero', output_path=None, **scene):
         scene.setdefault('seconds_per_frame', 0.02)
         scene.setdefault('output_dir', self.out)
         scene.setdefault('prefix', name)
@@ -95,7 +95,7 @@ class MockDCCCase(unittest.TestCase):
         return RenderJob(
             id=f'{key}-{name}', name=name, project_file=project,
             software_type=SoftwareType(key),
-            output_path=os.path.join(self.out, f'{name}.png'),
+            output_path=output_path or os.path.join(self.out, f'{name}.png'),
             resolution=(960, 540), frame_range=frames, output_format='png')
 
     def launch(self, key, job):
@@ -150,11 +150,36 @@ class TestMockPackageBehaviour(MockDCCCase):
                       'the engine discarded the renderer stderr')
 
     def test_05_missing_output_directory_is_reported(self):
-        job = self.job('blender', frame_count=2,
-                       output_dir=os.path.join(self.work, 'nope'))
+        """A renderer handed a folder that isn't there fails; it does not make one.
+
+        So the app has to create it before launching, which is what the second
+        half of this test proves: the same job, run through `render_job`, lands
+        its frames in a folder that did not exist a moment before.
+        """
+        missing = os.path.join(self.work, 'nope')
+        job = self.job('blender', frame_count=2, name='nope',
+                       output_path=os.path.join(missing, 'hero.png'))
         run = self.launch('blender', job)
         self.assertEqual(31, run.returncode, run.stdout + run.stderr)
         self.assertIn('output directory does not exist', run.stderr)
+        self.assertFalse(os.path.exists(missing),
+                         'the mock created the folder it was supposed to refuse')
+
+        engine = self.engine('blender')
+        self.assertTrue(engine.render_job(job), job.error_message)
+        # The frames are named from the output file the user typed, not from the
+        # job's display name.
+        self.assertEqual(['hero_0001.png', 'hero_0002.png'],
+                         sorted(os.path.basename(path) for path in
+                                glob.glob(os.path.join(missing, '*.png'))))
+        # A folder the app cannot create is a clear message, not a crash.
+        blocked = os.path.join(missing, 'a-file')
+        job_two = self.job('blender', frame_count=1, name='blocked',
+                           output_path=os.path.join(blocked, 'hero.png'))
+        with open(blocked, 'w') as handle:
+            handle.write('in the way')
+        self.assertFalse(engine.render_job(job_two))
+        self.assertIn('Cannot create output directory', job_two.error_message or '')
 
     def test_06_rejects_command_lines_the_engines_do_not_build(self):
         job = self.job('blender', frame_count=1)
@@ -372,19 +397,24 @@ class TestEngineLaunchPath(MockDCCCase):
 
         The queue is built from a folder picker *or* a typed name, so an output
         path with no directory in it has to mean "right here" for every engine,
-        in the command line as well as in the folder the app creates.
+        in the command line as well as in the folder the app creates. What each
+        package calls the frames is its own business - `test_18` covers the names
+        for the engines whose command line carries a name at all.
         """
         for key in CLASSES:
             with self.subTest(package=key):
+                for stale in glob.glob(os.path.join(self.work, '*.png')):
+                    os.remove(stale)
                 job = self.job(key, frames=(1, 2), name=f'bare-{key}', output_dir=None)
                 job.output_path = f'{key}_hero.png'
                 engine = self.engine(key)
                 self.assertTrue(engine.render_job(job), f'{key}: {job.error_message}')
                 self.assertEqual(100.0, engine.get_progress())
                 landed = sorted(os.path.basename(path) for path in
-                                glob.glob(os.path.join(self.work, f'bare-{key}_0*.png')))
-                self.assertEqual([f'bare-{key}_0001.png', f'bare-{key}_0002.png'], landed,
-                                 f'{key} put a bare-name render somewhere unexpected')
+                                glob.glob(os.path.join(self.work, '*.png')))
+                self.assertEqual(2, len(landed),
+                                 f'{key} put a bare-name render somewhere unexpected: {landed}')
+                self.assertEqual([], glob.glob(os.path.join(self.out, 'bare*')))
 
     def test_16_a_second_render_over_the_same_filenames_is_not_a_failure(self):
         """Re-rendering a shot keeps the frame names and moves only their mtimes.
@@ -416,6 +446,60 @@ class TestEngineLaunchPath(MockDCCCase):
                 self.assertTrue(engine.render_job(job), job.error_message)
                 self.assertEqual([25.0, 50.0, 75.0, 100.0], seen,
                                  f'{key} reported frames on stderr and none reached the bar')
+
+    def test_18_a_directory_output_path_keeps_frames_inside_it(self):
+        """What the Batch Render dialog hands the queue is a folder, not a filename.
+
+        `browse_output` uses `getExistingDirectory` (`dashboard_tab.py:235`) and
+        imported job JSON copies the same value, so for nearly every real job
+        `output_path` is a directory. Reading it as a filename instead - which is
+        what `dirname()` of a directory does - wrote frames into the folder
+        *above* the one the user chose.
+        """
+        for key in ('blender', 'maya', 'unreal'):
+            with self.subTest(package=key):
+                name = f'into-{key}'
+                job = self.job(key, frames=(1, 3), name=name, output_path=self.out,
+                               output_dir=None)  # only the command line may decide
+                engine = self.engine(key)
+                self.assertTrue(engine.render_job(job), job.error_message)
+                self.assertEqual([f'{name}_0001.png', f'{name}_0002.png', f'{name}_0003.png'],
+                                 self.frames_written(name))
+                self.assertEqual([], glob.glob(os.path.join(self.work, f'{name}_0*')),
+                                 f'{key} wrote one level above the chosen directory')
+
+    def test_19_blender_output_template_carries_a_frame_placeholder(self):
+        """Blender appends the frame number to `-o` unless the path has a `#` run.
+
+        A directory handed over as the output path therefore becomes
+        `<folder>0001.png` - one file per frame, all of them in the parent, and
+        none of the names the queue later reads back. The `#` run is the only
+        thing that keeps the folder a folder, and it has to be wide enough for
+        the last frame number or a long shot loses its leading zeros.
+        """
+        for frames, digits in (((1, 3), 4), ((1, 12000), 5)):
+            with self.subTest(frames=frames):
+                job = self.job('blender', frames=frames, name='pad', output_path=self.out)
+                cmd = self.engine('blender').get_render_command(job)
+                value = cmd[cmd.index('--render-output') + 1]
+                self.assertEqual(os.path.join(self.out, f'pad_{"#" * digits}'), value)
+
+    def test_20_a_job_name_cannot_escape_the_output_directory(self):
+        """`job.name` is free text from the dialog and it becomes part of a path."""
+        for key in ('blender', 'maya'):
+            with self.subTest(package=key):
+                project = harness.write_scene(self.work, key, name=f'unsafe-{key}',
+                                              seconds_per_frame=0.02, prefix='unused')
+                job = RenderJob(id=f'unsafe-{key}', name='Hero/Shot: 1',
+                                project_file=project, software_type=SoftwareType(key),
+                                output_path=self.out, resolution=(64, 36),
+                                frame_range=(1, 2), output_format='png')
+                engine = self.engine(key)
+                self.assertTrue(engine.render_job(job), job.error_message)
+                self.assertEqual(2, len(self.frames_written('Hero_Shot_ 1')),
+                                 'the sanitized name did not reach the frame files')
+                self.assertFalse(os.path.isdir(os.path.join(self.out, 'Hero')),
+                                 'a slash in the job name created a folder nobody asked for')
 
 
 def pid_is_live(pid):
