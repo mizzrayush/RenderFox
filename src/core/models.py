@@ -49,6 +49,7 @@ class RenderJob:
     end_time: Optional[float] = None
     progress: float = 0.0
     error_message: Optional[str] = None
+    retry_count: int = 0
     
     # Pre-processing options
     generate_lods: bool = False

@@ -23,17 +23,17 @@ did you write" because a docstring counts as code here.
 | Bucket | Files | Raw | Code |
 |---|---|---|---|
 | `src/` at the pre-repair baseline (`1727f94`) | 73 | 56,111 | 41,523 |
-| `src/` now | 73 | 56,990 | 42,360 |
+| `src/` now | 73 | 57,249 | 42,584 |
 | `tests/` (incl. `tests/mock_dcc/`) at baseline | 22 | 2,257 | 1,620 |
-| `tests/` now | 32 | 4,610 | 3,582 |
+| `tests/` now | 32 | 5,066 | 3,981 |
 | entry + tooling scripts at the root | 5 | 581 | ~450 |
 | `installer.nsi` + `RenderFox.spec` | 2 | 210 | 158 |
 | dead code inside `src/` (to be deleted) | 10 | 6,081 | 4,624 |
 
 Headline for a README or a conversation: **~57k lines of application code in
-`src/` (~42k non-blank), plus ~4.6k of tests.** Say "application code" and
+`src/` (~42.6k non-blank), plus ~5.1k of tests.** Say "application code" and
 "tests" separately - folding them together invites the reply "so half of it was
-generated?". The repair pass itself is +879 raw in `src/` and +2,353 in `tests/`
+generated?". The repair pass itself is +1,138 raw in `src/` and +2,809 in `tests/`
 (the mock renderers, the harness, the contract and mutation suites), which is
 the honest answer to "what did the AI write": the app, every tab and every
 feature are the user's; the harness and the fixes are the difference.
@@ -64,7 +64,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 1 | Mesh Tools UI-to-backend contract | DONE |
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
-| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b DONE (every configured engine reaches the queue), 4c-1 DONE (output path, frame names, post-processing folder), 4c-2 queue (priority, retry, concurrency), 4d dashboard wiring |
+| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b DONE (every configured engine reaches the queue), 4c-1 DONE (output path, frame names, post-processing folder), 4c-2 DONE (priority, retry, concurrency, per-job pause/remove/stop), 4d partly done (dashboard pause/resume/progress wired; JPG→JPEG and the dead Render buttons remain) |
 | 5 | FBX/DAE claims + requirements gaps | not started |
 | 6 | Fabricated results presented as real | not started |
 | 7 | 22s startup | not started |
@@ -74,10 +74,10 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 
 **Confirmed by live reproduction**
 
-- `src/ui/dashboard_tab.py:572` and `:579` read `job_table.item(row, 0)` for the job id, but column 0 is a `QCheckBox` cellWidget (`:854`) and the id lives in column 1 (`:858`) → `AttributeError` on Pause/Resume.
+- ~~`src/ui/dashboard_tab.py:572` and `:579` read `job_table.item(row, 0)` for the job id, but column 0 is a `QCheckBox` cellWidget (`:854`) and the id lives in column 1 (`:858`) → `AttributeError` on Pause/Resume.~~ **Fixed in Phase 4d** - both buttons now read the id through `selected_job_id()`, the same column pair `remove_selected_job` already used.
 - ~~`src/processing/render_engines.py:81-84` `get_progress()` returns a constant `0.0`; `job_manager.py:240` uses blocking `communicate()` so Blender's `Fra:` output is discarded → progress sits at 0% then jumps to 100.~~ **Engines fixed in Phase 4a** (verified streaming against the mock). `job_manager.py` still polls on a 1 s timer and now gets real values, but the queue loop itself is Phase 4c.
-- `max_concurrent` appears **zero** times in `job_manager.py`; `pending_jobs[0]` (`:222`) plus one engine = strictly serial. Settings checkbox is write-only.
-- `auto_retry` / `max_retries` exist only in `settings_tab.py:288-295`; no consumer in `job_manager.py` or `render_engines.py`.
+- ~~`max_concurrent` appears **zero** times in `job_manager.py`; `pending_jobs[0]` (`:222`) plus one engine = strictly serial. Settings checkbox is write-only.~~ **Fixed in Phase 4c-2** - the queue fills slots, and the number now comes from `config.json` (clamped, junk-proof).
+- ~~`auto_retry` / `max_retries` exist only in `settings_tab.py:288-295`; no consumer in `job_manager.py` or `render_engines.py`.~~ **Fixed in Phase 4c-2** - `_queue_policy()` reads all four queue settings and `test_26` pins that the key names on both sides still match.
 - `src/ui/rendering_tab.py`: `render_btn` "Render Image" (`:624`) and `btn_render` "Render Frame" (`:764`) have **no `.clicked.connect`** — the Rendering tab cannot render. Toolbar view modes (`:720-751`) likewise unwired; only `action_export` is connected.
 - `src/ui/dashboard_tab.py:95` format dropdown offers `jpg`; `render_engines.py:199` sends `--render-format JPG` — Blender requires `JPEG`.
 - `src/core/library_manager.py:978` thumbnail keyed on basename only in one shared dir → different models named `char.fbx` in different folders serve each other's picture; no mtime in key → stale thumbs after edits.
@@ -92,7 +92,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 - ~~`render_engines.py:229` `os.path.dirname(job.output_path)` while the dialog returns a directory (`dashboard_tab.py:235`).~~ **Worse than the inventory said, and only half fixed:** `browse_output` uses `getExistingDirectory`, so `job.output_path` from both `AddJobDialog` (`:546`) and imported job JSON (`:781`) is a **directory**, and `dirname()` of a directory is its parent - frames land one level up, and Blender is handed `--render-output D:\Renders`, which writes `D:\Renders0001.png`. Phase 4a removed the `makedirs('')` crash and made every path absolute; `output_spec` + `frame_stem` + Blender's `#` run are Phase 4c-1.
 - **Found while fixing that, also fixed in Phase 4c-1:** `postprocessor.py` used `os.path.dirname(job.output_path) or job.output_path` for archiving and temp cleanup, i.e. the folder *above* the render folder - `archive_old_files` walks its argument and **deletes** every file older than the threshold, so a UI job whose output was `D:\Renders` archived the old files of `D:\`. Two more in the same shape: the system-temp sweep matched the `renderfox_` prefix with no age check, so it deleted the scratch folder of a render running in another window, and `job.name` (free text) went untreated into a folder *and* a file name, where on Windows `Elsewhere: 1` becomes an alternate data stream on a file named `Elsewhere` and the copy "succeeds" invisibly.
 - `render_engines.py:413-442` Unreal writes a 3-key `MoviePipelineConfig.json` its own comment calls "Simplified"; UE does not consume it. `:513-525` C4D flags `-nogui -render -frame a..b` do not exist in C4D's CLI.
-- `dashboard_tab.py:909` `update_progress` never connected → the visible queue progress bar never moves. `:669` Set Priority mutates `job.priority` the queue never sorts on.
+- ~~`dashboard_tab.py:909` `update_progress` never connected → the visible queue progress bar never moves. `:669` Set Priority mutates `job.priority` the queue never sorts on.~~ **Fixed:** `update_progress`/`update_status` are connected to `job_updated` in Phase 4d (no timer of its own to drift), and `_next_pending()` sorts on the priority in Phase 4c-2, so the Batch menu's Set Priority decides what renders next.
 - `automation_tab.py:1350-1366` `simulate_file_event` logs `random.choice([...])` fake file events as live watching. `automation_engine.py:172-175` `generate_lod` returns "Generated N LODs" without calling `LODGenerator`.
 - `pipeline_engine.py:843-845` render node logs "Rendering not fully implemented, skipping" and returns `True`; `:997` transform node "is not yet implemented. Passing data through."
 - `animation_tab.py:316-332` fake sine waveform as audio track; `:907` seeds dummy tracks. No skeletal playback at all — `:1143-1183` applies only whole-model translate/rotate/uniform-scale.
@@ -366,6 +366,59 @@ Phase 4a made a render readable; it did not make one *startable*. Three separate
 
 - `tests/test_mock_dcc.py` → `Ran 27 tests ... OK` (11.1 s); `tests/test_job_manager.py` → `Ran 12 tests ... OK` (15.3 s); `tests/test_postprocessor_paths.py` → `Ran 6 tests ... OK` (0.03 s); `run_audit.py` → `100% (11/11 suites passed in 88.33s)`.
 - Two lessons from the pass itself. The first runner compared a *decoded string* digest to the *raw bytes* on restore, refused to write, and left `postprocessor.py` mutated one step longer than it should have been - repaired by hand and the runner now keeps the original bytes and verifies after writing. And "stayed inside the output folder" was not strong evidence: under the raw-`output_path` defect Windows happily created a **folder named `hero.png`** inside the render folder, so the tests now pin the folder list and the file prefix, not just the ancestor.
+
+### Phase 4c-2 - the queue runs the settings it is given
+
+The queue had one job pointer, one engine pointer, and one worker thread: `_current_job` / `_render_engine` stood for "whatever is rendering", so every queue-side setting in the Settings tab was write-only and every per-job control acted on whichever job happened to be last. It is now a slot machine with a table of live renders.
+
+**`src/core/job_manager.py`** (the bulk of the phase)
+
+- `self._running: Dict[job_id, (job, engine)]` and `self._workers: Dict[job_id, Thread]`, both under `self._lock`. The two singletons are gone, and `current_job` with them (nothing left that may speak of one job). A signal is never emitted while holding `_lock` - it is a plain `threading.Lock`, and same-thread emissions run the slot before the lock is released.
+- `_queue_policy()` (`:317`) reads `performance` from `config.json` on every pick: `max_concurrent` clamped to 1..16, `max_retries` to 0..100, `auto_retry`/`pause_on_error` coerced to bool, non-numbers falling back to `_DEFAULT_POLICY` (`:25`). Re-read rather than cached because a saved setting must not look broken until the next queue start; the file is a few hundred bytes and this runs once per render. The key names are the ones `settings_tab.py:1214-1221` writes - `test_26` pins that from both ends.
+- `_next_pending()` (`:353`) sorts `(-_PRIORITY_RANK, insertion position)`. `Priority` is a string Enum with no order of its own, so the rank lives in a table (`:21`) that adding a level cannot silently reshuffle. It also skips any job still holding a slot: `_retry_pending` puts a job back to PENDING *before* its worker reaches the `finally` that frees the slot, and picking it in that gap hands one job two renderers and overwrites the slot it still holds.
+- `_process_queue()` (`:369`) fills the free slots and hands each render to its own thread, wakes on `_queue_changed` instead of sleeping a second per pick, and stops picking when `_hold_after_failure` is set. When the queue stops itself it emits `processing_stopped` - the UI cannot see a stop nobody clicked.
+- `_bind_progress(job)` (`:490`) returns a callback that writes into *that* job. The old one wrote into "the current job", so a two-slot queue let the short render's 100% close the long one. `_update_progress()` (`:576`) now polls every engine, clamped to 0..100, and treats an engine mid-teardown as no reading rather than a queue failure.
+- `pause_job`/`resume_job`/`remove_job` work on the job id they were given. `_kill_renderer()` (`:219`) wakes a suspended process before terminating it (a SIGSTOPped renderer never sees the request on POSIX) and `remove_job` kills only that engine - dropping one render from a queue is not a request to cancel the others. A paused job deliberately keeps its slot: its process is alive and its frames are real.
+- `get_queue_stats()` counts a snapshot; `estimate_remaining_time()` sums over every running job and averages in the completed ones instead of letting one job stand for the queue.
+
+**The stop/launch race** - `stop_processing()` sets `_stop_event` and *then* snapshots the slots to kill them. A worker that had claimed a slot but not yet registered its engine was invisible to that snapshot, so it went on to launch a renderer nobody owned: the window closed with Blender still rendering. Closed at two points, because either side alone leaves a gap. `_run_job` reads `_stop_event` **inside** the lock that registers the engine (`:424-434`), so either the stop sees the engine and kills it or the worker sees the stop and never launches. And `execute()` no longer clears a pending stop before the launch (`render_engines.py:194-200`) - it reports the cancel instead, then consumes the flag so a later render on a reused engine is not cancelled by an old click - and re-checks right after `Popen` (`:216-221`), the only moment a process exists that no snapshot ever saw.
+
+**`src/core/models.py`** - `retry_count: int = 0` on `RenderJob` (`:52`), so `max_retries` means the same for a hand-edited queue as for a hundred-job one.
+
+**`tests/mock_dcc/mock_dcc.py`** - a scene may name a `launch_log`, and every renderer process appends one line before it does anything else. Counting launches is the only way to ask "how many renders did the queue actually start": a retried job rewrites the same frame names, so the output folder cannot answer it.
+
+**`tests/test_job_manager.py` (12 → 28 tests)** - `TestQueuePolicy` (16) drives priority order, the retry limit, retry-off, two slots, one slot, per-job progress isolation, per-job pause, per-job remove, stop-mid-launch, pause-on-error, junk settings, and the key-name contract. Measurement is from the live job and the launch log, not from `job_updated`: those signals are queued onto the test thread and carry the same mutable object, so an attempt that opened and closed between two `processEvents()` reads as nothing (this cost a false "retries never happen" until it was measured properly). `live_renderers()` walks this process's own children with psutil, because "the queue says it stopped" and "no renderer is running" are different claims - with a `name` it can tell one job's renderer from another's, which is what makes per-job remove testable.
+
+**Proof** - thirteen defects injected one at a time, each caught by a named test, both source files restored byte-identically afterwards, scratch runner `_probe_4c2.py` deleted:
+
+| injected defect | caught by |
+|---|---|
+| priority is ignored (insertion order) | test_11 |
+| retry limit is not honoured (off by one) | test_12 |
+| `max_concurrent` is ignored | test_14, test_15 |
+| `max_concurrent` is not clamped | test_23 |
+| a junk setting is not caught | test_23 |
+| the queue re-checks nothing on Stop | test_08 (30 frames rendered after Stop) |
+| a Stop before the launch is rendered over | test_19 |
+| a paused renderer is killed while suspended | test_24 |
+| progress is written onto another job | test_16 |
+| `pause_on_error` is stored and ignored | test_20 |
+| a job holding a slot can be picked again | test_25 |
+| the queue reads a renamed config key | test_26 |
+| removing a job leaves its renderer | test_18 |
+
+- `tests/test_job_manager.py` → `Ran 28 tests ... OK` (28.7 s); `tests/test_mock_dcc.py` → `Ran 27 tests ... OK` (11.2 s); `tests/test_postprocessor_paths.py` → `Ran 6 tests ... OK`; `run_audit.py` → `100% (11/11 suites)`.
+- Four of those pins exist because the obvious measurement could not do the job. test_24 asserts the *order* of calls on a stub engine: on Windows `TerminateProcess` overrides a suspension, so a real render cannot show why waking first matters - it does on macOS/Linux, and the ordering is pinned where it can be. test_25 puts the job in the slot-held-but-PENDING state directly, because the real gap is a few hundred microseconds wide. test_26 reads the two source files as text, because a key renamed on one side saves fine and changes nothing. And test_22/test_23 exist because `max_concurrent: 0` in a hand-edited file means no slot ever fills: Start would appear dead forever.
+- Two runner lessons, both from this pass. Killing a mutation probe mid-run leaves the source **mutated** - it happened twice here, once showing up as an anchor that no longer matched, and the tree now has to be verified restored before any result is believed. And a mutation that is "not caught" is not always a coverage hole: stubbing the progress callback stayed MISSED because the 1 s timer covers the same ground, so the defect was rewritten to the one that actually breaks a job - writing progress onto a different one.
+- **Still open here:** the 1 s `_update_progress` poll is redundant with the callback for every engine this app ships, so no test can see it removed; it stays because a renderer that reports frames only through `get_progress()` would otherwise freeze the bar. `max_concurrent` above the machine's core count is the user's call - only the 1..16 clamp is enforced.
+
+### Phase 4d (part) - the dashboard's queue controls reach the queue
+
+`pause_selected_job`/`resume_selected_job` read `job_table.item(row, 0)`, but column 0 is the select `QCheckBox` set with `setCellWidget`, so `item()` there is `None` and both buttons raised `AttributeError` on every click. `update_progress` was defined and connected to nothing, so the queue bar in the same panel sat at 0 while a render ran.
+
+**`src/ui/dashboard_tab.py`** - `selected_job_id()` (`:586`) reads the id from column 1, the same cell `remove_selected_job` and `get_selected_jobs` already use, and both buttons now go through it; `update_progress`/`update_status` are connected to `job_updated` (`:515-526`) - every frame line is a signal, so the bar follows the render with no second timer to drift - and both read `running_jobs()`, which is the queue's own view of what is live (`update_status` says `(+N more)` when the Settings tab allows concurrency). `on_queue_stopped()` hides the bar on `processing_stopped`, because "Pause queue on error" ends the run without a Stop click. A button that cannot do its job now says so in the status line instead of doing nothing.
+
+**Remaining in this phase:** `dashboard_tab.py:95` still offers `jpg` where Blender wants `JPEG`, and `rendering_tab.py:624`/`:764` - "Render Image" and "Render Frame" - are still without a `clicked.connect`.
 
 ## Known-deferred
 

@@ -34,7 +34,7 @@ Scene files are JSON, exactly like a real scene carries its own settings:
 
     {"seconds_per_frame": 0.05, "frame_count": 4, "output_dir": "...",
      "prefix": "hero", "fail_after": 2, "hang": false, "write_files": false,
-     "silent": true, "noise": 40, "stderr_progress": true}
+     "silent": true, "noise": 40, "stderr_progress": true, "launch_log": "..."}
 
 `silent` suppresses the per-frame progress lines only - it is how a build that
 words its progress differently from the syntax recorded here is simulated, so
@@ -42,6 +42,10 @@ the engines' fallback evidence (files on disk) gets tested and not just the
 parsers. `stderr_progress` moves those same lines to stderr, because which pipe
 a given build reports frames on is not this app's choice. `noise` floods both
 pipes at once, which is what a single buffered read of stdout cannot survive.
+
+`launch_log` names a file each process start appends one line to. A retried job
+rewrites the same frame names, so the output folder cannot answer "how many
+renders did the queue actually launch" - this can.
 
 Run directly while debugging:
     python tests/mock_dcc/mock_dcc.py blender --version
@@ -323,6 +327,17 @@ def render(dcc, project, output, output_dir, start, last, scene):
         frames = list(range(start, start + int(scene['frame_count'])))
     seconds = float(scene.get('seconds_per_frame', 0.05))
     fail_after = scene.get('fail_after')
+
+    launch_log = scene.get('launch_log')
+    if launch_log:
+        # A queue that retries or restarts a job rewrites the same frame names, so
+        # "how many times did a renderer actually run" cannot be read off the
+        # output folder. Each process records itself here, once.
+        try:
+            with open(launch_log, 'a', encoding='utf-8') as handle:
+                handle.write(f'{dcc} launched {os.path.basename(project)}\n')
+        except OSError as error:
+            fail(EXIT_BAD_COMMAND, f'Error: cannot write launch log {launch_log}: {error}')
 
     if scene.get('hang'):
         log(f'{NAMES[dcc]}: starting render')

@@ -77,7 +77,7 @@ SUITES = [
         "id": "job_queue",
         "name": "Render Queue & Software Discovery",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_job_manager.py")],
-        "description": "Drives the real JobManager thread against the mock renderers: configured engines are discovered, a queued job renders with live progress, stop returns it to pending"
+        "description": "Drives the real JobManager thread against the mock renderers: configured engines are discovered, live progress per job, priority order, retries, concurrency, pause/remove/stop leave no renderer running"
     },
     {
         "id": "postprocessor_paths",

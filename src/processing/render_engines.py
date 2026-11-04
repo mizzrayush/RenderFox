@@ -188,6 +188,14 @@ class RenderEngine(ABC):
 
     def execute(self, cmd: List[str], job: RenderJob) -> bool:
         """Run one render, reporting progress from live output."""
+        # The queue can hand this engine a Stop click between its registration and
+        # the launch. Clearing `should_stop` unconditionally here would render
+        # straight over that request, so a pending stop is answered instead - and
+        # then consumed, so a later render asked for is not cancelled by an old click.
+        if self.should_stop:
+            self.should_stop = False
+            job.error_message = f"{self.name} render cancelled by user"
+            return False
         self.should_stop = False
         self._progress = 0.0
         output_dir = output_spec(job)[0]
@@ -207,6 +215,11 @@ class RenderEngine(ABC):
             return False
 
         self.current_process = process
+        if self.should_stop:
+            # The Stop click landed in the window between the check above and this
+            # launch, so the queue's snapshot of running engines never saw a process
+            # it could kill - this is the only place that can.
+            self.stop()
         stdout_lines: List[str] = []
         stderr_lines: List[str] = []
         # Both streams are watched for progress: which one a given build reports
