@@ -86,6 +86,12 @@ SUITES = [
         "description": "Clicks every dashboard queue control and requires the queue to be asked, the bar to follow the render and the format list to match the engine"
     },
     {
+        "id": "rendering_tab_contract",
+        "name": "Rendering Viewport Control Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_rendering_tab_contract.py")],
+        "description": "Clicks every Rendering tab toolbar action and Render Image button and requires the viewport to change or a frame of the requested resolution and format to be written"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

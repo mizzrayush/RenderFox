@@ -23,17 +23,17 @@ did you write" because a docstring counts as code here.
 | Bucket | Files | Raw | Code |
 |---|---|---|---|
 | `src/` at the pre-repair baseline (`1727f94`) | 73 | 56,111 | 41,523 |
-| `src/` now | 73 | 57,249 | 42,584 |
+| `src/` now | 73 | 57,488 | 42,773 |
 | `tests/` (incl. `tests/mock_dcc/`) at baseline | 22 | 2,257 | 1,620 |
-| `tests/` now | 32 | 5,066 | 3,981 |
+| `tests/` now | 34 | 5,699 | 4,497 |
 | entry + tooling scripts at the root | 5 | 581 | ~450 |
 | `installer.nsi` + `RenderFox.spec` | 2 | 210 | 158 |
 | dead code inside `src/` (to be deleted) | 10 | 6,081 | 4,624 |
 
 Headline for a README or a conversation: **~57k lines of application code in
-`src/` (~42.6k non-blank), plus ~5.1k of tests.** Say "application code" and
+`src/` (~42.8k non-blank), plus ~5.7k of tests.** Say "application code" and
 "tests" separately - folding them together invites the reply "so half of it was
-generated?". The repair pass itself is +1,138 raw in `src/` and +2,809 in `tests/`
+generated?". The repair pass itself is +1,377 raw in `src` and +3,442 in `tests`
 (the mock renderers, the harness, the contract and mutation suites), which is
 the honest answer to "what did the AI write": the app, every tab and every
 feature are the user's; the harness and the fixes are the difference.
@@ -41,9 +41,10 @@ feature are the user's; the harness and the fixes are the difference.
 ## Verification commands
 
 ```bash
-python run_audit.py                       # 12-suite health audit (~102s)
+python run_audit.py                       # 13-suite health audit (~117s)
 python -X utf8 tests/test_mesh_tools_contract.py   # clicks every Mesh Tools control
 python -X utf8 tests/test_dashboard_contract.py    # clicks every dashboard queue control
+python -X utf8 tests/test_rendering_tab_contract.py  # clicks every Rendering tab control
 python -X utf8 tests/test_pymeshlab_calls.py       # every filter/param/enum/method name vs the installed build
 python -X utf8 tests/test_texture_bake.py          # bakes 3 maps and reads the pixels back
 python -X utf8 tests/test_renderfox.py    # LOD/QEM/format/queue
@@ -65,7 +66,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 1 | Mesh Tools UI-to-backend contract | DONE |
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
-| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b DONE (every configured engine reaches the queue), 4c-1 DONE (output path, frame names, post-processing folder), 4c-2 DONE (priority, retry, concurrency, per-job pause/remove/stop), 4d partly done (dashboard pause/resume/progress wired; JPG→JPEG and the dead Render buttons remain) |
+| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | DONE - 4a live progress streaming; 4b every configured engine reaches the queue; 4c-1 output path, frame names, post-processing folder; 4c-2 priority, retry, concurrency, per-job pause/remove/stop; 4d-1 dashboard queue controls and readout; 4d-2 each renderer is asked for a format it has; 4d-3 the Rendering tab's toolbar and Render buttons work |
 | 5 | FBX/DAE claims + requirements gaps | not started |
 | 6 | Fabricated results presented as real | not started |
 | 7 | 22s startup | not started |
@@ -79,7 +80,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 - ~~`src/processing/render_engines.py:81-84` `get_progress()` returns a constant `0.0`; `job_manager.py:240` uses blocking `communicate()` so Blender's `Fra:` output is discarded → progress sits at 0% then jumps to 100.~~ **Engines fixed in Phase 4a** (verified streaming against the mock). `job_manager.py` still polls on a 1 s timer and now gets real values, but the queue loop itself is Phase 4c.
 - ~~`max_concurrent` appears **zero** times in `job_manager.py`; `pending_jobs[0]` (`:222`) plus one engine = strictly serial. Settings checkbox is write-only.~~ **Fixed in Phase 4c-2** - the queue fills slots, and the number now comes from `config.json` (clamped, junk-proof).
 - ~~`auto_retry` / `max_retries` exist only in `settings_tab.py:288-295`; no consumer in `job_manager.py` or `render_engines.py`.~~ **Fixed in Phase 4c-2** - `_queue_policy()` reads all four queue settings and `test_26` pins that the key names on both sides still match.
-- `src/ui/rendering_tab.py`: `render_btn` "Render Image" (`:624`) and `btn_render` "Render Frame" (`:764`) have **no `.clicked.connect`** — the Rendering tab cannot render. Toolbar view modes (`:720-751`) likewise unwired; only `action_export` is connected.
+- ~~`src/ui/rendering_tab.py`: `render_btn` "Render Image" (`:624`) and `btn_render` "Render Frame" (`:764`) have **no `.clicked.connect`** — the Rendering tab cannot render. Toolbar view modes (`:720-751`) likewise unwired; only `action_export` is connected.~~ **Fixed in Phase 4d-3** - every action and both buttons are connected, `test_01` asks Qt for the receiver count so a dead control fails the suite, and "Focus Selected" / MP4 / Samples were removed because nothing here could honour them.
 - ~~`src/ui/dashboard_tab.py:95` format dropdown offers `jpg`; `render_engines.py:199` sends `--render-format JPG` - Blender requires `JPEG`.~~ **Fixed in Phase 4d-2** - each engine's own format vocabulary now lives in `render_engines.py`, the dialog offers only what the chosen engine can be told, and the mock refuses a name Blender does not have.
 - `src/core/library_manager.py:978` thumbnail keyed on basename only in one shared dir → different models named `char.fbx` in different folders serve each other's picture; no mtime in key → stale thumbs after edits.
 - `src/ui/main_window.py:244`/`:249`/`:254` View menu → `switch_to_tab(0/1/2)`, but tab order (`:106-120`) is 0=Library, 1=Batch Render, 2=Models. All three entries land on the wrong tab.
@@ -419,7 +420,7 @@ The queue had one job pointer, one engine pointer, and one worker thread: `_curr
 
 **`src/ui/dashboard_tab.py`** - `selected_job_id()` (`:586`) reads the id from column 1, the same cell `remove_selected_job` and `get_selected_jobs` already use, and both buttons now go through it; `update_progress`/`update_status` are connected to `job_updated` (`:515-526`) - every frame line is a signal, so the bar follows the render with no second timer to drift - and both read `running_jobs()`, which is the queue's own view of what is live (`update_status` says `(+N more)` when the Settings tab allows concurrency). `on_queue_stopped()` hides the bar on `processing_stopped`, because "Pause queue on error" ends the run without a Stop click. A button that cannot do its job now says so in the status line instead of doing nothing.
 
-**Remaining in this phase:** `rendering_tab.py:624`/`:764` - "Render Image" and "Render Frame" - are still without a `clicked.connect`, and the toolbar view modes beside them are too.
+**Closed by 4d-2 and 4d-3 below:** the `jpg`→`JPEG` format bug and the dead Render buttons.
 
 ### Phase 4d-2 - a job asks for a format the renderer can be told about
 
@@ -437,6 +438,19 @@ The queue had one job pointer, one engine pointer, and one worker thread: `_curr
 - The probe's first run reported 2 of 5 as SKIPPED, not MISSED: the sources are CRLF, and an anchor containing `\n` never matches. The anchor now carries the file's own newline convention - a skipped mutation is a hole in the runner, not in the tests, and it looks identical to coverage from the summary line.
 - **Not covered here:** the mock still writes `.png`/`.exr` frames from its *scene* hint rather than the command-line format, so nothing checks that a JPEG job's files end `.jpg`. The app's post-processor does not filter on that extension (it records `'format'` in metadata only), so the mismatch has no consequence today; it becomes a test when a renderer is asked to write a format the queue then looks for. And the four Maya ids are the app's own - no package here can say whether `imageFormat 8` is JPEG, so the mock accepts any number and the repair leaves them exactly as they were rather than guessing.
 
+### Phase 4d-3 - the Rendering tab's toolbar does the thing its label says
+
+Nine toolbar actions and two "Render" buttons were drawn and connected to nothing; only "Export Scene" had a `triggered.connect`. The Settings pane's "Render Image" and the status bar's "Render Frame" were the same widget with the same silence, so the tab that is supposed to be the lookdev front end could not produce a picture. Two of its controls were not switchable at all: "Toggle Overlays" had nothing to toggle (`paintGL` drew the axis labels unconditionally inside a `try/except: pass`), and "Focus Selected" promised a selection the tab offers no way to make. "MP4 (H.264)" and "Samples: 128" were on-screen settings no code path could honour - the queue and `VideoExporter` render video, this tab never did.
+
+**`src/ui/model_viewer.py`** - `show_overlays` (`:231`) plus `set_show_overlays()` (`:1795`), and the three axis-label draws gated on it (`:1495-1506`). The flag is read through `getattr(self, 'show_overlays', True)` inside `paintGL`, so a viewer built before the attribute exists still draws.
+
+**`src/ui/rendering_tab.py`** - `RenderSettingsPanel` now owns one table per setting (`RESOLUTIONS` `:597`, `FORMATS` `:599`) that both the combo boxes and the renderer read, so the label the user picks and the file that gets written cannot disagree; `values(viewport_size)` (`:636`) returns `(size, extension, tag, denoise)`, with "Custom" meaning the viewport's own size because nothing else here knows how big the picture is. The pane emits `render_requested`, and the tab connects it to the same `render_frame` as the toolbar button. `set_view_mode` (`:788`) maps the four modes onto the viewport's real switches - wireframe/fill, textures, vertex colours, and grid + overlays off for `rendered` - and does not pretend there is a second renderer behind the tab. `reset_view`/`toggle_grid`/`toggle_overlays`/`snapshot` (`:805-856`) reach the viewport and say what changed. `render_frame` (`:858`) writes `{model}_0001.{ext}` in a folder the user chose, at exactly the requested resolution: `_grab_view` (`:828`) scales to cover and centre-crops instead of stretching, so a 4K file really is 3840x2160. Denoising runs through the Post-Processing tab's own `ImageDenoiser` pass on a temp file that keeps the frame's extension (OpenCV picks its writer from it); if the pass refuses, the raw frame stays and the status line says `as rendered` rather than `denoised`. `model_path` is tracked (`set_model`) so output lands beside the model it came from. "Focus Selected", the MP4 entry and the Samples spinbox are gone.
+
+**`tests/test_rendering_tab_contract.py`** (new, 15 tests, and the 13th audit suite) - the same widget-level pattern as Mesh Tools and the dashboard. `test_01` asks Qt directly: `action.receivers(action.triggered)` / `button.receivers(button.clicked)` must be nonzero, so a drawn-but-dead control fails the suite before any behaviour test has to notice. `TestViewportModes` pins each mode to the viewport state its label promises and checks the toggles flip both ways; `TestRenderFrame` reads the written file back with `cv2.imread` and requires the shape to be the resolution asked for, checks the format reaches the extension, that both buttons do the same job, that a refused denoise keeps the frame, that a declined folder writes nothing, and that nothing is renamed `Focus Selected`'s way. `QFileDialog` is shimmed to return a path - the real dialogs are modal and cannot be clicked headlessly - and restored in `tearDownClass`.
+
+- Proof: `tests/test_rendering_tab_contract.py` → `Ran 15 tests ... OK`; `tests/test_all_tabs_headless.py` → `Ran 14 tests ... OK`; `run_audit.py` → `100% (13/13 suites passed in 117.30s)`; 10 injected defects, 10 caught by a named test (each Render button disconnected, `set_render_mode` not reached, rendered mode leaving overlays on the plate, frame written at pane size, format ignored, "Focus Selected" restored, a failed denoise claiming success, `snapshot` not saving, `reset_view` not reaching the camera).
+- **Not covered here:** the suite asserts size, format, naming and viewport state - not pixel *content*. Headless GL gives no way to say "this is a shaded model, not a blank plate", so whether the preview looks right is still the user's eye. `_grab_view` centre-crops when the requested aspect is not the pane's, so a 4K frame from a wide window loses its edges rather than its resolution. And `rendered` is the OpenGL viewport with grid and labels off; it is a lookdev frame, which is what the status line reports, and a Cycles-quality still is still the queue's job.
+
 ## Known-deferred
 
 - `tools/` is gone. Its job - the pymeshlab name/parameter/enum truth - is now `tests/_pymeshlab_probe.py` + `tests/test_pymeshlab_calls.py`, which run inside the audit instead of being remembered by hand. Nothing references `tools/` any more.
@@ -444,3 +458,4 @@ The queue had one job pointer, one engine pointer, and one worker thread: `_curr
 - `MeshAnalyzer.is_manifold` / `mesh_tools_tab.update_mesh_info` still report `is_winding_consistent` under the label "Manifold". Kept open because a correct test needs a real edge-manifold check, which belongs with the quality-scoring work, not silently patched here.
 - Running the audit dirties the working tree: tests write into tracked files (`config/batch_templates.json` records a `created_at` timestamp; `tests/test_data/repaired.obj` and `simplified.obj` are regenerated outputs, not inputs - nothing reads them). They were restored with `git restore` before the Phase 2 commit, so every commit here is clean, but the suites need to write to a temp directory. Belongs with the dead-file/phase-8 hygiene pass, not a behaviour fix.
 - `format_converter.py` calls `os.makedirs(os.path.dirname(output_file))` at lines 262, 290 and 313, which raises for a bare filename (`dirname` is `''`). Latent - every UI path passes a directory - and not reached by any test yet. Fix with the format-claims phase.
+- `ModelViewer3D` defines `set_render_mode` twice (`:1605` and `:1860`) and `set_use_vertex_colors` twice (`:1865`/`:1889`) in the same class. Last definition wins, and both pairs do the same thing, so the Rendering tab's view modes reach the body they expect - but a reader cannot tell which one a control reaches without scrolling to the end. Left for the dead-code pass rather than edited blind.

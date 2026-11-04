@@ -228,6 +228,7 @@ class ModelViewer3D(QOpenGLWidget):
         self.render_mode = 'fill'  # 'fill' | 'wireframe' | 'overlay' | 'point_cloud'
         self.show_edges = False
         self.show_hidden_edges = False
+        self.show_overlays = True
         self.zebra_direction = 0  # 0: Horizontal, 1: Vertical
         self.zebra_scale = 1.0
         self.curvature_scale = 1.0
@@ -1466,6 +1467,7 @@ class ModelViewer3D(QOpenGLWidget):
                 painter.end()
 
             # 2D overlay: draw XYZ axis labels in RGB using QPainter
+            show_labels = getattr(self, 'show_overlays', True)
             try:
                 from PyQt6.QtGui import QVector4D
                 painter = QPainter(self)
@@ -1490,15 +1492,15 @@ class ModelViewer3D(QOpenGLWidget):
                 pz = project((0.0, 0.0, self.axis_length))
                 
                 # Draw axes lines and labels if projected points are valid
-                if origin and px:
+                if show_labels and origin and px:
                     painter.setPen(QPen(QColor(self.axis_colors['x']), 2))
                     painter.drawLine(*origin, *px)
                     painter.drawText(px[0], px[1], "X")
-                if origin and py:
+                if show_labels and origin and py:
                     painter.setPen(QPen(QColor(self.axis_colors['y']), 2))
                     painter.drawLine(*origin, *py)
                     painter.drawText(py[0], py[1], "Y")
-                if origin and pz:
+                if show_labels and origin and pz:
                     painter.setPen(QPen(QColor(self.axis_colors['z']), 2))
                     painter.drawLine(*origin, *pz)
                     painter.drawText(pz[0], pz[1], "Z")
@@ -1789,6 +1791,11 @@ class ModelViewer3D(QOpenGLWidget):
             self.setup_grid_buffers()
             self.doneCurrent()
         self.update()   
+
+    def set_show_overlays(self, show: bool):
+        """Toggle the drawn-over UI: the axis labels beside the model."""
+        self.show_overlays = bool(show)
+        self.update()
 
     def reset_view(self):
         """Reset camera and model transforms."""

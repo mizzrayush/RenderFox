@@ -591,42 +591,61 @@ class CameraPanel(BasePanel):
         self.camera_updated.emit(data)
 
 class RenderSettingsPanel(BasePanel):
-    """Panel for Output Resolution and Format."""
-    
+    """Panel for the resolution and file format of this tab's preview render."""
+
+    # The label the user reads, and what it means at the two places it has to go:
+    # the size the file is written at, and the tag Qt's image writer is told.
+    RESOLUTIONS = {"1920x1080 (HD)": (1920, 1080),
+                   "3840x2160 (4K)": (3840, 2160),
+                   "1280x720 (HD)": (1280, 720)}
+    FORMATS = {"PNG Sequence": ('png', 'PNG'), "JPG Sequence": ('jpg', 'JPG')}
+
+    render_requested = pyqtSignal()
+
     def __init__(self):
         super().__init__("Render Settings")
         self.init_ui()
-        
+
     def init_ui(self):
         # Output
         out_layout = self.add_section("Output")
-        
+
         self.res_combo = QComboBox()
-        self.res_combo.addItems(["1920x1080 (HD)", "3840x2160 (4K)", "1280x720 (HD)", "Custom"])
+        self.res_combo.addItems(list(self.RESOLUTIONS) + ["Custom"])
         out_layout.addWidget(self.create_row("Resolution:", self.res_combo))
-        
+
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["MP4 (H.264)", "PNG Sequence", "JPG Sequence"])
+        self.format_combo.addItems(list(self.FORMATS))
         out_layout.addWidget(self.create_row("Format:", self.format_combo))
-        
+
         # Quality
         qual_layout = self.add_section("Quality")
-        
-        self.samples = QSpinBox()
-        self.samples.setRange(1, 4096)
-        self.samples.setValue(128)
-        qual_layout.addWidget(self.create_row("Samples:", self.samples))
-        
+
         self.denoise = QCheckBox("Use AI Denoising")
         self.denoise.setChecked(True)
         qual_layout.addWidget(self.denoise)
-        
+
         self.render_btn = QPushButton("Render Image")
         self.render_btn.setMinimumHeight(40)
         self.render_btn.setStyleSheet(STYLESHEET_BUTTON_PRIMARY)
+        self.render_btn.clicked.connect(self.render_requested.emit)
         self.layout.addWidget(self.render_btn)
-        
+
         self.layout.addStretch()
+
+    def values(self, viewport_size):
+        """(size, extension, Qt tag, denoise) for the settings as they stand.
+
+        "Custom" means the viewport's own size: the resolution the file is written
+        at has to come from something real, and the pane is the only other thing
+        here that knows how big the picture is.
+        """
+        size = self.RESOLUTIONS.get(self.res_combo.currentText())
+        if size is None:
+            size = (max(1, viewport_size.width()), max(1, viewport_size.height()))
+        extension, tag = self.FORMATS.get(self.format_combo.currentText(),
+                                          self.FORMATS["PNG Sequence"])
+        return size, extension, tag, self.denoise.isChecked()
 
 # ============================================================================
 # MAIN RENDERING TAB
@@ -643,6 +662,7 @@ class RenderingTab(QWidget):
     
     def __init__(self):
         super().__init__()
+        self.model_path = None
         self.init_ui()
         
     def init_ui(self):
@@ -689,7 +709,9 @@ class RenderingTab(QWidget):
         self.camera_panel.camera_updated.connect(self.on_camera_updated)
         self.tool_panel.addTab(self.create_scrollable(self.camera_panel), "Camera")
         
-        self.tool_panel.addTab(self.create_scrollable(RenderSettingsPanel()), "Settings")
+        self.settings_panel = RenderSettingsPanel()
+        self.settings_panel.render_requested.connect(self.render_frame)
+        self.tool_panel.addTab(self.create_scrollable(self.settings_panel), "Settings")
         
         self.splitter.addWidget(self.tool_panel)
         
@@ -717,39 +739,35 @@ class RenderingTab(QWidget):
         parent_layout.addWidget(toolbar)
         
         # Render Modes with crisp vector icons
-        act_wire = toolbar.addAction("Wireframe")
-        act_wire.setIcon(get_icon("wireframe"))
-        
-        act_solid = toolbar.addAction("Solid")
-        act_solid.setIcon(get_icon("solid"))
-        
-        act_mat = toolbar.addAction("Material")
-        act_mat.setIcon(get_icon("material"))
-        
-        act_render = toolbar.addAction("Rendered")
-        act_render.setIcon(get_icon("rendered"))
-        
+        modes = [("Wireframe", "wireframe", 'wireframe'), ("Solid", "solid", 'solid'),
+                 ("Material", "material", 'material'), ("Rendered", "rendered", 'rendered')]
+        for label, icon_name, mode in modes:
+            action = toolbar.addAction(label)
+            action.setIcon(get_icon(icon_name))
+            action.triggered.connect(lambda checked=False, m=mode: self.set_view_mode(m))
+
         toolbar.addSeparator()
-        
+
         # View Controls
-        act_reset = toolbar.addAction("Reset View")
-        act_reset.setIcon(get_icon("reset_view"))
-        
-        act_focus = toolbar.addAction("Focus Selected")
-        act_focus.setIcon(get_icon("focus"))
-        
+        action_reset = toolbar.addAction("Reset View")
+        action_reset.setIcon(get_icon("reset_view"))
+        action_reset.triggered.connect(self.reset_view)
+
         toolbar.addSeparator()
-        
+
         # Tools
-        act_snap = toolbar.addAction("Snapshot")
-        act_snap.setIcon(get_icon("camera"))
-        
-        act_grid = toolbar.addAction("Toggle Grid")
-        act_grid.setIcon(get_icon("grid"))
-        
-        act_overlay = toolbar.addAction("Toggle Overlays")
-        act_overlay.setIcon(get_icon("overlays"))
-        
+        action_snap = toolbar.addAction("Snapshot")
+        action_snap.setIcon(get_icon("camera"))
+        action_snap.triggered.connect(self.snapshot)
+
+        action_grid = toolbar.addAction("Toggle Grid")
+        action_grid.setIcon(get_icon("grid"))
+        action_grid.triggered.connect(self.toggle_grid)
+
+        action_overlays = toolbar.addAction("Toggle Overlays")
+        action_overlays.setIcon(get_icon("overlays"))
+        action_overlays.triggered.connect(self.toggle_overlays)
+
         toolbar.addSeparator()
         action_export = toolbar.addAction("Export Scene")
         action_export.setIcon(get_icon("export"))
@@ -764,10 +782,133 @@ class RenderingTab(QWidget):
         btn_render = QPushButton("Render Frame")
         btn_render.setIcon(get_icon("rendering", color="#ffffff"))
         btn_render.setProperty("primary", "true")
+        btn_render.clicked.connect(self.render_frame)
         toolbar.addWidget(btn_render)
+
+    def set_view_mode(self, mode):
+        """Switch the viewport between the four looks the toolbar offers.
+
+        These are the viewport's own switches, and `rendered` is the clean plate:
+        textured, lit, grid and axis labels off, which is what the frame is when it
+        is meant to be judged rather than worked on. There is no second renderer
+        behind this tab, so no mode here means sampling, ray tracing or denoising -
+        those are the queue's and the DCC's job.
+        """
+        self.viewport.set_render_mode('wireframe' if mode == 'wireframe' else 'fill')
+        self.viewport.set_use_textures(mode in ('material', 'rendered'))
+        self.viewport.set_use_vertex_colors(mode != 'solid')
+        if mode == 'rendered':
+            self.viewport.set_show_grid(False)
+            self.viewport.set_show_overlays(False)
+        self.status_message.emit(f"Viewport: {mode.title()}")
+
+    def reset_view(self):
+        """Put the camera and the model transform back where they started."""
+        self.viewport.reset_view()
+        self.status_message.emit("View reset")
+
+    def toggle_grid(self):
+        show = not getattr(self.viewport, 'show_grid', False)
+        self.viewport.set_show_grid(show)
+        self.status_message.emit(f"Grid: {'on' if show else 'off'}")
+
+    def toggle_overlays(self):
+        show = not getattr(self.viewport, 'show_overlays', True)
+        self.viewport.set_show_overlays(show)
+        self.status_message.emit(f"Overlays: {'on' if show else 'off'}")
+
+    def _output_seed(self):
+        """Where a picture from this tab should land: beside the model, if there is one."""
+        return os.path.dirname(os.path.abspath(self.model_path)) if self.model_path else os.getcwd()
+
+    def _frame_name(self, extension):
+        stem = os.path.splitext(os.path.basename(self.model_path))[0] if self.model_path else 'render'
+        return f"{stem}_0001.{extension}"
+
+    def _grab_view(self, size):
+        """The viewport, at exactly the requested size.
+
+        The pane is rarely the aspect ratio the settings ask for, so the image is
+        scaled to cover the box and the overflow is cropped from the centre: the
+        file is the resolution it claims, and the pixels are not stretched to get
+        there.
+        """
+        image = self.viewport.grab().toImage()
+        if image.isNull():
+            return None
+        scaled = image.scaled(size[0], size[1], Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                              Qt.TransformationMode.SmoothTransformation)
+        left = max(0, (scaled.width() - size[0]) // 2)
+        top = max(0, (scaled.height() - size[1]) // 2)
+        return scaled.copy(left, top, size[0], size[1])
+
+    def snapshot(self):
+        """Save what the viewport shows right now, at its own size, as a PNG."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Viewport Snapshot", os.path.join(self._output_seed(), 'snapshot.png'),
+            "PNG image (*.png)")
+        if not path:
+            return
+        image = self.viewport.grab().toImage()
+        if image.isNull() or not image.save(path, 'PNG'):
+            self.status_message.emit(f"Snapshot could not be written to {path}")
+            return
+        self.status_message.emit(f"Snapshot saved to {path}")
+
+    def render_frame(self):
+        """Write the current view as one frame of the chosen sequence.
+
+        This is the tab's own render: the OpenGL view, at the resolution and format
+        the Settings pane asks for, denoised through the same OpenCV pass the
+        Post-Processing tab uses when the box is ticked. It is a frame of a
+        lookdev preview, not a Cycles picture, and it is reported as what it is -
+        the file, at the size it has.
+        """
+        size, extension, tag, denoise = self.settings_panel.values(self.viewport.size())
+        directory = QFileDialog.getExistingDirectory(self, "Choose an output folder",
+                                                     self._output_seed())
+        if not directory:
+            self.status_message.emit("Render stopped: no output folder chosen")
+            return
+        path = os.path.join(directory, self._frame_name(extension))
+        image = self._grab_view(size)
+        if image is None:
+            self.status_message.emit("Nothing to render: the viewport has no image")
+            return
+        if not image.save(path, tag):
+            self.status_message.emit(f"Render failed: {path} could not be written")
+            return
+        cleaned = self._denoise_in_place(path) if denoise else False
+        self.status_message.emit(
+            f"Rendered {os.path.basename(path)} ({size[0]}x{size[1]}"
+            f"{', denoised' if cleaned else ', as rendered'})")
+
+    def _denoise_in_place(self, path):
+        """Denoise the frame through the Post-Processing tab's own pass, or keep the raw one.
+
+        The denoiser writes to the path it is handed, so a failure part-way through
+        would otherwise destroy the frame that was already on disk - and the file has
+        to keep its real extension, or OpenCV has no writer to pick.
+        """
+        head, extension = os.path.splitext(path)
+        temporary = f"{head}.denoising{extension}"
+        try:
+            from ..processing.postprocessor import ImageDenoiser
+            done = ImageDenoiser().denoise_image(path, temporary)
+        except Exception as error:
+            print(f"Denoising unavailable: {error}")
+            done = False
+        if done and os.path.isfile(temporary):
+            os.replace(temporary, path)
+            return True
+        if os.path.isfile(temporary):
+            os.remove(temporary)
+        return False
+
         
     def set_model(self, model_path):
         """Load a model into the viewport."""
+        self.model_path = model_path
         self.viewport.load_model(model_path)
         self.status_message.emit(f"Loaded model: {os.path.basename(model_path)}")
         
