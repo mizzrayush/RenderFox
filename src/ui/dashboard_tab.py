@@ -517,6 +517,13 @@ class DashboardTab(QWidget):
         self.job_manager.job_updated.connect(self.refresh_table)
         self.job_manager.job_removed.connect(self.refresh_table)
         self.job_manager.queue_updated.connect(self.update_status)
+        # Every frame the renderer reports is a job_updated, so the bar and the
+        # status line follow the render instead of waiting for a poll of their own.
+        self.job_manager.job_updated.connect(self.update_progress)
+        self.job_manager.job_updated.connect(self.update_status)
+        # The queue can stop itself (Pause queue on error), and the user then has
+        # to see that it stopped rather than a bar frozen where it was.
+        self.job_manager.processing_stopped.connect(self.on_queue_stopped)
         
         # Connect stats updates to all job changes
         self.job_manager.job_added.connect(self.update_stats_cards)
@@ -564,20 +571,47 @@ class DashboardTab(QWidget):
         """Stop processing the job queue."""
         self.job_manager.stop_processing()
         self.queue_progress.setVisible(False)
+
+    def on_queue_stopped(self):
+        """The queue can stop itself, and the bar has to show that it did.
+
+        "Pause queue on error" ends the run without a Stop click, so hiding the
+        bar cannot live only in `stop_queue`.
+        """
+        self.queue_progress.setVisible(False)
+        self.update_status()
     
+    def selected_job_id(self):
+        """The id stored on the row the cursor is on.
+
+        Column 0 is the select checkbox (a `QCheckBox` cell widget, so `item()`
+        there is None) and column 1 is the name, which carries the job id in its
+        UserRole - the same pair `remove_selected_job` and `get_selected_jobs`
+        already read.
+        """
+        row = self.job_table.currentRow()
+        if row < 0:
+            return None
+        item = self.job_table.item(row, 1)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
     def pause_selected_job(self):
         """Pause the selected job."""
-        current_row = self.job_table.currentRow()
-        if current_row >= 0:
-            job_id = self.job_table.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
-            self.job_manager.pause_job(job_id)
-    
+        job_id = self.selected_job_id()
+        if job_id is None:
+            self.status_label.setText("Select a rendering job to pause")
+            return
+        if not self.job_manager.pause_job(job_id):
+            self.status_label.setText("Only a job that is rendering can be paused")
+
     def resume_selected_job(self):
         """Resume the selected job."""
-        current_row = self.job_table.currentRow()
-        if current_row >= 0:
-            job_id = self.job_table.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
-            self.job_manager.resume_job(job_id)
+        job_id = self.selected_job_id()
+        if job_id is None:
+            self.status_label.setText("Select a paused job to resume")
+            return
+        if not self.job_manager.resume_job(job_id):
+            self.status_label.setText("Only a paused job can be resumed")
     
     def get_selected_jobs(self):
         """Get all currently selected jobs."""
@@ -907,19 +941,18 @@ class DashboardTab(QWidget):
         return color_map.get(status, QColor(255, 255, 255))
     
     def update_progress(self):
-        """Update progress indicators."""
-        if self.job_manager.current_job:
-            progress = self.job_manager.current_job.progress
-            self.queue_progress.setValue(int(progress))
-    
+        """The queue bar tracks the job the queue is rendering."""
+        running = self.job_manager.running_jobs()
+        self.queue_progress.setValue(int(running[0].progress) if running else 0)
+
     def update_status(self):
-        """Update status display."""
-        if self.job_manager.is_processing:
-            current_job = self.job_manager.current_job
-            if current_job:
-                self.status_label.setText(f"Processing: {current_job.name}")
-            else:
-                self.status_label.setText("Processing queue...")
+        """One line that says what the queue is doing, including how many jobs."""
+        running = self.job_manager.running_jobs()
+        if running:
+            extra = f" (+{len(running) - 1} more)" if len(running) > 1 else ""
+            self.status_label.setText(f"Processing: {running[0].name}{extra}")
+        elif self.job_manager.is_processing:
+            self.status_label.setText("Processing queue...")
         else:
             self.status_label.setText("Ready")
     
