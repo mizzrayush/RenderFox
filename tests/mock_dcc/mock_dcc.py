@@ -32,13 +32,14 @@ Scene files are JSON, exactly like a real scene carries its own settings:
 
     {"seconds_per_frame": 0.05, "frame_count": 4, "output_dir": "...",
      "prefix": "hero", "fail_after": 2, "hang": false, "write_files": false,
-     "silent": true, "noise": 40}
+     "silent": true, "noise": 40, "stderr_progress": true}
 
-`silent` suppresses the per-frame stdout lines only - it is how a build that
+`silent` suppresses the per-frame progress lines only - it is how a build that
 words its progress differently from the syntax recorded here is simulated, so
 the engines' fallback evidence (files on disk) gets tested and not just the
-parsers. `noise` floods both pipes at once, which is what a single buffered
-read of stdout cannot survive.
+parsers. `stderr_progress` moves those same lines to stderr, because which pipe
+a given build reports frames on is not this app's choice. `noise` floods both
+pipes at once, which is what a single buffered read of stdout cannot survive.
 
 Run directly while debugging:
     python tests/mock_dcc/mock_dcc.py blender --version
@@ -337,9 +338,10 @@ def render(dcc, project, output, output_dir, start, last, scene):
     stem = scene.get('prefix') or (os.path.splitext(os.path.basename(output))[0]
                                    if output else 'frame')
     suffix = 'exr' if scene.get('format') == 'exr' else 'png'
+    report = log_error if scene.get('stderr_progress') else log
     for position, frame in enumerate(frames, start=1):
         if not scene.get('silent'):
-            log(frame_line(dcc, frame, frames[-1]))
+            report(frame_line(dcc, frame, frames[-1]))
         for _ in range(int(scene.get('noise', 0))):
             # Chatty on both pipes during the frame: the shape a reader that
             # takes stdout first and stderr second cannot survive.

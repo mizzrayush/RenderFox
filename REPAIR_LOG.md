@@ -48,7 +48,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 1 | Mesh Tools UI-to-backend contract | DONE |
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
-| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b detection, 4c queue, 4d dashboard wiring |
+| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b DONE (every configured engine reaches the queue), 4c queue, 4d dashboard wiring |
 | 5 | FBX/DAE claims + requirements gaps | not started |
 | 6 | Fabricated results presented as real | not started |
 | 7 | 22s startup | not started |
@@ -72,7 +72,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 
 **Confirmed by code reading**
 
-- `job_manager.py:340` uses `sys.platform` but `sys` is never imported (harmless on Windows, `NameError` on mac/linux).
+- ~~`job_manager.py:340` uses `sys.platform` but `sys` is never imported (harmless on Windows, `NameError` on mac/linux).~~ **Fixed in Phase 4b** - the read is now `system_name(os.name, sys.platform)` with `sys` imported, and the branch it lived in was rewritten.
 - ~~`render_engines.py:229` `os.path.dirname(job.output_path)` while the dialog returns a directory (`dashboard_tab.py:235`).~~ **Worse than the inventory said, and only half fixed:** `browse_output` uses `getExistingDirectory`, so `job.output_path` from both `AddJobDialog` (`:546`) and imported job JSON (`:781`) is a **directory**, and `dirname()` of a directory is its parent - frames land one level up, and Blender is handed `--render-output D:\Renders`, which writes `D:\Renders0001.png`. Phase 4a removed the `makedirs('')` crash and made every path absolute; normalising "directory vs prefix" into a real output prefix is Phase 4c.
 - `render_engines.py:413-442` Unreal writes a 3-key `MoviePipelineConfig.json` its own comment calls "Simplified"; UE does not consume it. `:513-525` C4D flags `-nogui -render -frame a..b` do not exist in C4D's CLI.
 - `dashboard_tab.py:909` `update_progress` never connected → the visible queue progress bar never moves. `:669` Set Priority mutates `job.priority` the queue never sorts on.
@@ -211,7 +211,7 @@ Nothing in `render_engines.py` had ever been executed: `detect_available_softwar
 **Measured facts Phase 4 has to work with**
 
 - `test_10_nothing_about_the_render_is_readable_while_it_runs` records the current ceiling deliberately: `get_progress()` returns a constant `0.0`, nothing calls it, and `render_job` uses `communicate()`, so stdout is only available after the render ends. Phase 4 replaces that test with one requiring the `Fra:` lines above to drive the bar - it must not be kept.
-- `detect_available_software()` returns only `blender` even when `config.json` names all four correctly (`_get_user_configured_path('maya' / 'cinema4d' / 'unreal')` all return the path, but only `_get_blender_paths` asks for it). `JobManager._process_queue` gates on that dict, so a configured Maya/C4D/Unreal job fails with "No render engine available for maya" before the command is ever built. This is Phase 4's first fix, not a harness limitation.
+- ~~`detect_available_software()` returns only `blender` even when `config.json` names all four correctly (`_get_user_configured_path('maya' / 'cinema4d' / 'unreal')` all return the path, but only `_get_blender_paths` asks for it). `JobManager._process_queue` gates on that dict, so a configured Maya/C4D/Unreal job fails with "No render engine available for maya" before the command is ever built. This is Phase 4's first fix, not a harness limitation.~~ **Fixed in Phase 4b** - all four getters now ask, and `tests/test_job_manager.py` runs a configured Maya job through the real queue to COMPLETED.
 - `pause()` and `resume()` do nothing without psutil - they set no state and report no error, so the Pause button would lie. psutil 6.0.0 is installed here but is **not** in `requirements.txt` (Phase 5).
 
 ### Phase 4a - render progress streamed while the renderer runs
@@ -266,6 +266,50 @@ Then five more for the path rules, same method:
 - `python -X utf8 tests/test_mock_dcc.py` → `Ran 22 tests ... OK` (8.9 s).
 - `python run_audit.py` → `100% (9/9 suites passed in 81.52s)`.
 - Both scratch mutation runners were deleted after these runs (one-shot probes, not tooling).
+
+### Phase 4b - every configured engine reaches the queue
+
+Phase 4a made a render readable; it did not make one *startable*. Three separate lookups stood between the Settings tab and a Maya job, and all three only ever asked about Blender.
+
+**`src/processing/render_engines.py` (+30 / -17)**
+
+- New `_preferred_paths(config_key, commands)` (`:685`): the path `config.json` names for this exact package first, then one entry per `shutil.which(command)` hit, deduplicated. `_get_blender_paths`, `_get_maya_paths`, `_get_unreal_paths` and `_get_cinema4d_paths` each call it (`blender`/`maya`/`unreal`+`cinema4d` keys, commands `blender`, `maya`, `UnrealEditor`+`UnrealEditor-Cmd`, `cinema4d`+`Cinema 4D`). Previously only the Blender getter asked at all, so `detect_available_software()` could not return Maya even when its path was configured correctly.
+- Maya's list is `["maya"]` only, because the lookup has to return a program that accepts the line `MayaEngine.get_render_command` builds - `maya -batch -file scene.ma -command "<mel>"`, which is what `mock_dcc.parse_maya` refuses anything else than. `Render.exe` is a different program with a different call shape, and putting it in this list would hand a job to something that starts and renders nothing. That contrast is a design reason, not something measured on this machine.
+- `execute()` now hands `self._observe` to the **stderr** reader as well (`:190`). Which pipe a build reports frames on is not this app's choice, and a `Fra:` line on stderr is still a frame line; stdout-only parsing left the bar at 0 for such a build, where the exit-0 verdict then had to carry the whole job. `tests/mock_dcc/mock_dcc.py` grew a `stderr_progress` scene knob (frame lines to stderr) and `test_17` requires `[25, 50, 75, 100]` from it for all four packages.
+
+**`src/core/job_manager.py` (+52 / -25)**
+
+- `sys` was never imported here while `_get_executable_path` read `sys.platform` at old `:340`. The `NameError` was swallowed by that method's own `except Exception`, which returned `None`, so on mac and Linux the fallback path list was unreachable and the job died with "No executable found". `import sys` is now at `:6` and the branch is gone.
+- That read became `system_name(os_name, platform_name)` (`:17`), taking the values as arguments so all three platforms are testable on the one machine this runs on (`test_04`).
+- `_get_executable_path` (`:360`) is now two steps instead of three: the configured path via `_get_user_configured_path`, then the same `_get_*_paths(system)` list the detector walks (which carries the PATH lookups). The 12-line duplicated `config.json` reader and the trailing `shutil.which(software_type.value)` are deleted - the first re-read what the helper already reads, the second searched for the enum's own spelling (`unreal`, `cinema4d`) rather than the binary names the surviving list asks for (`UnrealEditor`, `UnrealEditor-Cmd`), so it could only ever hit for Blender and Maya, which `_preferred_paths` already covers. Both deletions are covered by `test_01`/`test_05`/`test_06`.
+- The software cache (`:318`) is now keyed on the file it is a view of: `_config_stamp()` (`:347`) hashes `config.json`'s bytes, and a cached answer is reused only when that digest is unchanged *and* the entry is under 5 minutes old. Saving a Maya path in Settings therefore reaches the next job instead of waiting out the window on a stale answer. A digest rather than `st_mtime`: the file is a few hundred bytes, and a one-second mtime is exactly the resolution at which "Save" and "Start Queue" happen.
+
+**`tests/mock_dcc/harness.py` (+9 / -2)** - the shims moved from `<root>` to `<root>/bin`. This was a harness bug hiding an app truth: `shutil.which` searches the current working directory on Windows, so with the shims sitting next to `config.json` the sandbox could not express "this package is not installed anywhere" - `test_02` and `test_07` failed for that reason before the app changed. `path_key()` in the new suite is the second half of the same discovery: `shutil.which` rebuilds the name from `PATHEXT` and returns `maya.CMD` for a file written `maya.cmd`, so paths from PATH have to be compared the way the OS compares them.
+
+**`tests/test_job_manager.py` (new, 308 lines, 12 tests)** - the queue itself, driven through the real `JobManager` thread with real child processes and nothing monkeypatched. `TestSoftwareDiscovery`: `test_01` all four configured packages available *and* resolving to the configured executable; `test_02` a package named in no config is not available; `test_03` the cache is reused for an unchanged `config.json` and rebuilt when it changes; `test_04` platform keys; `test_05` an empty `config.json` with the shims on PATH still finds all four; `test_06` a job found only through PATH renders to COMPLETED. `TestQueueExecution`: `test_05` the flagship case - a configured **Maya** job, which before this phase could not even reach a command line - completes with 3 frames and progress 100; `test_06` a `job_updated` snapshot carrying `RENDERING` and `0 < progress < 100`, i.e. the bar moved *during* the render; `test_07` an unconfigured package fails with a message naming it; `test_08` stop returns the job to PENDING and cuts the render short; `test_09` queue stats; `test_10` a directory typed into Settings (`MayaEngine.is_available()` at `render_engines.py:375` can only ask whether the path exists - real Maya has no version flag to probe, and `_get_user_configured_path` accepts any existing path) lands the job on FAILED naming Maya, and the queue still renders the next job.
+
+- `test_10` was written expecting the second half to pass on the first try. It did not, and the reason was my test's own fault: `write_config({'maya': …})` replaces the whole software map, so Blender stopped being configured and the follow-up job failed honestly. Corrected to override one key. The app never disagreed with the documented behaviour, which is worth stating because the alternative reading - "the queue poisoned itself" - was the hypothesis being tested.
+- `job_manager.py:392` `_update_progress` (the 1 s timer that re-reads `get_progress()`) has no test of its own: the engine callback already emits, so nothing observable changes when the timer is deleted. It is kept as the fallback for an engine that updates `_progress` without calling back, and recorded here as covered-by-design rather than covered-by-a-test.
+- The versioned-install-folder scans inside `_get_*_paths` (`C:\Program Files\Blender Foundation\…` and friends) are not reachable from a temp directory, so no suite here proves they work; the two routes that are proven are the configured path and PATH.
+
+**Proof** - control run green, then ten defects injected one at a time, each caught by a named test, each file restored byte-identically (sha256 compared), scratch runner `_probe_4b.py` deleted:
+
+| injected defect | caught by |
+|---|---|
+| `config.json` consulted for Blender only | test_01 (job manager), test_09 (mock) |
+| Maya never looked up on PATH | test_05, test_06 |
+| Cinema 4D config key misspelled `"cinema 4d"` | test_01 |
+| progress read from stdout only | test_17 (mock) |
+| `except OSError` around `Popen` widened to `ValueError` | test_10 |
+| `system_name` never returns darwin | test_04 |
+| Unreal dropped from the executable map | test_01, test_05 |
+| `_config_stamp` returns a constant | test_03 |
+| cache reuse stops comparing the config digest | test_03 |
+| queue failure message stops naming the package | test_07 |
+
+- `python -X utf8 tests/test_job_manager.py` → `Ran 12 tests ... OK` (15.3 s); `tests/test_mock_dcc.py` → `Ran 24 tests ... OK` (9.8 s).
+- `run_audit.py` grew a tenth suite (`job_queue`, "Render Queue & Software Discovery") → `100% (10/10 suites passed in 83.33s)`.
+- `config/batch_templates.json`, `tests/test_data/repaired.obj` and `tests/test_data/simplified.obj` were `git restore`d again after the audit run (see Known-deferred).
 
 ## Known-deferred
 

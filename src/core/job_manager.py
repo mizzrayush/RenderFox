@@ -3,13 +3,28 @@ Job manager for handling render queues and job execution.
 """
 
 import os
+import sys
+import hashlib
 import uuid
 import threading
 import time
 from typing import List, Optional, Callable, Dict
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from .models import RenderJob, JobStatus, SoftwareType
-from ..processing.render_engines import create_render_engine, detect_available_software
+from ..processing.render_engines import (create_render_engine, detect_available_software,
+                                         _get_user_configured_path)
+
+def system_name(os_name: str, platform_name: str) -> str:
+    """Map what Python knows about the machine onto the keys the path lists use.
+
+    `os.name` and `sys.platform` are passed in rather than read, so the mapping
+    can be tested for all three platforms on the one platform this runs on.
+    """
+    if os_name == 'nt':
+        return "windows"
+    if platform_name == 'darwin':
+        return "darwin"
+    return "linux"
 
 class JobManager(QObject):
     """Manages the render job queue and execution."""
@@ -35,6 +50,7 @@ class JobManager(QObject):
         self._available_software_cache = {}
         self._cache_timestamp = 0
         self._cache_duration = 300  # 5 minutes
+        self._cache_stamp = None
         
         # Timer for updating job progress
         self._progress_timer = QTimer()
@@ -300,17 +316,26 @@ class JobManager(QObject):
         self._is_processing = False
 
     def _get_cached_available_software(self) -> Dict[SoftwareType, str]:
-        """Get available software with caching for performance."""
+        """Get available software, cached because a detection pass runs subprocesses.
+
+        The cache is a view of `config.json`, so it is keyed on that file: when
+        the user saves a Maya path in Settings the next job has to see it,
+        instead of waiting out the 5-minute window on a stale answer.
+        """
         current_time = time.time()
-        
+        stamp = self._config_stamp()
+
         # Check if cache is still valid
-        if (current_time - self._cache_timestamp) < self._cache_duration and self._available_software_cache:
+        if (self._available_software_cache
+                and stamp == self._cache_stamp
+                and (current_time - self._cache_timestamp) < self._cache_duration):
             return self._available_software_cache
         
         # Refresh cache
         try:
             self._available_software_cache = detect_available_software()
             self._cache_timestamp = current_time
+            self._cache_stamp = stamp
         except Exception as e:
             print(f"Error detecting available software: {e}")
             # Return empty dict if detection fails
@@ -318,26 +343,33 @@ class JobManager(QObject):
         
         return self._available_software_cache
 
+    @staticmethod
+    def _config_stamp() -> Optional[str]:
+        """A digest of config.json, or None when there is none.
+
+        Hashing the bytes beats an mtime: config.json is a few hundred bytes, and
+        a modified-time can be one-second granular on a network share, which is
+        exactly the resolution at which "Save" then "Start Queue" happens.
+        """
+        try:
+            with open(os.path.join(os.getcwd(), 'config.json'), 'rb') as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            return None
+
     def _get_executable_path(self, software_type: SoftwareType, available_software: Dict[SoftwareType, str]) -> Optional[str]:
         """Get the executable path for a specific software type."""
         try:
-            # 1. Check user-configured path in config.json
-            import json, shutil
-            config_path = os.path.join(os.getcwd(), 'config.json')
-            if os.path.exists(config_path):
-                try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
-                        config_data = json.load(f)
-                        software_map = config_data.get('software', {})
-                        configured_path = software_map.get(software_type.value, '').strip()
-                        if configured_path and os.path.exists(configured_path):
-                            return configured_path
-                except Exception:
-                    pass
+            # 1. The path the Settings tab stored for this exact package.
+            configured = _get_user_configured_path(software_type.value)
+            if configured:
+                return configured
 
-            # 2. Check engine path getters
-            from ..processing.render_engines import _get_blender_paths, _get_maya_paths, _get_unreal_paths, _get_cinema4d_paths
-            system = "windows" if os.name == 'nt' else ("darwin" if sys.platform == 'darwin' else "linux")
+            # 2. The same list the detector walks, so the two can never disagree
+            #    about what is installed (it carries PATH lookups too).
+            from ..processing.render_engines import (_get_blender_paths, _get_cinema4d_paths,
+                                                     _get_maya_paths, _get_unreal_paths)
+            system = system_name(os.name, sys.platform)
             
             paths_map = {
                 SoftwareType.BLENDER: _get_blender_paths(system),
@@ -350,11 +382,6 @@ class JobManager(QObject):
             for path in paths:
                 if path and os.path.exists(path):
                     return path
-            
-            # 3. Check shutil.which
-            which_exe = shutil.which(software_type.value)
-            if which_exe:
-                return which_exe
             
             return None
             

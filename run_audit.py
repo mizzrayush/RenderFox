@@ -74,6 +74,12 @@ SUITES = [
         "description": "Runs every engine's real command line against a stand-in renderer process and checks versions, progress syntax, exit codes, pause and stop"
     },
     {
+        "id": "job_queue",
+        "name": "Render Queue & Software Discovery",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_job_manager.py")],
+        "description": "Drives the real JobManager thread against the mock renderers: configured engines are discovered, a queued job renders with live progress, stop returns it to pending"
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

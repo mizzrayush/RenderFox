@@ -34,7 +34,8 @@ from mock_dcc import mock_dcc as dcc
 from src.core.models import RenderJob, SoftwareType
 from src.processing.render_engines import (BlenderEngine, Cinema4DEngine,
                                            MayaEngine, UnrealEngine,
-                                           create_render_engine)
+                                           create_render_engine,
+                                           detect_available_software)
 
 # What each package prints per frame, in its own syntax. The parsers in
 # `render_engines.py` are written against these lines rather than a guess, and
@@ -284,10 +285,18 @@ class TestEngineLaunchPath(MockDCCCase):
         self.assertEqual(6, len(self.frames_written()))
 
     def test_09_configured_path_is_discovered_by_the_detector(self):
-        """`config.json` in the working directory is how a user points RenderFox at their install."""
-        from src.processing.render_engines import detect_available_software
+        """`config.json` in the working directory is how a user points RenderFox at their install.
+
+        Every engine has to be looked up through it, not just Blender: the queue
+        refuses a job whose software is missing from this dict, so a configured
+        Maya that the detector never asks about fails with "No render engine
+        available for maya" before a command line is ever built.
+        """
         found = detect_available_software()
-        self.assertIn(SoftwareType.BLENDER, found)
+        for key in CLASSES:
+            with self.subTest(package=key):
+                self.assertIn(SoftwareType(key), found,
+                              f'{key} is configured in config.json and was still not detected')
 
     def test_10_progress_lines_move_the_bar_while_the_render_runs(self):
         """Each package's frame lines are read, not discarded.
@@ -390,6 +399,23 @@ class TestEngineLaunchPath(MockDCCCase):
         self.assertTrue(engine.render_job(again),
                         f'the second pass over the same names was refused: {again.error_message}')
         self.assertEqual(3, len(self.frames_written()))
+
+    def test_17_frame_lines_on_stderr_move_the_bar_too(self):
+        """Which pipe a build reports frames on is not this app's choice.
+
+        Reading progress from stdout alone would leave the bar stuck at 0 for a
+        build that writes its frame lines to stderr, so both streams are
+        watched and parsed the same way.
+        """
+        for key in CLASSES:
+            with self.subTest(package=key):
+                job = self.job(key, frames=(1, 4), name=key, stderr_progress=True)
+                seen = []
+                engine = self.engine(key)
+                engine.set_progress_callback(seen.append)
+                self.assertTrue(engine.render_job(job), job.error_message)
+                self.assertEqual([25.0, 50.0, 75.0, 100.0], seen,
+                                 f'{key} reported frames on stderr and none reached the bar')
 
 
 def pid_is_live(pid):

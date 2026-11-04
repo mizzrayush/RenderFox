@@ -12,6 +12,11 @@ Each executable is a two-line shim that forwards to `mock_dcc.py` with the
 package name it is emulating, which is what makes `BlenderEngine.is_available`
 ("Blender" must appear in stdout of `--version`) pass honestly.
 
+The shims live in `<root>/bin`, never in `<root>` itself. The app looks up an
+unconfigured package with `shutil.which`, and on Windows that search includes
+the current working directory - so shims sitting next to `config.json` would be
+found even when the test means "this package is not installed anywhere".
+
 Used by tests/test_mock_dcc.py and, from Phase 4 on, by the job manager tests.
 """
 
@@ -43,11 +48,13 @@ def _shim_body(package):
 
 
 def install(root):
-    """Create shims + config.json under `root` and return {software: path}."""
+    """Create shims in `<root>/bin` + config.json in `root`; return {software: path}."""
+    binary_dir = os.path.join(root, 'bin')
+    os.makedirs(binary_dir, exist_ok=True)
     executables = {}
     for key, (package, name, _extension) in PACKAGES.items():
         filename = name + ('.cmd' if IS_WINDOWS else '')
-        path = os.path.join(root, filename)
+        path = os.path.join(binary_dir, filename)
         with open(path, 'w', encoding='utf-8', newline='') as handle:
             handle.write(_shim_body(package))
         if not IS_WINDOWS:

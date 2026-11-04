@@ -3,6 +3,7 @@ Render engines for different 3D software integration.
 """
 
 import os
+import shutil
 import subprocess
 import json
 import re
@@ -83,7 +84,7 @@ class RenderEngine(ABC):
         return self._progress
 
     def parse_progress(self, line: str) -> Optional[float]:
-        """Turn one stdout line into a percentage, or None if it carries no progress.
+        """Turn one output line into a percentage, or None if it carries no progress.
 
         Subclasses implement this against the syntax their package really
         prints; `tests/test_mock_dcc.py` records those lines.
@@ -159,7 +160,7 @@ class RenderEngine(ABC):
             return {}
 
     def execute(self, cmd: List[str], job: RenderJob) -> bool:
-        """Run one render, reporting progress from live stdout."""
+        """Run one render, reporting progress from live output."""
         self.should_stop = False
         self._progress = 0.0
         output_dir = self._output_directory(job)
@@ -181,9 +182,12 @@ class RenderEngine(ABC):
         self.current_process = process
         stdout_lines: List[str] = []
         stderr_lines: List[str] = []
+        # Both streams are watched for progress: which one a given build reports
+        # frames on is not this app's choice, and a `Fra:` line on stderr is
+        # still a frame line.
         readers = [
             threading.Thread(target=self._drain, args=(process.stdout, stdout_lines, self._observe)),
-            threading.Thread(target=self._drain, args=(process.stderr, stderr_lines)),
+            threading.Thread(target=self._drain, args=(process.stderr, stderr_lines, self._observe)),
         ]
         for reader in readers:
             reader.start()
@@ -678,20 +682,29 @@ def detect_available_software() -> Dict[SoftwareType, str]:
     
     return available_software
 
-def _get_blender_paths(system: str) -> List[str]:
-    """Get comprehensive Blender installation paths."""
+def _preferred_paths(config_key: str, commands: List[str]) -> List[str]:
+    """Where the user's own configuration and PATH say a package lives.
+
+    The Settings tab stores an absolute executable path in `config.json`, and
+    that is the only mechanism that works for a non-default install - the
+    hardcoded version folders below are a guess that has to stay behind it, in
+    the order the list is built. Every engine has to ask, not just Blender:
+    `JobManager` refuses any job whose software is missing from
+    `detect_available_software()`.
+    """
     paths = []
-    
-    # Check user-configured path
-    user_path = _get_user_configured_path("blender")
+    user_path = _get_user_configured_path(config_key)
     if user_path:
         paths.append(user_path)
-        
-    # Check PATH
-    import shutil
-    which_blender = shutil.which("blender")
-    if which_blender:
-        paths.append(which_blender)
+    for command in commands:
+        found = shutil.which(command)
+        if found and found not in paths:
+            paths.append(found)
+    return paths
+
+def _get_blender_paths(system: str) -> List[str]:
+    """Get comprehensive Blender installation paths."""
+    paths = _preferred_paths("blender", ["blender"])
     
     if system == "windows":
         # Windows paths
@@ -745,7 +758,7 @@ def _get_blender_paths(system: str) -> List[str]:
 
 def _get_maya_paths(system: str) -> List[str]:
     """Get comprehensive Maya installation paths."""
-    paths = []
+    paths = _preferred_paths("maya", ["maya"])
     
     if system == "windows":
         base_paths = [
@@ -788,7 +801,7 @@ def _get_maya_paths(system: str) -> List[str]:
 
 def _get_unreal_paths(system: str) -> List[str]:
     """Get comprehensive Unreal Engine installation paths."""
-    paths = []
+    paths = _preferred_paths("unreal", ["UnrealEditor", "UnrealEditor-Cmd"])
     
     if system == "windows":
         base_paths = [
@@ -819,7 +832,7 @@ def _get_unreal_paths(system: str) -> List[str]:
 
 def _get_cinema4d_paths(system: str) -> List[str]:
     """Get comprehensive Cinema 4D installation paths."""
-    paths = []
+    paths = _preferred_paths("cinema4d", ["cinema4d", "Cinema 4D"])
     
     if system == "windows":
         base_paths = [
