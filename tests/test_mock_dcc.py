@@ -30,13 +30,15 @@ sys.path.insert(0, os.path.join(ROOT, 'tests'))
 import psutil
 
 from mock_dcc import harness
+from mock_dcc import mock_dcc as dcc
 from src.core.models import RenderJob, SoftwareType
 from src.processing.render_engines import (BlenderEngine, Cinema4DEngine,
                                            MayaEngine, UnrealEngine,
                                            create_render_engine)
 
-# What each package prints per frame, in its own syntax. Phase 4 writes the
-# progress parser against these lines rather than against a guess.
+# What each package prints per frame, in its own syntax. The parsers in
+# `render_engines.py` are written against these lines rather than a guess, and
+# test_03 below keeps the mock honest about printing them.
 PROGRESS_LINES = {
     'blender': ['Fra:1/3 Rendered', 'Fra:2/3 Rendered', 'Fra:3/3 Rendered', 'Blender quit'],
     'maya': ['// Rendering frame 1 of 3 //', '// Rendering frame 2 of 3 //',
@@ -170,6 +172,30 @@ class TestMockPackageBehaviour(MockDCCCase):
                 run = harness.run('blender', *argv)
                 self.assertEqual(20, run.returncode, run.stdout + run.stderr)
 
+    def test_07_reads_one_mel_quoted_value_and_never_two(self):
+        """A MEL value is read up to its closing quote, not to the last one.
+
+        `"(.*)"` runs through the following statement, so the directory the mock
+        renders into used to come back as the directory plus half the command -
+        which is how a path with no folder in it turned into exit 31 "output
+        directory does not exist" for a directory that plainly did.
+        """
+        command = ('setAttr defaultResolution.width 960; '
+                   'workspace -fr "images" "D:/renders/hero"; '
+                   'setAttr -type "string" defaultRenderGlobals.imageFilePrefix "shot_01"; '
+                   'setAttr defaultRenderGlobals.imageFormat 32; render -batch;')
+        self.assertEqual('D:/renders/hero', dcc.mel_string(command, 'workspace -fr "images"'))
+        self.assertEqual('shot_01', dcc.mel_string(command, 'defaultRenderGlobals.imageFilePrefix'))
+        self.assertEqual('D:/say"hi"',
+                         dcc.mel_string(r'workspace -fr "images" "D:/say\"hi\""; render;',
+                                        'workspace -fr "images"'))
+        for broken in ('setAttr defaultResolution.width 960; render -batch;',
+                       'workspace -fr "images" ; render -batch;',
+                       'workspace -fr "images" D:/unquoted; render -batch;'):
+            with self.subTest(command=broken):
+                with self.assertRaises(SystemExit):
+                    dcc.mel_string(broken, 'workspace -fr "images"')
+
 
 class TestEngineLaunchPath(MockDCCCase):
     """The four engine classes assemble commands a real renderer would accept."""
@@ -206,6 +232,10 @@ class TestEngineLaunchPath(MockDCCCase):
         self.assertIn('imageFormat 32', command)
         self.assertIn('startFrame 1', command)
         self.assertIn('endFrame 2', command)
+        written_to = dcc.mel_string(command.split(' -command ', 1)[1],
+                                    'workspace -fr "images"')
+        self.assertEqual(os.path.normpath(self.out), os.path.normpath(written_to),
+                         'Maya was told to render somewhere other than the job output folder')
 
     def test_05_unreal_passes_the_pipeline_config_it_writes(self):
         job = self.job('unreal')
@@ -259,20 +289,107 @@ class TestEngineLaunchPath(MockDCCCase):
         found = detect_available_software()
         self.assertIn(SoftwareType.BLENDER, found)
 
-    def test_10_nothing_about_the_render_is_readable_while_it_runs(self):
-        """The engines collect stdout only after the process exits.
+    def test_10_progress_lines_move_the_bar_while_the_render_runs(self):
+        """Each package's frame lines are read, not discarded.
 
-        `get_progress()` returns a constant 0.0 and no caller invokes it, so a
-        40-frame render reports 0% until it is over. Phase 4 replaces this with
-        a test that requires the progress lines above to drive the bar.
+        Phase 3 recorded the opposite ceiling - `get_progress()` was a constant
+        0.0 and `render_job` used `communicate()`, so stdout only existed after
+        the render was over. That test had to go; this is the one it promised.
         """
-        seen = []
-        job = self.job('blender', frame_count=3)
+        for key in CLASSES:
+            with self.subTest(package=key):
+                job = self.job(key, frames=(1, 4), name=key)
+                seen = []
+                engine = self.engine(key)
+                engine.set_progress_callback(seen.append)
+                self.assertTrue(engine.render_job(job), job.error_message)
+                self.assertEqual([25.0, 50.0, 75.0, 100.0], seen,
+                                 f'{key} frame lines did not drive the callback')
+
+    def test_11_progress_is_readable_before_the_renderer_exits(self):
+        """The value has to land while the process is still live, or the bar is a lie."""
+        job = self.job('blender', frame_count=8, seconds_per_frame=0.15)
         engine = self.engine('blender')
-        engine.set_progress_callback(seen.append)
+        results = {}
+        worker = self.run_render_in_thread(engine, job, results)
+        pid = engine.current_process.pid
+        deadline = time.time() + 10
+        while engine.get_progress() == 0.0 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertGreater(engine.get_progress(), 0.0, 'no progress was ever reported')
+        self.assertTrue(worker.is_alive(), 'the render had already finished - nothing was live')
+        self.assertTrue(pid_is_live(pid), 'progress came from a process that had exited')
+        worker.join(timeout=30)
+        self.assertTrue(results.get('ok', False), job.error_message)
+        self.assertEqual(8, len(self.frames_written()))
+        self.assertEqual(100.0, engine.get_progress())
+
+    def test_12_a_silent_renderer_that_writes_nothing_is_reported_as_failed(self):
+        job = self.job('blender', frame_count=2, silent=True, write_files=False)
+        engine = self.engine('blender')
+        self.assertFalse(engine.render_job(job),
+                         'exit code 0 with no frame and no file passed as a render')
+        self.assertIn('without reporting a frame', job.error_message or '')
         self.assertEqual(0.0, engine.get_progress())
-        engine.render_job(job)
-        self.assertEqual([], seen)
+
+    def test_13_frames_on_disk_succeed_without_any_progress_lines(self):
+        """A build that words its frame lines differently is not a false failure.
+
+        The parsers are written against the syntax `PROGRESS_LINES` records here,
+        which is the closest thing to a real package this machine can produce.
+        Exit code 0 plus files that were not there before is evidence that does
+        not depend on matching a string.
+        """
+        job = self.job('blender', frame_count=3, silent=True)
+        engine = self.engine('blender')
+        self.assertTrue(engine.render_job(job), job.error_message)
+        self.assertEqual(3, len(self.frames_written()))
+        self.assertEqual(100.0, engine.get_progress())
+
+    def test_14_a_chatty_renderer_does_not_deadlock_the_pipes(self):
+        """Both pipes need their own reader: fill one 4 KB buffer and the renderer
+        blocks writing the other while the app waits on the first."""
+        job = self.job('maya', frames=(1, 3), noise=60)
+        engine = self.engine('maya')
+        results = {}
+        worker = self.run_render_in_thread(engine, job, results)
+        worker.join(timeout=60)
+        self.assertFalse(worker.is_alive(), 'reading 3 frames of output never finished')
+        self.assertTrue(results.get('ok', False), job.error_message)
+        self.assertEqual(100.0, engine.get_progress())
+
+    def test_15_a_bare_output_filename_renders_into_the_working_directory(self):
+        """`dirname('hero.png')` is the empty string, and `makedirs('')` is a crash.
+
+        The queue is built from a folder picker *or* a typed name, so an output
+        path with no directory in it has to mean "right here" for every engine,
+        in the command line as well as in the folder the app creates.
+        """
+        for key in CLASSES:
+            with self.subTest(package=key):
+                job = self.job(key, frames=(1, 2), name=f'bare-{key}', output_dir=None)
+                job.output_path = f'{key}_hero.png'
+                engine = self.engine(key)
+                self.assertTrue(engine.render_job(job), f'{key}: {job.error_message}')
+                self.assertEqual(100.0, engine.get_progress())
+                landed = sorted(os.path.basename(path) for path in
+                                glob.glob(os.path.join(self.work, f'bare-{key}_0*.png')))
+                self.assertEqual([f'bare-{key}_0001.png', f'bare-{key}_0002.png'], landed,
+                                 f'{key} put a bare-name render somewhere unexpected')
+
+    def test_16_a_second_render_over_the_same_filenames_is_not_a_failure(self):
+        """Re-rendering a shot keeps the frame names and moves only their mtimes.
+
+        "the output folder is unchanged" is therefore not evidence that nothing
+        rendered, and the file comparison has to look at modified times too.
+        """
+        engine = self.engine('blender')
+        first = self.job('blender', frame_count=3, silent=True)
+        self.assertTrue(engine.render_job(first), first.error_message)
+        again = self.job('blender', frame_count=3, silent=True)
+        self.assertTrue(engine.render_job(again),
+                        f'the second pass over the same names was refused: {again.error_message}')
+        self.assertEqual(3, len(self.frames_written()))
 
 
 def pid_is_live(pid):

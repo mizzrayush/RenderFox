@@ -5,11 +5,10 @@ Render engines for different 3D software integration.
 import os
 import subprocess
 import json
-import time
+import re
+import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple, Callable
-from dataclasses import dataclass
-from enum import Enum
 
 from ..core.models import RenderJob, SoftwareType, JobStatus
 
@@ -45,6 +44,7 @@ class RenderEngine(ABC):
         self.current_process = None
         self.should_stop = False
         self.progress_callback: Optional[Callable[[float], None]] = None
+        self._progress = 0.0
     
     @abstractmethod
     def is_available(self) -> bool:
@@ -79,10 +79,137 @@ class RenderEngine(ABC):
         self.progress_callback = callback
     
     def get_progress(self) -> float:
-        """Get current render progress (0-100)."""
-        # Default implementation - subclasses can override
-        return 0.0
-    
+        """Current render progress (0-100), taken from the renderer's own output."""
+        return self._progress
+
+    def parse_progress(self, line: str) -> Optional[float]:
+        """Turn one stdout line into a percentage, or None if it carries no progress.
+
+        Subclasses implement this against the syntax their package really
+        prints; `tests/test_mock_dcc.py` records those lines.
+        """
+        return None
+
+    @staticmethod
+    def _percent(done: float, total: float) -> Optional[float]:
+        if total and total > 0:
+            return max(0.0, min(100.0, done / total * 100.0))
+        return None
+
+    def _drain(self, stream, sink: List[str], on_line: Optional[Callable[[str], None]] = None):
+        """Copy one pipe to a list, calling on_line as each line arrives.
+
+        Both stdout and stderr need their own reader: a renderer that writes
+        plenty to both fills one 4 KB buffer and blocks forever in the other.
+        """
+        try:
+            for line in iter(stream.readline, ''):
+                text = line.rstrip('\n')
+                sink.append(text)
+                if on_line:
+                    on_line(text)
+        except (ValueError, OSError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _observe(self, line: str):
+        progress = self.parse_progress(line)
+        if progress is not None:
+            self._progress = progress
+            if self.progress_callback:
+                self.progress_callback(progress)
+
+    @staticmethod
+    def _output_directory(job: RenderJob) -> str:
+        """The absolute directory a job's frames belong in.
+
+        `os.path.dirname('hero.png')` is the empty string, and `makedirs('')`
+        raises, so a bare filename means "right here" - which is also what
+        `abspath` of an empty path gives. Absolute matters as well: a renderer
+        resolves a relative path against *its own* working directory, and this
+        app does not get to assume what that is.
+        """
+        return os.path.abspath(os.path.dirname(job.output_path))
+
+    @staticmethod
+    def _files_in(directory: str) -> Dict[str, Tuple[int, int]]:
+        """Size and modified-time of every file in a directory.
+
+        The frame counters below are written against the progress syntax the
+        mock DCC packages record; a real build could word its lines differently.
+        The exit code plus the files left behind are the evidence that does not
+        depend on parsing anything.
+        """
+        try:
+            with os.scandir(directory) as entries:
+                found: Dict[str, Tuple[int, int]] = {}
+                for entry in entries:
+                    try:
+                        if entry.is_file():
+                            stat = entry.stat()
+                            found[entry.name] = (stat.st_size, stat.st_mtime_ns)
+                    except OSError:
+                        continue
+                return found
+        except OSError:
+            return {}
+
+    def execute(self, cmd: List[str], job: RenderJob) -> bool:
+        """Run one render, reporting progress from live stdout."""
+        self.should_stop = False
+        self._progress = 0.0
+        output_dir = self._output_directory(job)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as error:
+            job.error_message = f"Cannot create output directory: {error}"
+            return False
+
+        before = self._files_in(output_dir)
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True,
+                                       encoding='utf-8', errors='replace')
+        except OSError as error:
+            job.error_message = f"Failed to start {self.name}: {error}"
+            return False
+
+        self.current_process = process
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+        readers = [
+            threading.Thread(target=self._drain, args=(process.stdout, stdout_lines, self._observe)),
+            threading.Thread(target=self._drain, args=(process.stderr, stderr_lines)),
+        ]
+        for reader in readers:
+            reader.start()
+        for reader in readers:
+            reader.join()
+        return_code = process.wait()
+        self.current_process = None
+
+        if self.should_stop:
+            job.error_message = f"{self.name} render cancelled by user"
+            return False
+
+        if return_code != 0:
+            detail = "\n".join(stderr_lines).strip() or "\n".join(stdout_lines).strip()
+            job.error_message = detail or f"{self.name} exited with code {return_code}"
+            return False
+
+        if self._progress <= 0.0 and self._files_in(output_dir) == before:
+            job.error_message = (f"{self.name} exited cleanly without reporting a frame or "
+                                 f"writing anything to {output_dir}")
+            return False
+
+        job.error_message = None
+        self._progress = 100.0
+        return True
+
     def stop(self):
         """Stop the current render process."""
         self.should_stop = True
@@ -195,7 +322,7 @@ class BlenderEngine(RenderEngine):
             self.executable_path,
             "--background",  # Run in background mode
             job.project_file,  # Blend file
-            "--render-output", job.output_path,  # Output path
+            "--render-output", os.path.abspath(job.output_path),  # Output path
             "--render-format", job.output_format.upper(),  # Output format
         ]
         
@@ -219,42 +346,18 @@ class BlenderEngine(RenderEngine):
         
         return cmd
     
+    def parse_progress(self, line: str) -> Optional[float]:
+        """Blender counts frames as `Fra:<this>/<total> Rendered ...`."""
+        match = re.match(r'^Fra:(\d+)(?:/(\d+))?', line)
+        if not match:
+            return None
+        done = int(match.group(1))
+        total = int(match.group(2)) if match.group(2) else done
+        return self._percent(done, total)
+
     def render_job(self, job: RenderJob) -> bool:
         """Execute Blender render job."""
-        try:
-            self.should_stop = False
-            cmd = self.get_render_command(job)
-            
-            # Create output directory if it doesn't exist
-            os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
-            
-            # Start the render process
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            # Monitor the process
-            stdout, stderr = self.current_process.communicate()
-            
-            if self.should_stop:
-                job.error_message = "Render cancelled by user"
-                return False
-                
-            success = self.current_process.returncode == 0
-            
-            if not success:
-                job.error_message = stderr or "Render failed"
-            
-            return success
-            
-        except Exception as e:
-            job.error_message = f"Failed to start render: {str(e)}"
-            return False
-        finally:
-            self.current_process = None
+        return self.execute(self.get_render_command(job), job)
 
 
 class MayaEngine(RenderEngine):
@@ -299,6 +402,17 @@ class MayaEngine(RenderEngine):
         ]
         return cmd
     
+    @staticmethod
+    def _mel_string(value: str) -> str:
+        """One path as a MEL quoted string wants it.
+
+        Forward slashes instead of backslashes: Windows accepts them in API
+        paths, they survive a MEL string literal untouched, and an odd number of
+        backslashes before the closing quote would eat the quote and break the
+        command.
+        """
+        return value.replace('\\', '/').replace('"', '\\"')
+
     def _get_maya_mel_script(self, job: RenderJob) -> str:
         """Generate MEL script for Maya rendering."""
         mel_commands = []
@@ -310,8 +424,9 @@ class MayaEngine(RenderEngine):
         ])
         
         # Set output path and format
-        output_dir = os.path.dirname(job.output_path)
-        output_name = os.path.splitext(os.path.basename(job.output_path))[0]
+        output_dir = self._mel_string(self._output_directory(job))
+        output_name = self._mel_string(
+            os.path.splitext(os.path.basename(job.output_path))[0])
         
         mel_commands.extend([
             f"workspace -fr \"images\" \"{output_dir}\";",
@@ -342,41 +457,16 @@ class MayaEngine(RenderEngine):
         
         return " ".join(mel_commands)
     
+    def parse_progress(self, line: str) -> Optional[float]:
+        """Maya counts frames as `// Rendering frame <this> of <total> //`."""
+        match = re.search(r'Rendering frame (\d+) of (\d+)', line)
+        if not match:
+            return None
+        return self._percent(int(match.group(1)), int(match.group(2)))
+
     def render_job(self, job: RenderJob) -> bool:
         """Execute Maya render job."""
-        try:
-            self.should_stop = False
-            cmd = self.get_render_command(job)
-            
-            # Create output directory
-            os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
-            
-            # Start the render process
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            stdout, stderr = self.current_process.communicate()
-            
-            if self.should_stop:
-                job.error_message = "Maya render cancelled by user"
-                return False
-                
-            success = self.current_process.returncode == 0
-            
-            if not success:
-                job.error_message = stderr or "Maya render failed"
-            
-            return success
-            
-        except Exception as e:
-            job.error_message = f"Failed to start Maya render: {str(e)}"
-            return False
-        finally:
-            self.current_process = None
+        return self.execute(self.get_render_command(job), job)
 
 
 class UnrealEngine(RenderEngine):
@@ -426,7 +516,7 @@ class UnrealEngine(RenderEngine):
         # This would create a JSON config for UE's Movie Render Pipeline
         # Simplified implementation
         config = {
-            "OutputDirectory": os.path.dirname(job.output_path),
+            "OutputDirectory": self._output_directory(job),
             "OutputFormat": job.output_format,
             "Resolution": job.resolution,
             # The command line carries no frame range for Unreal, so the config
@@ -445,40 +535,24 @@ class UnrealEngine(RenderEngine):
         
         return config_path
     
+    def parse_progress(self, line: str) -> Optional[float]:
+        """Unreal's Movie Render Queue prints both a frame tally and a percent.
+
+        `Frame 2 ( 2/3 )` carries the real tally; the leading `[ 100.0%]` is the
+        completion of the *current* frame, so the fraction has to win when both
+        are present.
+        """
+        match = re.search(r'Frame \d+ \( *(\d+)/(\d+) *\)', line)
+        if match:
+            return self._percent(int(match.group(1)), int(match.group(2)))
+        match = re.search(r'\[\s*(\d+(?:\.\d+)?)%\]', line)
+        if match:
+            return self._percent(float(match.group(1)), 100.0)
+        return None
+
     def render_job(self, job: RenderJob) -> bool:
         """Execute Unreal Engine render job."""
-        try:
-            self.should_stop = False
-            cmd = self.get_render_command(job)
-            
-            # Create output directory
-            os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
-            
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            stdout, stderr = self.current_process.communicate()
-            
-            if self.should_stop:
-                job.error_message = "Unreal Engine render cancelled by user"
-                return False
-                
-            success = self.current_process.returncode == 0
-            
-            if not success:
-                job.error_message = stderr or "Unreal Engine render failed"
-            
-            return success
-            
-        except Exception as e:
-            job.error_message = f"Failed to start Unreal Engine render: {str(e)}"
-            return False
-        finally:
-            self.current_process = None
+        return self.execute(self.get_render_command(job), job)
 
 
 class Cinema4DEngine(RenderEngine):
@@ -503,7 +577,6 @@ class Cinema4DEngine(RenderEngine):
             for part in path_parts:
                 if 'Cinema 4D' in part and any(c.isdigit() for c in part):
                     # Extract version like "R25" or "2024"
-                    import re
                     version_match = re.search(r'(R\d+|\d{4})', part)
                     if version_match:
                         self.version = version_match.group(1)
@@ -529,40 +602,16 @@ class Cinema4DEngine(RenderEngine):
         
         return cmd
     
+    def parse_progress(self, line: str) -> Optional[float]:
+        """Cinema 4D counts frames as `Frame <this> rendered (<this>/<total>)`."""
+        match = re.search(r'Frame \d+ rendered \((\d+)/(\d+)\)', line)
+        if not match:
+            return None
+        return self._percent(int(match.group(1)), int(match.group(2)))
+
     def render_job(self, job: RenderJob) -> bool:
         """Execute Cinema 4D render job."""
-        try:
-            self.should_stop = False
-            cmd = self.get_render_command(job)
-            
-            # Create output directory
-            os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
-            
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            stdout, stderr = self.current_process.communicate()
-            
-            if self.should_stop:
-                job.error_message = "Cinema 4D render cancelled by user"
-                return False
-                
-            success = self.current_process.returncode == 0
-            
-            if not success:
-                job.error_message = stderr or "Cinema 4D render failed"
-            
-            return success
-            
-        except Exception as e:
-            job.error_message = f"Failed to start Cinema 4D render: {str(e)}"
-            return False
-        finally:
-            self.current_process = None
+        return self.execute(self.get_render_command(job), job)
 
 
 # Factory function for creating render engines

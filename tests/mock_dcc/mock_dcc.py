@@ -23,10 +23,22 @@ Each package is fed its output location the way the real one is:
 * Cinema 4D  - nothing on the command line, so the scene file carries it.
 * Unreal     - the JSON written by `_create_movie_pipeline_config`.
 
+Every location above has to be absolute (Cinema 4D takes none). A relative
+path resolves against the renderer's own working directory, and this app does
+not get to assume what that is, so a relative output path is refused with
+exit 20.
+
 Scene files are JSON, exactly like a real scene carries its own settings:
 
     {"seconds_per_frame": 0.05, "frame_count": 4, "output_dir": "...",
-     "prefix": "hero", "fail_after": 2, "hang": false, "write_files": false}
+     "prefix": "hero", "fail_after": 2, "hang": false, "write_files": false,
+     "silent": true, "noise": 40}
+
+`silent` suppresses the per-frame stdout lines only - it is how a build that
+words its progress differently from the syntax recorded here is simulated, so
+the engines' fallback evidence (files on disk) gets tested and not just the
+parsers. `noise` floods both pipes at once, which is what a single buffered
+read of stdout cannot survive.
 
 Run directly while debugging:
     python tests/mock_dcc/mock_dcc.py blender --version
@@ -62,6 +74,11 @@ def fail(exit_code, message):
     sys.stderr.write(message + '\n')
     sys.stderr.flush()
     sys.exit(exit_code)
+
+
+def log_error(line):
+    sys.stderr.write(line + '\n')
+    sys.stderr.flush()
 
 
 def read_json(path, kind):
@@ -120,10 +137,34 @@ def parse_blender(argv):
         fail(EXIT_BAD_COMMAND, 'Error: neither --render-anim nor --render-frame given')
     if 'expr' in options and 'resolution_x' not in options['expr']:
         fail(EXIT_BAD_COMMAND, f'Error: --python-expr does not set a resolution: {options["expr"]!r}')
+    if not os.path.isabs(options['output']):
+        fail(EXIT_BAD_COMMAND,
+             f'Error: --render-output is relative, so it resolves against the renderer '
+             f'cwd and not the caller: {options["output"]!r}')
 
     start = int(options.get('start', 1))
     end = int(options.get('end', options.get('single', start)))
     return project, options['output'], None, start, end
+
+
+MEL_VALUE = re.compile(r'"((?:\\.|[^"\\])*)"')
+
+
+def mel_string(command, after):
+    """The quoted MEL string that follows `after`, with its escapes undone.
+
+    A greedy `"(.*)"` reads a value straight through the next statement, so a
+    path handed to a later `setAttr` looks like part of the directory name -
+    which is exactly how it is written in MEL: `"` ends the value.
+    """
+    parts = command.split(after, 1)
+    if len(parts) < 2:
+        fail(EXIT_BAD_COMMAND, f'Error: maya command never sets {after!r}: {command!r}')
+    match = MEL_VALUE.match(parts[1].lstrip())
+    if match is None:
+        fail(EXIT_BAD_COMMAND,
+             f'Error: maya {after!r} has no closed quoted value: {command!r}')
+    return re.sub(r'\\(.)', r'\1', match.group(1))
 
 
 def parse_maya(argv):
@@ -157,12 +198,12 @@ def parse_maya(argv):
     if 'render' not in command:
         fail(EXIT_BAD_COMMAND, f'Error: maya -command never calls render: {command!r}')
 
-    images = re.search(r'workspace -fr "images" "(.*)";', command)
-    prefix = re.search(r'imageFilePrefix "(.*)"', command)
-    if images is None:
-        fail(EXIT_BAD_COMMAND, 'Error: maya command does not set an image workspace')
-    output_dir = images.group(1)
-    stem = prefix.group(1) if prefix else 'frame'
+    output_dir = mel_string(command, 'workspace -fr "images"')
+    stem = mel_string(command, 'defaultRenderGlobals.imageFilePrefix') or 'frame'
+    if not os.path.isabs(output_dir):
+        fail(EXIT_BAD_COMMAND,
+             f'Error: maya image workspace is relative, so it resolves against the '
+             f'renderer cwd and not the caller: {output_dir!r}')
 
     frames = [int(value) for value in
               re.findall(r'(?:startFrame|endFrame|-frame)\s+(-?\d+)', command)]
@@ -240,6 +281,10 @@ def parse_unreal(argv):
     output_dir = config.get('OutputDirectory')
     if not output_dir:
         fail(EXIT_BAD_COMMAND, f'Error: config has no OutputDirectory: {config_path}')
+    if not os.path.isabs(output_dir):
+        fail(EXIT_BAD_COMMAND,
+             f'Error: OutputDirectory is relative, so it resolves against the renderer '
+             f'cwd and not the caller: {output_dir!r}')
     if not config.get('Resolution'):
         fail(EXIT_BAD_COMMAND, 'Error: config has no Resolution')
     start = int(config.get('StartFrame') or 0)
@@ -277,7 +322,10 @@ def render(dcc, project, output, output_dir, start, last, scene):
         time.sleep(float(scene.get('hang_seconds', 3600)))
         sys.exit(EXIT_OK)
 
-    directory = scene.get('output_dir') or output_dir or os.path.dirname(output or '')
+    # A bare output name with no folder in it means "write where I am running" -
+    # that is what dirname() of one really hands a batch renderer.
+    directory = (scene.get('output_dir') or output_dir
+                 or os.path.dirname(output or '') or os.getcwd())
     if not directory:
         fail(EXIT_MISSING_SCENE_VALUE,
              f'Error: {NAMES[dcc]} was given nowhere to write frames')
@@ -290,7 +338,13 @@ def render(dcc, project, output, output_dir, start, last, scene):
                                    if output else 'frame')
     suffix = 'exr' if scene.get('format') == 'exr' else 'png'
     for position, frame in enumerate(frames, start=1):
-        log(frame_line(dcc, frame, frames[-1]))
+        if not scene.get('silent'):
+            log(frame_line(dcc, frame, frames[-1]))
+        for _ in range(int(scene.get('noise', 0))):
+            # Chatty on both pipes during the frame: the shape a reader that
+            # takes stdout first and stderr second cannot survive.
+            log(f'Log: shading frame {frame} ' + 'x' * 200)
+            log_error(f'Warning: sample discarded ' + 'x' * 200)
         if scene.get('write_files', True):
             path = os.path.join(directory, f'{stem}_{frame:04d}.{suffix}')
             with open(path, 'wb') as handle:

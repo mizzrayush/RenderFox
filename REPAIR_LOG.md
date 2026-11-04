@@ -48,7 +48,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 1 | Mesh Tools UI-to-backend contract | DONE |
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
-| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | not started |
+| 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | IN PROGRESS - 4a DONE (live progress streaming), 4b detection, 4c queue, 4d dashboard wiring |
 | 5 | FBX/DAE claims + requirements gaps | not started |
 | 6 | Fabricated results presented as real | not started |
 | 7 | 22s startup | not started |
@@ -59,7 +59,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 **Confirmed by live reproduction**
 
 - `src/ui/dashboard_tab.py:572` and `:579` read `job_table.item(row, 0)` for the job id, but column 0 is a `QCheckBox` cellWidget (`:854`) and the id lives in column 1 (`:858`) → `AttributeError` on Pause/Resume.
-- `src/processing/render_engines.py:81-84` `get_progress()` returns a constant `0.0`; `job_manager.py:240` uses blocking `communicate()` so Blender's `Fra:` output is discarded → progress sits at 0% then jumps to 100.
+- ~~`src/processing/render_engines.py:81-84` `get_progress()` returns a constant `0.0`; `job_manager.py:240` uses blocking `communicate()` so Blender's `Fra:` output is discarded → progress sits at 0% then jumps to 100.~~ **Engines fixed in Phase 4a** (verified streaming against the mock). `job_manager.py` still polls on a 1 s timer and now gets real values, but the queue loop itself is Phase 4c.
 - `max_concurrent` appears **zero** times in `job_manager.py`; `pending_jobs[0]` (`:222`) plus one engine = strictly serial. Settings checkbox is write-only.
 - `auto_retry` / `max_retries` exist only in `settings_tab.py:288-295`; no consumer in `job_manager.py` or `render_engines.py`.
 - `src/ui/rendering_tab.py`: `render_btn` "Render Image" (`:624`) and `btn_render` "Render Frame" (`:764`) have **no `.clicked.connect`** — the Rendering tab cannot render. Toolbar view modes (`:720-751`) likewise unwired; only `action_export` is connected.
@@ -73,7 +73,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 **Confirmed by code reading**
 
 - `job_manager.py:340` uses `sys.platform` but `sys` is never imported (harmless on Windows, `NameError` on mac/linux).
-- `render_engines.py:229` `os.path.dirname(job.output_path)` while the dialog returns a directory (`dashboard_tab.py:235`).
+- ~~`render_engines.py:229` `os.path.dirname(job.output_path)` while the dialog returns a directory (`dashboard_tab.py:235`).~~ **Worse than the inventory said, and only half fixed:** `browse_output` uses `getExistingDirectory`, so `job.output_path` from both `AddJobDialog` (`:546`) and imported job JSON (`:781`) is a **directory**, and `dirname()` of a directory is its parent - frames land one level up, and Blender is handed `--render-output D:\Renders`, which writes `D:\Renders0001.png`. Phase 4a removed the `makedirs('')` crash and made every path absolute; normalising "directory vs prefix" into a real output prefix is Phase 4c.
 - `render_engines.py:413-442` Unreal writes a 3-key `MoviePipelineConfig.json` its own comment calls "Simplified"; UE does not consume it. `:513-525` C4D flags `-nogui -render -frame a..b` do not exist in C4D's CLI.
 - `dashboard_tab.py:909` `update_progress` never connected → the visible queue progress bar never moves. `:669` Set Priority mutates `job.priority` the queue never sorts on.
 - `automation_tab.py:1350-1366` `simulate_file_event` logs `random.choice([...])` fake file events as live watching. `automation_engine.py:172-175` `generate_lod` returns "Generated N LODs" without calling `LODGenerator`.
@@ -213,6 +213,59 @@ Nothing in `render_engines.py` had ever been executed: `detect_available_softwar
 - `test_10_nothing_about_the_render_is_readable_while_it_runs` records the current ceiling deliberately: `get_progress()` returns a constant `0.0`, nothing calls it, and `render_job` uses `communicate()`, so stdout is only available after the render ends. Phase 4 replaces that test with one requiring the `Fra:` lines above to drive the bar - it must not be kept.
 - `detect_available_software()` returns only `blender` even when `config.json` names all four correctly (`_get_user_configured_path('maya' / 'cinema4d' / 'unreal')` all return the path, but only `_get_blender_paths` asks for it). `JobManager._process_queue` gates on that dict, so a configured Maya/C4D/Unreal job fails with "No render engine available for maya" before the command is ever built. This is Phase 4's first fix, not a harness limitation.
 - `pause()` and `resume()` do nothing without psutil - they set no state and report no error, so the Pause button would lie. psutil 6.0.0 is installed here but is **not** in `requirements.txt` (Phase 5).
+
+### Phase 4a - render progress streamed while the renderer runs
+
+The queue could not show progress because nothing read the renderer while it was alive: `get_progress()` returned a constant `0.0`, no caller invoked it, and all four `render_job` bodies were the same ~33 lines of `Popen` + `communicate()`, which by design hands you stdout only after the process has exited. One shared `execute()` in the base class replaces all four.
+
+**`src/processing/render_engines.py` (+192 / -143)**
+
+- Base class gained `_progress` state, `get_progress()` (real value now), `parse_progress()` (per-engine hook), `_percent()`, `_drain()`, `_observe()`, `_output_directory()`, `_files_in()`, `execute()`.
+- `execute()` runs one reader thread per pipe. `_drain`'s comment records why: a renderer chatty on both streams fills one 4 KB buffer and blocks forever writing the other, which is exactly what `stdout.read()` then `stderr.read()` would do.
+- Each engine keeps only its own frame-line grammar: Blender `Fra:7/9 Rendered …`, Maya `// Rendering frame 2 of 3 //`, Cinema 4D `Frame 2 rendered (2/3)`, Unreal `Frame 2 ( 2/3 )` **before** its `[ 100.0%]` bracket, because that bracket is the completion of the current frame, not of the job - taking the percent first makes a 3-frame job report 100% on frame 1.
+- `render_job` in all four classes is now `return self.execute(self.get_render_command(job), job)`. The 143 deleted lines are those four duplicated bodies (~33 each), the constant `get_progress()` it replaces, the three imports none of them used (`time`, `dataclasses.dataclass`, `enum.Enum` - all already dead before this change), the function-local `import re` in `Cinema4DEngine.get_version`, and the raw `os.path.dirname(...)` expressions that `_output_directory`/`_mel_string` replaced. No behaviour was dropped: each body's `should_stop` check, return-code check and stderr capture are all in `execute()`, plus the two verdicts they did not have.
+- Verdict rules, in order: user stopped → failed; non-zero exit → failed with the renderer's own stderr; **exit 0 with neither a frame line nor a new file** → failed ("exited cleanly without reporting a frame or writing anything to …"); exit 0 with new files but no recognised frame line → **success**, and progress closes at 100.
+- That fourth rule is the safety net for the constraint this machine imposes: the parsers are written against syntax the mock records, and a real build of any of these packages could word its lines differently. Size + `st_mtime_ns` per file is evidence that does not depend on matching a string, so a differently-worded renderer costs a still bar, not a false failure. A re-render over the same filenames still shows up, because the mtimes move.
+- `_output_directory` (`abspath(dirname(output_path))`) removes the `os.makedirs('')` crash the inventory noted at `render_engines.py:229` for a bare output filename, and hands every engine an **absolute** directory. A relative path is resolved against the *renderer's* cwd, which this app does not control, so Blender's `--render-output` is absolutized too and `test_15` renders a bare `blender_hero.png` through all four packages.
+
+**A MEL quoting bug the bare-name test exposed** - `tests/mock_dcc/mock_dcc.py` read Maya's settings with `workspace -fr "images" "(.*)";`, and `.*` is greedy: the captured "directory" was the path plus everything up to the *last* quoted value in the command. That produced `Error: output directory does not exist: C:\Users\AYUSHM~1\..."; setAttr -type "string" defaultRenderGlobals.imageFilePrefix "maya_hero`. Two sides fixed:
+
+- the mock now reads one quoted value at a time (`MEL_VALUE` + `mel_string()`, unescaping `\X` → `X`) and refuses an absent, unquoted or unterminated one with exit 20 - `test_07` drives it with literal MEL, including `D:/say\"hi\"`.
+- the app now writes one: `MayaEngine._mel_string()` turns `\` into `/` (valid in every Windows API path, needs no escaping in a MEL literal) and `"` into `\"`.
+- Unverifiable here: the app-side `\"` branch, because Windows forbids `"` in a path. The reader half is tested; the writer half is one `str.replace` and is exercised only through the backslash branch. Stated rather than implied.
+- Symmetric strictness added to the mock for Unreal's `OutputDirectory` (empty *and* relative are both refused now), which is what caught the original `dirname` bug in a runnable way.
+
+**`tests/mock_dcc/mock_dcc.py` (+63 / -9)** - two new scene knobs. `silent` prints no frame lines at all (simulates a build whose progress wording differs, so the fallback evidence is tested and not just the parsers); `noise` floods both pipes during every frame (the shape a single buffered read cannot survive). `log_error()` writes flushed stderr. A bare output name now falls back to the process working directory, which is what `dirname` of one really means.
+
+**`tests/test_mock_dcc.py` (22 tests, was 16)** - `test_10_nothing_about_the_render_is_readable_while_it_runs` deleted, as its own docstring required; it existed only to record the ceiling. In its place: `test_10` asserts each package's four frame lines arrive at the callback as `[25, 50, 75, 100]`; `test_11` polls `get_progress()` on an 8-frame render and requires a non-zero value **while the worker thread is still alive and the renderer pid still exists** - progress read after exit would pass a weaker test; `test_12` a silent renderer that writes nothing is a failure and its message says so; `test_13` a silent renderer that writes frames is a success; `test_14` 60 lines of output on both pipes for 3 Maya frames completes inside its join timeout; `test_15` a bare output filename renders into the working directory for all four packages; `test_16` rendering the same shot twice is not refused (same frame names, moved mtimes - so filename-only comparison is not the evidence); `test_07` in `TestMockPackageBehaviour` covers the MEL reader. `test_04` now reads Maya's workspace back instead of string-matching it.
+
+**Proof** - control run passed, then nine defects injected one at a time, each caught, file restored byte-identically:
+
+| injected defect | caught by |
+|---|---|
+| Blender regex `^Fra:` → `^Frame:` | test_10 |
+| Maya `Rendering` → `Renderig` | test_10 |
+| Cinema 4D `rendered` → `rendrd` | test_10 |
+| Unreal percent tried before the tally | test_10 |
+| `_observe` stores progress but never calls the callback | test_10 |
+| `_observe` calls the callback but never stores progress | test_11 |
+| `_drain` reads lines and drops them on the floor | test_10 |
+| file evidence removed from the exit-0 verdict | test_13 |
+| threaded drain → `stdout.read()` then `stderr.read()` | test_14 (deadlocks, join timeout fires) |
+
+Then five more for the path rules, same method:
+
+| injected defect | caught by |
+|---|---|
+| `_output_directory` loses `abspath` | test_15 (4 subtests) |
+| `_mel_string` returns the path unconverted | test_01, test_04 |
+| Blender `--render-output` loses `abspath` | test_15 |
+| new-output check compares filenames only, ignoring mtimes | test_16 |
+| "nothing reported and nothing written" verdict removed | test_12 |
+
+- `python -X utf8 tests/test_mock_dcc.py` → `Ran 22 tests ... OK` (8.9 s).
+- `python run_audit.py` → `100% (9/9 suites passed in 81.52s)`.
+- Both scratch mutation runners were deleted after these runs (one-shot probes, not tooling).
 
 ## Known-deferred
 
