@@ -1,0 +1,160 @@
+"""
+RenderFox Master Solo-Developer Audit & Health Runner
+One-click comprehensive test and health audit across all 15 tabs and backend processing engines.
+Usage: python run_audit.py
+"""
+
+import os
+import sys
+import time
+import subprocess
+import json
+from datetime import datetime
+
+# Enforce UTF-8 encoding for Windows terminals
+if sys.platform.startswith('win'):
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SUITES = [
+    {
+        "id": "syntax_compilation",
+        "name": "Syntax & Bytecode Compilation",
+        "command": [sys.executable, "-m", "compileall", "-q", "src", "tests", "main.py"],
+        "description": "Verifies that 100% of Python source files compile without syntax errors"
+    },
+    {
+        "id": "baseline_stability",
+        "name": "Core Backend & Regression Suite",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "verify_all_fixes.py")],
+        "description": "Validates database integrity, translation matrices, process handles, and engine bindings"
+    },
+    {
+        "id": "lod_mesh_pipeline",
+        "name": "3D LOD & QEM Decimation Pipeline",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_renderfox.py")],
+        "description": "Validates Quadric Error decimation, clustering simplification, format conversions, and job queue"
+    },
+    {
+        "id": "backend_e2e",
+        "name": "Mesh Repair & Analysis E2E Workflow",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "e2e_backend_test.py")],
+        "description": "Validates hole filling, duplicate vertex removal, topology scoring, and format conversion"
+    },
+    {
+        "id": "headless_gui_15_tabs",
+        "name": "15-Tab Headless GUI & Synthetic Asset Suite",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
+        "description": "Runs full Qt offscreen driver across all 15 tabs using procedural edge-case 3D meshes"
+    }
+]
+
+
+def print_banner():
+    print("=" * 75)
+    print("[RenderFox] Solo-Developer Master Health & Audit Suite")
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Python: {sys.version.split()[0]} | Platform: {sys.platform}")
+    print("=" * 75)
+
+
+def run_suite(suite_info):
+    name = suite_info["name"]
+    cmd = suite_info["command"]
+    desc = suite_info["description"]
+    
+    print(f"\n▶ [{name}]")
+    print(f"  Purpose: {desc}")
+    start = time.time()
+    
+    env = os.environ.copy()
+    env['QT_QPA_PLATFORM'] = 'offscreen'
+    env['PYTHONIOENCODING'] = 'utf-8'
+    
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=120
+        )
+        elapsed = time.time() - start
+        success = (proc.returncode == 0)
+        
+        status_badge = "✅ PASS" if success else "❌ FAIL"
+        print(f"  Result: {status_badge} ({elapsed:.2f}s)")
+        
+        if not success:
+            print("  --- Stderr snippet ---")
+            lines = (proc.stderr or proc.stdout).strip().splitlines()
+            for line in lines[-8:]:
+                print(f"    {line}")
+                
+        return {
+            "id": suite_info["id"],
+            "name": name,
+            "status": "PASS" if success else "FAIL",
+            "elapsed_seconds": round(elapsed, 2),
+            "output_tail": (proc.stdout or "")[-300:]
+        }
+    except Exception as e:
+        elapsed = time.time() - start
+        print(f"  Result: ❌ ERROR: {e} ({elapsed:.2f}s)")
+        return {
+            "id": suite_info["id"],
+            "name": name,
+            "status": "ERROR",
+            "elapsed_seconds": round(elapsed, 2),
+            "error": str(e)
+        }
+
+
+def main():
+    print_banner()
+    total_start = time.time()
+    results = []
+    
+    for suite in SUITES:
+        res = run_suite(suite)
+        results.append(res)
+        
+    total_elapsed = time.time() - total_start
+    passed = sum(1 for r in results if r["status"] == "PASS")
+    total = len(results)
+    
+    print("\n" + "=" * 75)
+    print("📋 AUDIT SUMMARY DASHBOARD")
+    print("=" * 75)
+    for r in results:
+        badge = "✅" if r["status"] == "PASS" else "❌"
+        print(f"  {badge} {r['name']:<48} [{r['status']}] ({r['elapsed_seconds']}s)")
+    print("-" * 75)
+    health_score = int((passed / total) * 100)
+    print(f"Overall Health Score: {health_score}% ({passed}/{total} suites passed in {total_elapsed:.2f}s)")
+    print("=" * 75)
+    
+    # Save audit report
+    report_path = os.path.join(ROOT_DIR, "audit_report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"RenderFox Health Audit Report - {datetime.now().isoformat()}\n")
+        f.write(f"Health Score: {health_score}% ({passed}/{total})\n\n")
+        for r in results:
+            f.write(f"[{r['status']}] {r['name']} ({r['elapsed_seconds']}s)\n")
+            
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

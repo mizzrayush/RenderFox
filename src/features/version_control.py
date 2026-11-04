@@ -1,0 +1,764 @@
+"""
+Asset Version Control - Time-Based Versioning & Visual Diff Viewer
+
+This module provides Git-like version control for 3D assets with visual comparison.
+
+Features:
+- Automatic version snapshots on save
+- Version history timeline with thumbnails
+- Visual diff between versions (geometry changes)
+- Rollback to any previous version
+- Performance comparison (polygon reduction tracking)
+- Branching for experiments
+- Commit messages and metadata
+
+Author: RenderFox Team
+Date: October 2025
+"""
+
+import os
+import shutil
+import hashlib
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import trimesh
+import numpy as np
+import logging
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
+
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+
+logger = logging.getLogger(__name__)
+
+
+class AssetVersionControl:
+    """
+    Version control system for 3D assets.
+    
+    Provides Git-like functionality specifically designed for binary 3D files.
+    Includes visual diff and performance tracking.
+    """
+    
+    def __init__(self, library_path: str):
+        """
+        Initialize version control system.
+        
+        Args:
+            library_path: Root path of the asset library
+        """
+        self.library_path = Path(library_path)
+        self.versions_dir = self.library_path / '.versions'
+        self.snapshots_dir = self.versions_dir / 'snapshots'
+        self.thumbnails_dir = self.versions_dir / 'thumbnails'
+        self.db_path = self.versions_dir / 'versions.db'
+        
+        # Create directories
+        self.versions_dir.mkdir(parents=True, exist_ok=True)
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.thumbnails_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize database
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize SQLite database for version tracking."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        # Versions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_path TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                file_hash TEXT NOT NULL,
+                snapshot_path TEXT NOT NULL,
+                thumbnail_path TEXT,
+                timestamp TEXT NOT NULL,
+                commit_message TEXT,
+                author TEXT,
+                branch TEXT DEFAULT 'main',
+                parent_version_id INTEGER,
+                
+                -- Model metrics
+                polygon_count INTEGER,
+                vertex_count INTEGER,
+                file_size INTEGER,
+                is_watertight BOOLEAN,
+                
+                -- Diff metrics (compared to parent)
+                polygons_delta INTEGER,
+                vertices_delta INTEGER,
+                volume_delta REAL,
+                
+                UNIQUE(model_path, version_number)
+            )
+        ''')
+        
+        # Tags table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS version_tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL,
+                tag_name TEXT NOT NULL,
+                FOREIGN KEY (version_id) REFERENCES versions (id),
+                UNIQUE(version_id, tag_name)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def save_version(self, model_path: str, commit_message: str = "", 
+                    author: str = "User", branch: str = "main", auto: bool = False) -> Optional[int]:
+        """
+        Create a new version snapshot of a model.
+        
+        Args:
+            model_path: Path to the model file
+            commit_message: Description of changes
+            author: Author name
+            auto: Whether this is an automatic save
+            
+        Returns:
+            Version ID if saved, None if no changes detected
+        """
+        try:
+            model_path = Path(model_path)
+            
+            if not model_path.exists():
+                logger.error(f"Model not found: {model_path}")
+                return None
+            
+            # Check file size
+            file_size = model_path.stat().st_size
+            if file_size > MAX_FILE_SIZE:
+                raise ValueError(f"File too large ({file_size / 1024 / 1024:.1f} MB). Max allowed is 500 MB.")
+            
+            # Check disk space
+            total, used, free = shutil.disk_usage(self.snapshots_dir)
+            if free < file_size * 2:  # Ensure we have at least 2x file size available
+                raise IOError(f"Insufficient disk space. Need {file_size / 1024 / 1024:.1f} MB, but only {free / 1024 / 1024:.1f} MB available.")
+                logger.error(f"Model not found: {model_path}")
+                return None
+            
+            # Calculate file hash
+            file_hash = self._calculate_file_hash(model_path)
+            
+            # Check if this exact version already exists
+            if self._is_duplicate_version(str(model_path), file_hash, branch):
+                logger.info(f"No changes detected for {model_path.name}, skipping version save")
+                return None
+            
+            # Load mesh for metrics
+            mesh = trimesh.load(str(model_path))
+            
+            # Get next version number
+            version_number = self._get_next_version_number(str(model_path))
+            
+            # Create snapshot
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            snapshot_name = f"{model_path.stem}_v{version_number}_{timestamp}{model_path.suffix}"
+            snapshot_path = self.snapshots_dir / snapshot_name
+            
+            shutil.copy2(model_path, snapshot_path)
+            
+            # Generate thumbnail (optional)
+            thumbnail_path = self._generate_thumbnail(mesh, model_path.stem, version_number)
+            
+            # Get parent version for diff calculation
+            parent_version = self._get_latest_version(str(model_path), branch)
+            
+            # Calculate metrics
+            metrics = {
+                'polygon_count': len(mesh.faces),
+                'vertex_count': len(mesh.vertices),
+                'file_size': model_path.stat().st_size,
+                'is_watertight': mesh.is_watertight
+            }
+            
+            # Calculate diff if parent exists
+            diff_metrics = {}
+            if parent_version:
+                diff_metrics = self._calculate_diff(mesh, parent_version)
+            
+            # Save to database
+            version_id = self._save_version_to_db(
+                model_path=str(model_path),
+                version_number=version_number,
+                file_hash=file_hash,
+                snapshot_path=str(snapshot_path),
+                thumbnail_path=thumbnail_path,
+                timestamp=datetime.now().isoformat(),
+                commit_message=commit_message if commit_message else f"Auto-save v{version_number}",
+                author=author,
+                branch=branch,
+                metrics=metrics,
+                diff_metrics=diff_metrics,
+                parent_version_id=parent_version['id'] if parent_version else None
+            )
+            
+            logger.info(f"Version {version_number} saved for {model_path.name}")
+            return version_id
+            
+        except (ValueError, IOError) as e:
+            # Re-raise specific errors for UI handling
+            raise e
+        except Exception as e:
+            logger.error(f"Error saving version: {e}")
+            return None
+    
+    def get_version_history(self, model_path: str, branch: str = 'main') -> List[Dict]:
+        """
+        Get version history for a model.
+        
+        Args:
+            model_path: Path to the model
+            branch: Branch name (default: 'main')
+            
+        Returns:
+            List of version dictionaries, newest first
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM versions
+            WHERE model_path = ? AND branch = ?
+            ORDER BY version_number DESC
+        ''', (str(model_path), branch))
+        
+        versions = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        return versions
+    
+    def compare_versions(self, version1_id: int, version2_id: int) -> Dict:
+        """
+        Compare two versions and generate visual diff.
+        
+        Args:
+            version1_id: First version ID
+            version2_id: Second version ID
+            
+        Returns:
+            Dictionary containing comparison data
+        """
+        try:
+            # Get version info
+            v1 = self._get_version_by_id(version1_id)
+            v2 = self._get_version_by_id(version2_id)
+            
+            if not v1 or not v2:
+                return {'error': 'Version not found'}
+            
+            # Load meshes
+            mesh1 = trimesh.load(v1['snapshot_path'])
+            mesh2 = trimesh.load(v2['snapshot_path'])
+            
+            # Calculate differences
+            comparison = {
+                'version1': {
+                    'id': v1['id'],
+                    'version_number': v1['version_number'],
+                    'timestamp': v1['timestamp'],
+                    'commit_message': v1['commit_message']
+                },
+                'version2': {
+                    'id': v2['id'],
+                    'version_number': v2['version_number'],
+                    'timestamp': v2['timestamp'],
+                    'commit_message': v2['commit_message']
+                },
+                'changes': {
+                    'polygons': {
+                        'v1': len(mesh1.faces),
+                        'v2': len(mesh2.faces),
+                        'delta': len(mesh2.faces) - len(mesh1.faces),
+                        'percent': ((len(mesh2.faces) - len(mesh1.faces)) / len(mesh1.faces) * 100) if len(mesh1.faces) > 0 else 0
+                    },
+                    'vertices': {
+                        'v1': len(mesh1.vertices),
+                        'v2': len(mesh2.vertices),
+                        'delta': len(mesh2.vertices) - len(mesh1.vertices),
+                        'percent': ((len(mesh2.vertices) - len(mesh1.vertices)) / len(mesh1.vertices) * 100) if len(mesh1.vertices) > 0 else 0
+                    },
+                    'volume': {
+                        'v1': float(mesh1.volume) if mesh1.is_volume else 0,
+                        'v2': float(mesh2.volume) if mesh2.is_volume else 0,
+                        'delta': (float(mesh2.volume) if mesh2.is_volume else 0) - (float(mesh1.volume) if mesh1.is_volume else 0)
+                    },
+                    'bounds': {
+                        'v1': mesh1.bounds.tolist(),
+                        'v2': mesh2.bounds.tolist()
+                    }
+                },
+                'geometry_diff': self._calculate_geometry_diff(mesh1, mesh2)
+            }
+            
+            return comparison
+            
+        except Exception as e:
+            logger.error(f"Error comparing versions: {e}")
+            return {'error': str(e)}
+    
+    def restore_version(self, version_id: int, target_path: Optional[str] = None) -> bool:
+        """
+        Restore a previous version.
+        
+        Args:
+            version_id: Version ID to restore
+            target_path: Optional target path (default: original model path)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            version = self._get_version_by_id(version_id)
+            
+            if not version:
+                logger.error(f"Version {version_id} not found")
+                return False
+            
+            snapshot_path = Path(version['snapshot_path'])
+            
+            if not snapshot_path.exists():
+                logger.error(f"Snapshot file not found: {snapshot_path}")
+                return False
+            
+            # Determine target path
+            if target_path is None:
+                target_path = version['model_path']
+            
+            target_path = Path(target_path)
+            
+            # Create backup of current version before restoring
+            if target_path.exists():
+                self.save_version(str(target_path), commit_message="Auto-backup before restore", auto=True)
+            
+            # Copy snapshot to target
+            shutil.copy2(snapshot_path, target_path)
+            
+            logger.info(f"Restored version {version['version_number']} to {target_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error restoring version: {e}")
+            return False
+    
+    def create_branch(self, model_path: str, branch_name: str, 
+                     from_version_id: Optional[int] = None) -> bool:
+        """
+        Create a new branch for experimental changes.
+        
+        Args:
+            model_path: Model path
+            branch_name: Name of new branch
+            from_version_id: Optional version to branch from (default: latest)
+            
+        Returns:
+            True if successful
+        """
+        """
+        Create a new branch for experimental changes.
+        
+        Args:
+            model_path: Model path
+            branch_name: Name of new branch
+            from_version_id: Optional version to branch from (default: latest)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # Check if branch already exists
+            branches = self.get_branches(model_path)
+            if branch_name in branches:
+                logger.warning(f"Branch '{branch_name}' already exists")
+                return False
+            
+            # Get source version
+            if from_version_id:
+                source_version = self._get_version_by_id(from_version_id)
+            else:
+                source_version = self._get_latest_version(model_path)
+            
+            if not source_version:
+                logger.error("No source version to branch from")
+                return False
+            
+            # Create a new version entry for the branch start
+            # It points to the same snapshot but has a new branch name
+            # We increment version number globally for the file
+            version_number = self._get_next_version_number(model_path)
+            
+            # Copy metrics from source
+            metrics = {
+                'polygon_count': source_version['polygon_count'],
+                'vertex_count': source_version['vertex_count'],
+                'file_size': source_version['file_size'],
+                'is_watertight': source_version['is_watertight']
+            }
+            
+            self._save_version_to_db(
+                model_path=model_path,
+                version_number=version_number,
+                file_hash=source_version['file_hash'],
+                snapshot_path=source_version['snapshot_path'],
+                thumbnail_path=source_version['thumbnail_path'],
+                timestamp=datetime.now().isoformat(),
+                commit_message=f"Created branch '{branch_name}' from v{source_version['version_number']}",
+                author="System",
+                branch=branch_name,
+                parent_version_id=source_version['id'],
+                metrics=metrics,
+                diff_metrics={'polygons_delta': 0, 'vertices_delta': 0, 'volume_delta': 0}
+            )
+            
+            logger.info(f"Created branch '{branch_name}' from version {source_version['version_number']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating branch: {e}")
+            return False
+
+    def get_branches(self, model_path: str) -> List[str]:
+        """Get list of branches for a model."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT DISTINCT branch FROM versions
+            WHERE model_path = ?
+            ORDER BY branch
+        ''', (str(model_path),))
+        
+        branches = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if not branches:
+            return ['main']
+            
+        return branches
+    
+    def add_tag(self, version_id: int, tag_name: str):
+        """
+        Add a tag to a version (e.g., 'release', 'approved', 'milestone').
+        
+        Args:
+            version_id: Version ID
+            tag_name: Tag name
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT INTO version_tags (version_id, tag_name)
+                VALUES (?, ?)
+            ''', (version_id, tag_name))
+            conn.commit()
+            logger.info(f"Tag '{tag_name}' added to version {version_id}")
+        except sqlite3.IntegrityError:
+            logger.warning(f"Tag '{tag_name}' already exists for version {version_id}")
+        finally:
+            conn.close()
+    
+    def get_tagged_versions(self, model_path: str, tag_name: str) -> List[Dict]:
+        """Get all versions with a specific tag."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT v.* FROM versions v
+            JOIN version_tags t ON v.id = t.version_id
+            WHERE v.model_path = ? AND t.tag_name = ?
+            ORDER BY v.version_number DESC
+        ''', (str(model_path), tag_name))
+        
+        versions = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        return versions
+    
+    def export_version_timeline(self, model_path: str, output_path: str):
+        """
+        Export version history to HTML timeline.
+        
+        Args:
+            model_path: Model path
+            output_path: Output HTML file path
+        """
+        versions = self.get_version_history(model_path)
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Version Timeline - {Path(model_path).name}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+                .timeline {{ position: relative; padding: 20px 0; }}
+                .version {{ background: white; margin: 20px 0; padding: 15px; 
+                           border-left: 4px solid #3498db; border-radius: 3px; }}
+                .version-header {{ display: flex; justify-content: space-between; }}
+                .version-number {{ font-size: 24px; font-weight: bold; color: #3498db; }}
+                .timestamp {{ color: #7f8c8d; }}
+                .metrics {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }}
+                .metric {{ background: #ecf0f1; padding: 8px; border-radius: 3px; }}
+                .delta-positive {{ color: #e74c3c; }}
+                .delta-negative {{ color: #27ae60; }}
+            </style>
+        </head>
+        <body>
+            <h1>📅 Version Timeline: {Path(model_path).name}</h1>
+            <p>Total versions: {len(versions)}</p>
+            <div class="timeline">
+        """
+        
+        for version in versions:
+            delta_polys = version.get('polygons_delta', 0)
+            delta_class = 'delta-positive' if delta_polys > 0 else 'delta-negative' if delta_polys < 0 else ''
+            
+            html += f"""
+            <div class="version">
+                <div class="version-header">
+                    <span class="version-number">v{version['version_number']}</span>
+                    <span class="timestamp">{version['timestamp']}</span>
+                </div>
+                <p><strong>Message:</strong> {version['commit_message']}</p>
+                <p><strong>Author:</strong> {version.get('author', 'Unknown')}</p>
+                <div class="metrics">
+                    <div class="metric">
+                        <strong>Polygons:</strong> {version['polygon_count']:,}
+                        {f'<span class="{delta_class}"> ({delta_polys:+,})</span>' if delta_polys != 0 else ''}
+                    </div>
+                    <div class="metric">
+                        <strong>Vertices:</strong> {version['vertex_count']:,}
+                    </div>
+                    <div class="metric">
+                        <strong>File Size:</strong> {version['file_size'] / 1024:.1f} KB
+                    </div>
+                </div>
+            </div>
+            """
+        
+        html += """
+            </div>
+        </body>
+        </html>
+        """
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        
+        logger.info(f"Version timeline exported to: {output_path}")
+    
+    def _calculate_file_hash(self, file_path: Path) -> str:
+        """Calculate SHA256 hash of file."""
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    
+    def _is_duplicate_version(self, model_path: str, file_hash: str, branch: str = 'main') -> bool:
+        """Check if this exact version already exists in the branch."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT COUNT(*) FROM versions
+            WHERE model_path = ? AND file_hash = ? AND branch = ?
+        ''', (model_path, file_hash, branch))
+        
+        count = cursor.fetchone()[0]
+        conn.close()
+        
+        return count > 0
+    
+    def _get_next_version_number(self, model_path: str) -> int:
+        """Get next version number for a model."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT MAX(version_number) FROM versions
+            WHERE model_path = ?
+        ''', (model_path,))
+        
+        result = cursor.fetchone()[0]
+        conn.close()
+        
+        return (result or 0) + 1
+    
+    def _get_latest_version(self, model_path: str, branch: str = None) -> Optional[Dict]:
+        """Get the latest version of a model."""
+        if branch:
+            versions = self.get_version_history(model_path, branch)
+        else:
+            # Get absolute latest regardless of branch
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM versions
+                WHERE model_path = ?
+                ORDER BY version_number DESC LIMIT 1
+            ''', (str(model_path),))
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
+            
+        return versions[0] if versions else None
+    
+    def _get_version_by_id(self, version_id: int) -> Optional[Dict]:
+        """Get version info by ID."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM versions WHERE id = ?', (version_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        return dict(row) if row else None
+    
+    def _generate_thumbnail(self, mesh, model_name: str, version_number: int) -> Optional[str]:
+        """Generate thumbnail for version using Open3D."""
+        if o3d is None:
+            return None
+            
+        try:
+            # Create thumbnail path
+            thumb_name = f"{model_name}_v{version_number}.png"
+            thumb_path = self.thumbnails_dir / thumb_name
+            
+            # Convert Trimesh to Open3D
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(mesh.vertices)
+            
+            # Or better, use mesh if available
+            if hasattr(mesh, 'faces'):
+                o3d_mesh = o3d.geometry.TriangleMesh()
+                o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
+                o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
+                o3d_mesh.compute_vertex_normals()
+                geometry = o3d_mesh
+            else:
+                geometry = pcd
+
+            # Offscreen rendering
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False, width=640, height=480)
+            vis.add_geometry(geometry)
+            vis.poll_events()
+            vis.update_renderer()
+            vis.capture_screen_image(str(thumb_path))
+            vis.destroy_window()
+            
+            return str(thumb_path)
+            
+        except Exception as e:
+            logger.error(f"Error generating thumbnail: {e}")
+            return None
+    
+    def _calculate_diff(self, mesh, parent_version: Dict) -> Dict:
+        """Calculate differences from parent version."""
+        try:
+            parent_mesh = trimesh.load(parent_version['snapshot_path'])
+            
+            return {
+                'polygons_delta': len(mesh.faces) - len(parent_mesh.faces),
+                'vertices_delta': len(mesh.vertices) - len(parent_mesh.vertices),
+                'volume_delta': float(mesh.volume - parent_mesh.volume) if mesh.is_volume and parent_mesh.is_volume else 0
+            }
+        except:
+            return {'polygons_delta': 0, 'vertices_delta': 0, 'volume_delta': 0}
+    
+    def _calculate_geometry_diff(self, mesh1, mesh2) -> Dict:
+        """Calculate detailed geometry differences."""
+        diff = {
+            'vertices_moved': 0,
+            'vertices_added': max(0, len(mesh2.vertices) - len(mesh1.vertices)),
+            'vertices_removed': max(0, len(mesh1.vertices) - len(mesh2.vertices)),
+            'topology_changed': len(mesh1.faces) != len(mesh2.faces)
+        }
+        
+        # Center of mass shift
+        if hasattr(mesh1, 'center_mass') and hasattr(mesh2, 'center_mass'):
+            shift = np.linalg.norm(mesh2.center_mass - mesh1.center_mass)
+            diff['center_of_mass_shift'] = float(shift)
+            
+        # Bounding box change
+        if hasattr(mesh1, 'bounds') and hasattr(mesh2, 'bounds'):
+            bbox_diff = np.abs(mesh2.bounds - mesh1.bounds)
+            diff['bbox_change'] = bbox_diff.tolist()
+            
+        return diff
+    
+    def _save_version_to_db(self, **kwargs) -> int:
+        """Save version info to database."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        metrics = kwargs.get('metrics', {})
+        diff_metrics = kwargs.get('diff_metrics', {})
+        
+        cursor.execute('''
+            INSERT INTO versions (
+                model_path, version_number, file_hash, snapshot_path, thumbnail_path,
+                timestamp, commit_message, author, branch, parent_version_id,
+                polygon_count, vertex_count, file_size, is_watertight,
+                polygons_delta, vertices_delta, volume_delta
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            kwargs['model_path'],
+            kwargs['version_number'],
+            kwargs['file_hash'],
+            kwargs['snapshot_path'],
+            kwargs.get('thumbnail_path'),
+            kwargs['timestamp'],
+            kwargs['commit_message'],
+            kwargs['author'],
+            kwargs.get('branch', 'main'),
+            kwargs.get('parent_version_id'),
+            metrics.get('polygon_count', 0),
+            metrics.get('vertex_count', 0),
+            metrics.get('file_size', 0),
+            metrics.get('is_watertight', False),
+            diff_metrics.get('polygons_delta', 0),
+            diff_metrics.get('vertices_delta', 0),
+            diff_metrics.get('volume_delta', 0.0)
+        ))
+        
+        version_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        return version_id
+
+
+if __name__ == "__main__":
+    # Demo usage
+    vcs = AssetVersionControl("d:/MyApps/RenderFox/library")
+    
+    # Save version
+    version_id = vcs.save_version("model.obj", commit_message="Initial version", author="Artist")
+    
+    # Get history
+    history = vcs.get_version_history("model.obj")
+    print(f"Total versions: {len(history)}")
+    
+    # Compare versions
+    if len(history) >= 2:
+        comparison = vcs.compare_versions(history[1]['id'], history[0]['id'])
+        print(f"Polygon change: {comparison['changes']['polygons']['delta']}")

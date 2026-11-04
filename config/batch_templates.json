@@ -1,0 +1,12 @@
+{
+  "custom_game_template": {
+    "name": "custom_game_template",
+    "operation": "optimize_mesh",
+    "parameters": {
+      "merge_vertices": true,
+      "reduction": 0.5
+    },
+    "description": "Custom template for tests",
+    "created_at": 1793802230.1385806
+  }
+}

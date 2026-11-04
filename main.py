@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+RenderFox Advanced Batch Renderer
+A cross-platform batch rendering manager for 3D artists.
+"""
+
+import sys
+import traceback
+from PyQt6.QtWidgets import QApplication, QMessageBox
+import os
+
+# Suppress TensorFlow/Keras logs
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtWidgets import QSplashScreen
+from PyQt6.QtCore import Qt
+# from src.ui.main_window import MainWindow  # Moved inside main()
+from src.utils.telemetry import get_telemetry
+
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Global exception handler to catch unhandled errors."""
+    # Ignore keyboard interrupt
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(f"CRITICAL ERROR: {error_msg}", file=sys.stderr)
+    
+    # Log to telemetry
+    try:
+        get_telemetry().log_error("crash", str(exc_value), {"traceback": error_msg})
+    except:
+        pass
+
+    # Show error dialog
+    app = QApplication.instance()
+    if app:
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setWindowTitle("RenderFox Crash Reporter")
+        msg.setText("An unexpected error occurred.")
+        msg.setInformativeText(str(exc_value))
+        msg.setDetailedText(error_msg)
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
+
+def main():
+    """Main entry point for RenderFox application."""
+    # Set AppUserModelID for Windows Taskbar Icon - MUST be before QApplication
+    import ctypes
+    
+    myappid = 'renderfox.studio.app.v1.0.1_refresh' # Changed to force icon refresh
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass
+
+    sys.excepthook = global_exception_handler
+    app = QApplication(sys.argv)
+    app.setApplicationName("RenderFox")
+    app.setApplicationVersion("1.0.0")
+    app.setOrganizationName("RenderFox Studio")
+    
+    # AppUserModelID moved to start of main
+
+    # Set application icon
+    # Check root and resources folder
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(base_dir, "icon.ico")
+    
+    if not os.path.exists(icon_path):
+        icon_path = os.path.join(base_dir, "resources", "icon.ico")
+        
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        print(f"DEBUG: Icon loaded from {icon_path}")
+    else:
+        print(f"DEBUG: Icon NOT found at {icon_path}")
+
+    # Splash Screen
+    splash_path = os.path.join(base_dir, "resources", "splash.png")
+    if os.path.exists(splash_path):
+        splash_pix = QPixmap(splash_path)
+        # Scale if too large (optional, but good for 4k images)
+        if splash_pix.width() > 800:
+            splash_pix = splash_pix.scaledToWidth(800, Qt.TransformationMode.SmoothTransformation)
+            
+        splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
+        splash.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+        splash.setEnabled(False)
+        splash.showMessage("Initializing RenderFox...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, Qt.GlobalColor.white)
+        splash.show()
+        app.processEvents()
+    else:
+        splash = None
+        print(f"Warning: Splash screen not found at {splash_path}")
+
+    # Check for installer model download flag
+    if "--download-models" in sys.argv:
+        try:
+            from src.features.model_downloader import ModelDownloaderDialog
+            downloader = ModelDownloaderDialog()
+            if downloader.exec():
+                print("Models downloaded successfully.")
+                sys.exit(0)
+            else:
+                print("Model download cancelled or failed.")
+                sys.exit(1)
+        except Exception as e:
+            print(f"Error launching downloader: {e}")
+            sys.exit(1)
+    
+    # Create main window
+    # Import here to allow splash screen to show first
+    from src.ui.main_window import MainWindow
+    main_window = MainWindow()
+    
+    # Register Automation Actions
+    try:
+        from src.features.automation_engine import ActionRegistry, AutomationEngine
+        from src.processing.point_cloud_processor import PointCloudProcessor
+        
+        # Create a headless processor for automation
+        processor = PointCloudProcessor()
+        
+        # Register actions
+        ActionRegistry.register("pcd.load", processor.load_point_cloud, "Load a point cloud file", {'file_path': str})
+        ActionRegistry.register("pcd.save", processor.save_point_cloud, "Save a point cloud file", {'pcd': 'Any', 'output_path': str})
+        ActionRegistry.register("pcd.analyze", processor.analyze_point_cloud, "Analyze point cloud", {'file_path': str})
+        ActionRegistry.register("pcd.filter.voxel", processor.downsample, "Voxel downsampling", {'file_path': str, 'output_path': str, 'voxel_size': float})
+        ActionRegistry.register("pcd.filter.statistical", processor.remove_outliers, "Statistical outlier removal", {'file_path': str, 'output_path': str, 'method': 'statistical', 'nb_neighbors': int, 'std_ratio': float})
+        ActionRegistry.register("pcd.reconstruct.poisson", processor.reconstruct_mesh, "Poisson reconstruction", {'file_path': str, 'output_path': str, 'method': 'poisson', 'depth': int, 'scale': float})
+        
+        print("Core automation actions registered.")
+        
+        # Start Automation Engine
+        engine = AutomationEngine()
+        engine.start()
+        print("Automation Engine started.")
+        
+    except Exception as e:
+        print(f"Failed to register automation actions: {e}")
+
+    main_window.showMaximized()
+    
+    # Force Windows native window & taskbar icon
+    if sys.platform == 'win32' and os.path.exists(icon_path):
+        try:
+            hwnd = int(main_window.winId())
+            # Load 32x32 for big icon (taskbar / Alt+Tab) and 16x16 for small icon (titlebar)
+            hicon_big = ctypes.windll.user32.LoadImageW(
+                None, os.path.abspath(icon_path), 1, 32, 32, 0x00000010
+            )
+            hicon_small = ctypes.windll.user32.LoadImageW(
+                None, os.path.abspath(icon_path), 1, 16, 16, 0x00000010
+            )
+            WM_SETICON = 0x0080
+            if hicon_big:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, hicon_big)
+            if hicon_small:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, hicon_small)
+        except Exception:
+            pass
+    
+    if 'splash' in locals() and splash:
+        splash.finish(main_window)
+    
+    # Start the application event loop
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

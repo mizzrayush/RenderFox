@@ -1,0 +1,55 @@
+# --- Build artifacts / packaged app (GitHub rejects files >100MB) ---
+RenderFox_Setup.exe
+build/
+dist/
+*.spec.d
+RenderFox*.exe
+
+# --- Vendored binaries: re-acquired by build scripts, not authored here ---
+lib/
+resources/ffmpeg-*/
+*.dll
+*.exe
+*.pdb
+
+# --- Model weights: fetched with `python main.py --download-models` ---
+OPENai Clip/
+ai_models/
+*.bin
+*.safetensors
+*.pt
+*.onnx
+
+# --- Local dev tooling (source-rewriting scripts, not product code) ---
+patch_script/
+temp/
+temp_backups/
+test_lib_debug/
+
+# --- Runtime state / generated output ---
+config.json
+output/
+logs/
+data/
+audit_report.txt
+*.log
+*.db
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# --- Test exclusions (scratch reports, not assertions) ---
+tests/scope.txt
+tests/test_output.txt
+tests/test_log.txt
+tests/verify_output*.txt
