@@ -41,8 +41,9 @@ feature are the user's; the harness and the fixes are the difference.
 ## Verification commands
 
 ```bash
-python run_audit.py                       # 11-suite health audit (~88s)
+python run_audit.py                       # 12-suite health audit (~102s)
 python -X utf8 tests/test_mesh_tools_contract.py   # clicks every Mesh Tools control
+python -X utf8 tests/test_dashboard_contract.py    # clicks every dashboard queue control
 python -X utf8 tests/test_pymeshlab_calls.py       # every filter/param/enum/method name vs the installed build
 python -X utf8 tests/test_texture_bake.py          # bakes 3 maps and reads the pixels back
 python -X utf8 tests/test_renderfox.py    # LOD/QEM/format/queue
@@ -79,7 +80,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 - ~~`max_concurrent` appears **zero** times in `job_manager.py`; `pending_jobs[0]` (`:222`) plus one engine = strictly serial. Settings checkbox is write-only.~~ **Fixed in Phase 4c-2** - the queue fills slots, and the number now comes from `config.json` (clamped, junk-proof).
 - ~~`auto_retry` / `max_retries` exist only in `settings_tab.py:288-295`; no consumer in `job_manager.py` or `render_engines.py`.~~ **Fixed in Phase 4c-2** - `_queue_policy()` reads all four queue settings and `test_26` pins that the key names on both sides still match.
 - `src/ui/rendering_tab.py`: `render_btn` "Render Image" (`:624`) and `btn_render` "Render Frame" (`:764`) have **no `.clicked.connect`** — the Rendering tab cannot render. Toolbar view modes (`:720-751`) likewise unwired; only `action_export` is connected.
-- `src/ui/dashboard_tab.py:95` format dropdown offers `jpg`; `render_engines.py:199` sends `--render-format JPG` — Blender requires `JPEG`.
+- ~~`src/ui/dashboard_tab.py:95` format dropdown offers `jpg`; `render_engines.py:199` sends `--render-format JPG` - Blender requires `JPEG`.~~ **Fixed in Phase 4d-2** - each engine's own format vocabulary now lives in `render_engines.py`, the dialog offers only what the chosen engine can be told, and the mock refuses a name Blender does not have.
 - `src/core/library_manager.py:978` thumbnail keyed on basename only in one shared dir → different models named `char.fbx` in different folders serve each other's picture; no mtime in key → stale thumbs after edits.
 - `src/ui/main_window.py:244`/`:249`/`:254` View menu → `switch_to_tab(0/1/2)`, but tab order (`:106-120`) is 0=Library, 1=Batch Render, 2=Models. All three entries land on the wrong tab.
 - Measured startup: 22.2 s to construct MainWindow; `library_tab` import alone 14.2 s (eager torch/transformers/open3d/CLIP).
@@ -418,7 +419,23 @@ The queue had one job pointer, one engine pointer, and one worker thread: `_curr
 
 **`src/ui/dashboard_tab.py`** - `selected_job_id()` (`:586`) reads the id from column 1, the same cell `remove_selected_job` and `get_selected_jobs` already use, and both buttons now go through it; `update_progress`/`update_status` are connected to `job_updated` (`:515-526`) - every frame line is a signal, so the bar follows the render with no second timer to drift - and both read `running_jobs()`, which is the queue's own view of what is live (`update_status` says `(+N more)` when the Settings tab allows concurrency). `on_queue_stopped()` hides the bar on `processing_stopped`, because "Pause queue on error" ends the run without a Stop click. A button that cannot do its job now says so in the status line instead of doing nothing.
 
-**Remaining in this phase:** `dashboard_tab.py:95` still offers `jpg` where Blender wants `JPEG`, and `rendering_tab.py:624`/`:764` - "Render Image" and "Render Frame" - are still without a `clicked.connect`.
+**Remaining in this phase:** `rendering_tab.py:624`/`:764` - "Render Image" and "Render Frame" - are still without a `clicked.connect`, and the toolbar view modes beside them are too.
+
+### Phase 4d-2 - a job asks for a format the renderer can be told about
+
+`AddJobDialog` stored the extension the user picked (`png`, `jpg`, `exr`) and `BlenderEngine.get_render_command` upper-cased it onto the command line, so Blender was handed `--render-format JPG` and `EXR`. Those are not Blender format names: it reports `Unknown input format`, exits without rendering, and the job's only trace is a nonzero exit code several minutes later. Maya was worse because it fails quietly - `defaultRenderGlobals.imageFormat` takes a number, and the old lookup defaulted to `32` (png) for anything it did not know, so a `bmp` job wrote PNG files and the queue then looked for frames under an extension that never existed.
+
+**`src/processing/render_engines.py`** - the vocabulary is now owned here: `_BLENDER_IMAGE_FORMATS` (`jpg -> JPEG`, `exr -> OPEN_EXR`, plus tiff/bmp/webp/tga/dpx/hdr) and `_MAYA_IMAGE_FORMATS` (the app's existing ids, unchanged), `image_format_choices(software_type)` for what a dialog may offer, and `image_format_value()` which translates or raises a `ValueError` naming the accepted options. `job.output_format` still stores the extension, because that is what a saved queue JSON carries and what the post-processor metadata reports; only the command line changes. Unreal and Cinema 4D translate nothing - the pipeline config carries the extension as written, and C4D's command line has no output-format switch at all, so the scene decides - and both keep `DEFAULT_IMAGE_FORMATS`. A refused format reaches `job.error_message` through `_run_job`, so the queue says *why* instead of "Render job failed".
+
+**`src/ui/dashboard_tab.py`** - the format list is drawn from the engine, not from a literal: `update_format_choices()` (`:120`) repopulates on `currentIndexChanged` and keeps the user's choice when the new engine also accepts it, so Maya now offers four formats and never shows the `bmp` it cannot be told about. It falls back to `DEFAULT_IMAGE_FORMATS` while no engine is selected, so the field is never empty.
+
+**`tests/mock_dcc/mock_dcc.py`** - `BLENDER_FORMAT_NAMES` is Blender's own list, kept independent of the app's table, and `parse_blender` now rejects a name that is not in it. That is what turns "Blender wants JPEG" from a claim into something the harness can fail on: with the old `upper()` restored, `test_21` fails in the mock's own error.
+
+**`tests/test_dashboard_contract.py`** (new, 16 tests, and the 12th audit suite) - the pattern that found the Mesh Tools bugs, applied to the queue panel: real widgets, real signals, no `hasattr` guards. `SpyManager` (a `JobManager` subclass) records what the panel asks for, so the tests can tell "the button reached the queue with this id" from "the button did nothing"; `TestFormatChoices` requires every offered format to build a command the engine accepts, checked against the mock's list rather than a second copy of the table; `TestQueueControls` pins the id read, the no-selection refusal, and a refusal from the queue; `TestQueueReadout` emits a real `job_updated` and requires the bar to move, the status line to count live jobs, and a self-stopped queue to hide its bar. The `test_15` case is why this file exists: the panel had already been wired in 4d, and only a widget-level test can see that a bar with nothing connected to it stays at 0.
+
+- Proof: `tests/test_dashboard_contract.py` → `Ran 16 tests ... OK`; `tests/test_mock_dcc.py` → `Ran 29 tests ... OK` (27 before); `run_audit.py` → `100% (12/12 suites)`; 5 injected defects, 5 caught by a named test (upper-cased extension, Maya's silent png fallback, `JPG` as a Blender name, one format list for every engine, `EXR` as an OpenEXR name).
+- The probe's first run reported 2 of 5 as SKIPPED, not MISSED: the sources are CRLF, and an anchor containing `\n` never matches. The anchor now carries the file's own newline convention - a skipped mutation is a hole in the runner, not in the tests, and it looks identical to coverage from the summary line.
+- **Not covered here:** the mock still writes `.png`/`.exr` frames from its *scene* hint rather than the command-line format, so nothing checks that a JPEG job's files end `.jpg`. The app's post-processor does not filter on that extension (it records `'format'` in metadata only), so the mismatch has no consequence today; it becomes a test when a renderer is asked to write a format the queue then looks for. And the four Maya ids are the app's own - no package here can say whether `imageFormat 8` is JPEG, so the mock accepts any number and the repair leaves them exactly as they were rather than guessing.
 
 ## Known-deferred
 

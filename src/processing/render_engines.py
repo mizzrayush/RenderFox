@@ -73,6 +73,77 @@ def output_spec(job: RenderJob) -> Tuple[str, str]:
     return os.path.abspath(directory), frame_stem(stem)
 
 
+# Each renderer's own spelling of an image file format, as (what the user picks,
+# what the command line wants).
+#
+# `job.output_format` stores the *extension* - that is what the post-processor
+# looks for on disk afterwards, and what a saved queue JSON carries. A renderer
+# wants a different thing again: Blender's `--render-format` takes a format name,
+# and `JPG` is not one of them (it reports an unknown format and renders nothing);
+# Maya's `imageFormat` takes a number, and a number it does not know writes a
+# different file type without saying so. Either way the wrong token does not fail
+# where it is written, it fails several minutes later in someone else's software.
+_BLENDER_IMAGE_FORMATS = [('png', 'PNG'), ('jpg', 'JPEG'), ('exr', 'OPEN_EXR'),
+                          ('tiff', 'TIFF'), ('bmp', 'BMP'), ('webp', 'WEBP'),
+                          ('tga', 'TARGA'), ('dpx', 'DPX'), ('hdr', 'HDR')]
+_MAYA_IMAGE_FORMATS = [('png', 32), ('jpg', 8), ('tiff', 3), ('exr', 51)]
+
+# The formats a job may carry when nothing else constrains it. Neither of the two
+# remaining engines is given a format *name*: Unreal's config JSON carries the
+# extension as the app wrote it (the Movie Render Pipeline's own output settings
+# live in a settings asset this app does not touch), and Cinema 4D's command line
+# has no output-format switch at all, so the scene decides. Both keep this list so
+# the dialog matches what a job can carry, and neither translates.
+DEFAULT_IMAGE_FORMATS = ['png', 'jpg', 'exr', 'tiff', 'bmp']
+
+_IMAGE_FORMATS: Dict[SoftwareType, List[Tuple[str, object]]] = {
+    SoftwareType.BLENDER: _BLENDER_IMAGE_FORMATS,
+    SoftwareType.MAYA: _MAYA_IMAGE_FORMATS,
+}
+
+
+def _format_choice(value: str) -> str:
+    """A stored format string as a key of the tables above.
+
+    `jpeg` is accepted as a synonym of `jpg` because both spellings are already
+    in circulation: job JSON written by earlier builds, and the scripting API.
+    """
+    key = (value or '').strip().lower()
+    return 'jpg' if key == 'jpeg' else key
+
+
+def image_format_choices(software_type: SoftwareType) -> List[str]:
+    """The formats worth offering for one engine.
+
+    The dialog has to ask this instead of keeping its own list: an option that
+    only one of the four renderers understands is an option that fails a click
+    later, and the user cannot tell which.
+    """
+    pairs = _IMAGE_FORMATS.get(software_type)
+    if pairs is None:
+        return list(DEFAULT_IMAGE_FORMATS)
+    return [choice for choice, _ in pairs]
+
+
+def image_format_value(software_type: SoftwareType, output_format: str,
+                       engine_name: str) -> object:
+    """`output_format` translated for one engine, or a refusal naming the options.
+
+    An engine with no table is not given the format, so the string passes through
+    unchanged - the caller's scene settings decide.
+    """
+    pairs = _IMAGE_FORMATS.get(software_type)
+    if pairs is None:
+        return output_format
+    table = dict(pairs)
+    value = table.get(_format_choice(output_format))
+    if value is None:
+        raise ValueError(
+            f"{engine_name} cannot be told to render '{output_format}'. "
+            f"Use one of: {', '.join(sorted(table))}.")
+    return value
+
+
 class RenderEngine(ABC):
     """Abstract base class for render engines."""
     
@@ -381,7 +452,8 @@ class BlenderEngine(RenderEngine):
             "--background",  # Run in background mode
             job.project_file,  # Blend file
             "--render-output", self._output_template(job),  # <dir>/<stem>_####
-            "--render-format", job.output_format.upper(),  # Output format
+            "--render-format", str(image_format_value(
+                SoftwareType.BLENDER, job.output_format, self.name)),  # PNG/JPEG/OPEN_EXR
         ]
         
         # Add resolution
@@ -491,14 +563,7 @@ class MayaEngine(RenderEngine):
         ])
         
         # Set format
-        format_map = {
-            'png': 32,
-            'jpg': 8,
-            'jpeg': 8,
-            'tiff': 3,
-            'exr': 51
-        }
-        format_id = format_map.get(job.output_format.lower(), 32)
+        format_id = image_format_value(SoftwareType.MAYA, job.output_format, self.name)
         mel_commands.append(f"setAttr defaultRenderGlobals.imageFormat {format_id};")
         
         # Frame range

@@ -101,6 +101,20 @@ def read_json(path, kind):
     return document
 
 
+# The names `blender --render-format` takes. These are format *names*, not file
+# extensions: `JPG` and `EXR` are not in Blender's list, and it reports
+# `Unknown input format` and renders nothing rather than guessing. The mock keeps
+# the strict spelling so a command line built from an extension fails here instead
+# of passing quietly - and so the app has to name the format the way Blender does.
+BLENDER_FORMAT_NAMES = {
+    'PNG': 'png', 'JPEG': 'jpg', 'OPEN_EXR': 'exr', 'MULTILAYER': 'exr',
+    'TIFF': 'tif', 'BMP': 'bmp', 'WEBP': 'webp', 'TARGA': 'tga',
+    'TARGA_RAW': 'tga', 'DPX': 'dpx', 'CINEON': 'cin', 'HDR': 'hdr',
+    'JPEG2000': 'jp2', 'SGI': 'sgi', 'IRIX': 'rgb', 'PSD': 'psd', 'XPM': 'xpm',
+    'AVI_JPEG': 'avi', 'AVI_RAW': 'avi', 'FFMPEG': 'mp4', 'PRINT': 'prn',
+}
+
+
 def parse_blender(argv):
     """blender --background file.blend --render-output out --render-format PNG ... -a"""
     takes_value = {'--render-output': 'output', '--render-format': 'format',
@@ -140,6 +154,10 @@ def parse_blender(argv):
         fail(EXIT_BAD_COMMAND, 'Error: no --render-output given')
     if 'format' not in options:
         fail(EXIT_BAD_COMMAND, 'Error: no --render-format given')
+    if options['format'] not in BLENDER_FORMAT_NAMES:
+        fail(EXIT_BAD_COMMAND,
+             f"Error: Unknown input format: {options['format']} - blender takes a "
+             f"format name, not an extension ({', '.join(sorted(BLENDER_FORMAT_NAMES))})")
     if not animation and 'single' not in options:
         fail(EXIT_BAD_COMMAND, 'Error: neither --render-anim nor --render-frame given')
     if 'expr' in options and 'resolution_x' not in options['expr']:

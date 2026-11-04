@@ -80,6 +80,12 @@ SUITES = [
         "description": "Drives the real JobManager thread against the mock renderers: configured engines are discovered, live progress per job, priority order, retries, concurrency, pause/remove/stop leave no renderer running"
     },
     {
+        "id": "dashboard_contract",
+        "name": "Dashboard Queue Control Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_dashboard_contract.py")],
+        "description": "Clicks every dashboard queue control and requires the queue to be asked, the bar to follow the render and the format list to match the engine"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

@@ -13,6 +13,7 @@ from PyQt6.QtGui import QColor, QAction
 
 from ..core.models import RenderJob, SoftwareType, JobStatus, Priority
 from ..core.job_manager import JobManager
+from ..processing.render_engines import DEFAULT_IMAGE_FORMATS, image_format_choices
 from .icon_provider import get_icon
 import json
 import os
@@ -92,7 +93,8 @@ class AddJobDialog(QDialog):
         
         # Output format
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["png", "jpg", "exr", "tiff", "bmp"])
+        self.software_combo.currentIndexChanged.connect(self.update_format_choices)
+        self.update_format_choices()
         form_layout.addRow("Output Format:", self.format_combo)
         
         # Output path
@@ -113,6 +115,27 @@ class AddJobDialog(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
     
+    def update_format_choices(self):
+        """Offer only the formats the chosen engine can be told about.
+
+        Each renderer names an image format its own way - Blender takes `JPEG`,
+        Maya takes a number - and one list for all four engines means an option
+        that dies inside the render software minutes after the job starts. With no
+        engine selected yet there is nothing to translate against, so the app's own
+        list stands.
+        """
+        software_type = self.software_combo.currentData()
+        choices = image_format_choices(software_type) if software_type else []
+        if not choices:
+            choices = list(DEFAULT_IMAGE_FORMATS)
+        previous = self.format_combo.currentText() if self.format_combo.count() else None
+        self.format_combo.blockSignals(True)
+        self.format_combo.clear()
+        self.format_combo.addItems(choices)
+        if previous in choices:
+            self.format_combo.setCurrentText(previous)
+        self.format_combo.blockSignals(False)
+
     def refresh_software_detection(self):
         """Refresh the software detection and update the combo box."""
         try:
@@ -154,6 +177,9 @@ class AddJobDialog(QDialog):
                 if software_type in self.available_software:
                     self.software_combo.setCurrentIndex(i)
                     break
+
+            # The engine list is what the format list is drawn from.
+            self.update_format_choices()
                     
         except Exception as e:
             self.software_status_label.setText(f"Error detecting software: {str(e)}")

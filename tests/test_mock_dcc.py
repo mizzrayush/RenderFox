@@ -35,7 +35,8 @@ from src.core.models import RenderJob, SoftwareType
 from src.processing.render_engines import (BlenderEngine, Cinema4DEngine,
                                            MayaEngine, UnrealEngine,
                                            create_render_engine,
-                                           detect_available_software)
+                                           detect_available_software,
+                                           image_format_choices)
 
 # What each package prints per frame, in its own syntax. The parsers in
 # `render_engines.py` are written against these lines rather than a guess, and
@@ -87,7 +88,8 @@ class MockDCCCase(unittest.TestCase):
         self.live.append(engine)
         return engine
 
-    def job(self, key, frames=None, name='hero', output_path=None, **scene):
+    def job(self, key, frames=None, name='hero', output_path=None,
+            output_format='png', **scene):
         scene.setdefault('seconds_per_frame', 0.02)
         scene.setdefault('output_dir', self.out)
         scene.setdefault('prefix', name)
@@ -96,7 +98,7 @@ class MockDCCCase(unittest.TestCase):
             id=f'{key}-{name}', name=name, project_file=project,
             software_type=SoftwareType(key),
             output_path=output_path or os.path.join(self.out, f'{name}.png'),
-            resolution=(960, 540), frame_range=frames, output_format='png')
+            resolution=(960, 540), frame_range=frames, output_format=output_format)
 
     def launch(self, key, job):
         """Run the command the engine itself assembles, and keep its output."""
@@ -500,6 +502,47 @@ class TestEngineLaunchPath(MockDCCCase):
                                  'the sanitized name did not reach the frame files')
                 self.assertFalse(os.path.isdir(os.path.join(self.out, 'Hero')),
                                  'a slash in the job name created a folder nobody asked for')
+
+    def test_21_blender_is_told_a_format_name_and_not_an_extension(self):
+        """`job.output_format` is an extension; `--render-format` takes a name.
+
+        Upper-casing the extension - which is all this used to do - sends `JPG` and
+        `EXR`, and Blender answers "Unknown input format", exits and writes no
+        frames. Nothing in the app can see that, because the failure happens inside
+        a package this machine has not got, so the mock keeps Blender's own list and
+        the command line is checked against it here.
+        """
+        for fmt, name in [('png', 'PNG'), ('jpg', 'JPEG'), ('jpeg', 'JPEG'),
+                          ('exr', 'OPEN_EXR'), ('tiff', 'TIFF'), ('bmp', 'BMP')]:
+            with self.subTest(format=fmt):
+                job = self.job('blender', frames=(1, 2), name=f'fmt-{fmt}',
+                               output_format=fmt)
+                engine = self.engine('blender')
+                command = engine.get_render_command(job)
+                self.assertEqual(name, command[command.index('--render-format') + 1])
+                self.assertTrue(engine.render_job(job), job.error_message)
+                self.assertEqual(2, len(self.frames_written(f'fmt-{fmt}')))
+
+    def test_22_a_format_the_renderer_cannot_be_told_about_stops_the_job(self):
+        """Better a refusal at the click than a render that quietly produces nothing.
+
+        Maya is the worse case: an id its `imageFormat` attribute does not know is
+        not an error, it is a different file type written silently, and the queue
+        then looks for frames under an extension that never existed.
+        """
+        for key, fmt in (('blender', 'avi'), ('maya', 'bmp')):
+            with self.subTest(package=key):
+                job = self.job(key, frames=(1, 2), name=f'bad-{key}', output_format=fmt)
+                engine = self.engine(key)
+                with self.assertRaises(ValueError) as caught:
+                    engine.get_render_command(job)
+                message = str(caught.exception)
+                self.assertIn(fmt, message)
+                self.assertIn('Use one of', message)
+                for choice in image_format_choices(SoftwareType(key)):
+                    self.assertIn(choice, message)
+                self.assertFalse(self.frames_written(f'bad-{key}'),
+                                 'a job the renderer was never told about wrote frames')
 
 
 def pid_is_live(pid):
