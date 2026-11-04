@@ -23,17 +23,17 @@ did you write" because a docstring counts as code here.
 | Bucket | Files | Raw | Code |
 |---|---|---|---|
 | `src/` at the pre-repair baseline (`1727f94`) | 73 | 56,111 | 41,523 |
-| `src/` now | 73 | 57,488 | 42,773 |
+| `src/` now | 73 | 57,842 | 43,031 |
 | `tests/` (incl. `tests/mock_dcc/`) at baseline | 22 | 2,257 | 1,620 |
-| `tests/` now | 34 | 5,699 | 4,497 |
+| `tests/` now | 35 | 6,259 | 4,973 |
 | entry + tooling scripts at the root | 5 | 581 | ~450 |
 | `installer.nsi` + `RenderFox.spec` | 2 | 210 | 158 |
 | dead code inside `src/` (to be deleted) | 10 | 6,081 | 4,624 |
 
-Headline for a README or a conversation: **~57k lines of application code in
-`src/` (~42.8k non-blank), plus ~5.7k of tests.** Say "application code" and
+Headline for a README or a conversation: **~58k lines of application code in
+`src/` (~43k non-blank), plus ~6.2k of tests.** Say "application code" and
 "tests" separately - folding them together invites the reply "so half of it was
-generated?". The repair pass itself is +1,377 raw in `src` and +3,442 in `tests`
+generated?". The repair pass itself is +1,731 raw in `src` and +4,002 in `tests`
 (the mock renderers, the harness, the contract and mutation suites), which is
 the honest answer to "what did the AI write": the app, every tab and every
 feature are the user's; the harness and the fixes are the difference.
@@ -41,10 +41,11 @@ feature are the user's; the harness and the fixes are the difference.
 ## Verification commands
 
 ```bash
-python run_audit.py                       # 13-suite health audit (~117s)
+python run_audit.py                       # 14-suite health audit (~127s)
 python -X utf8 tests/test_mesh_tools_contract.py   # clicks every Mesh Tools control
 python -X utf8 tests/test_dashboard_contract.py    # clicks every dashboard queue control
 python -X utf8 tests/test_rendering_tab_contract.py  # clicks every Rendering tab control
+python -X utf8 tests/test_format_converter_contract.py  # converts every claimed pair for real
 python -X utf8 tests/test_pymeshlab_calls.py       # every filter/param/enum/method name vs the installed build
 python -X utf8 tests/test_texture_bake.py          # bakes 3 maps and reads the pixels back
 python -X utf8 tests/test_renderfox.py    # LOD/QEM/format/queue
@@ -67,7 +68,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
 | 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | DONE - 4a live progress streaming; 4b every configured engine reaches the queue; 4c-1 output path, frame names, post-processing folder; 4c-2 priority, retry, concurrency, per-job pause/remove/stop; 4d-1 dashboard queue controls and readout; 4d-2 each renderer is asked for a format it has; 4d-3 the Rendering tab's toolbar and Render buttons work |
-| 5 | FBX/DAE claims + requirements gaps | not started |
+| 5 | FBX/DAE claims + requirements gaps | DONE - 5a the capability table is what the three libraries were measured doing, and the assimp path works for the first time; 5b `pyassimp`/`pymeshlab` pinned, the DLL collected, the picker only offers what can be written |
 | 6 | Fabricated results presented as real | not started |
 | 7 | 22s startup | not started |
 | 8 | Dead module deletion + stale wiring + thumbnail keys | not started |
@@ -86,7 +87,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 - `src/ui/main_window.py:244`/`:249`/`:254` View menu → `switch_to_tab(0/1/2)`, but tab order (`:106-120`) is 0=Library, 1=Batch Render, 2=Models. All three entries land on the wrong tab.
 - Measured startup: 22.2 s to construct MainWindow; `library_tab` import alone 14.2 s (eager torch/transformers/open3d/CLIP).
 - pymeshlab 2025.7: `compute_ambient_occlusion_per_vertex` (`texture_baker.py:135`) does not exist and `colorize_by_vertex_quality` (`texture_baker.py:143`) fails.
-- trimesh 4.7.4: `.fbx` raises `ValueError: 'fbx' exporter not available`, `.dae` needs absent pycollada — yet `format_converter.py:108-111` advertises OBJ↔FBX and glTF→FBX conversions.
+- ~~trimesh 4.7.4: `.fbx` raises `ValueError: 'fbx' exporter not available`, `.dae` needs absent pycollada — yet `format_converter.py:108-111` advertises OBJ↔FBX and glTF→FBX conversions.~~ **Fixed in Phase 5a** - the advertised matrix is replaced by the measured capability table, assimp (the only FBX writer here) is called correctly for the first time, and every pair in the table is converted and read back by `test_01`/`test_05`.
 
 **Confirmed by code reading**
 
@@ -105,7 +106,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 - `lod_generator.py:233-234` `_cluster_simplify` delegates to quadric unless `use_vertex_clustering=True` (default False).
 - `verify_software` written/read only inside `settings_tab.py`; never consulted by the queue.
 - `painting_tab.py:299-304` `update_brush_settings` is a no-op "(to be implemented)".
-- Missing from `requirements.txt` but imported: `cv2` (`postprocessor.py:15`, top level), `sklearn` (`model_extractor.py:10`, top level), `psutil`, `schedule`, `GPUtil`, `pyqtgraph`, `pyassimp`, `pycollada`, PyOpenGL. Declared but unused: `scipy`, `networkx`, `matplotlib`, `tensorflow`, `accelerate`, `safetensors`.
+- Missing from `requirements.txt` but imported: `cv2` (`postprocessor.py:15`, top level), `sklearn` (`model_extractor.py:10`, top level), `psutil`, `schedule`, `GPUtil`, PyOpenGL (`model_viewer.py:24`, `from OpenGL.GL import *` inside a `try` - a machine without it silently loses the 3D viewport and gets the pixmap fallback). Declared but unused: `scipy`, `networkx`, `matplotlib`, `tensorflow`, `accelerate`, `safetensors`, and `pyqtgraph`, which this line used to call *imported* and is imported nowhere in `src/`. ~~`pyassimp`~~ **declared and pinned in Phase 5b**, and the native library it needs is now collected by the spec; `pycollada` is **not** needed - it was only ever a trimesh Collada *writer* workaround, and pymeshlab and assimp both handle Collada here.
 - `node_graph.py:229-232` material graph parser reads three Principled sockets, ignores the rest.
 
 **Dead files (10, 6,081 raw / 4,624 code)** — `src/ui/model_tab_open3d.py` (1871), `src/ui/model_viewer_open3d.py` (1065), `src/utils/system_utils.py` (1059), `src/ui/library_grid.py` (821, orphans `src/core/thumbnail_generator.py` 488), `src/utils/file_utils.py` (367), `src/ui/weight_painting_tab.py` (264), plus 6-line shims `src/features/mesh_processor.py`, `src/features/point_cloud_processor.py`. `src/ui/feedback_dialog.py` (134) is imported but its only entry point `main_window.py:553 open_feedback` is connected to nothing.
@@ -451,11 +452,54 @@ Nine toolbar actions and two "Render" buttons were drawn and connected to nothin
 - Proof: `tests/test_rendering_tab_contract.py` → `Ran 15 tests ... OK`; `tests/test_all_tabs_headless.py` → `Ran 14 tests ... OK`; `run_audit.py` → `100% (13/13 suites passed in 117.30s)`; 10 injected defects, 10 caught by a named test (each Render button disconnected, `set_render_mode` not reached, rendered mode leaving overlays on the plate, frame written at pane size, format ignored, "Focus Selected" restored, a failed denoise claiming success, `snapshot` not saving, `reset_view` not reaching the camera).
 - **Not covered here:** the suite asserts size, format, naming and viewport state - not pixel *content*. Headless GL gives no way to say "this is a shaded model, not a blank plate", so whether the preview looks right is still the user's eye. `_grab_view` centre-crops when the requested aspect is not the pane's, so a 4K frame from a wide window loses its edges rather than its resolution. And `rendered` is the OpenGL viewport with grid and labels off; it is a lookdev frame, which is what the status line reports, and a Cycles-quality still is still the queue's job.
 
+### Phase 5a - the converter claims only what a library here can do
+
+This is the one that mattered, because "it converts FBX and DAE" is the reason the app exists for game-dev hand-off, and **it had never once worked.**
+
+What the machine said when asked (`trimesh 4.7.4`, `pymeshlab 2025.7`, `pyassimp 5.2.5` + `lib/assimp-vc143-mt.dll`, measured by exporting all nine formats each way and reading the result back):
+
+- `SUPPORTED_CONVERSIONS` was a hand-typed list of nine source keys. trimesh has no FBX or Collada writer and no FBX or Collada *reader* at all; pymeshlab reads all nine but raises `Unknown format for save: gltf`; **assimp is the only FBX writer here** - and the assimp call was broken, so OBJ→FBX, glTF→FBX and every DAE output went nowhere.
+- `pyassimp.load()` is a `@contextmanager`, not a loader that returns a scene. The old `scene = pyassimp.load(path)` bound a generator wrapper, `aiExportScene` answered `AssimpError` - and `AssimpError` inherits **`BaseException`, not `Exception`** (`pyassimp/errors.py:7`), so it walked straight past the `except Exception` and out of the converter.
+- `pyassimp.export()` wants the exporter's **id**, not the extension: this DLL reports `gltf2`, `glb2`, `collada`, `fbx`, `3mf` via `aiGetExportFormatDescription`. Handing it `"dae"` is a silent no-op failure.
+- assimp writes everything except `.off`. trimesh writes `.off` and `.3mf`. Both were in `SupportedFormat` and in **no** target list, so the two formats that needed no library at all were never offered.
+- `get_conversion_preview` and `get_format_info` asked trimesh, which cannot open `.dae`/`.fbx`: the panel that is supposed to help you choose a conversion answered `Could not load mesh` for exactly the two formats you came for.
+- **pymeshlab's FBX reader does not report a malformed file - it takes an access violation and the process dies with it** (measured: exit `0xC0000005` on bytes that were merely named `.fbx`). That was one Convert click away, inside a `QThread`, for the whole app. assimp raises a catchable error for the same bytes.
+- `batch_convert` set `library_used` to the first *installed* library whether or not it had done anything, and `FormatConversionThread` ignored `result['success']` per file and reported `list(zip(inputs, outputs))`, so a batch in which every conversion failed displayed **"All N files converted successfully"**.
+- `ScriptAPI.convert_format` (`:154`) called `converter.convert()`, a method that does not exist: every documented `rfx.convert_format(...)` call raised `AttributeError`.
+- `os.makedirs(os.path.dirname(output_file))` raised `FileNotFoundError` for a bare `result.stl` - the Known-deferred item, now closed.
+
+**`src/processing/format_converter.py`** - the hand-typed matrix is gone. `_CAPABILITIES` (`:190`) is the measured read/write set per library plus `applies_options`, and everything else derives from it: `supported_targets`/`get_supported_targets` (`:234`/`:273`, the instance one filtered by what is installed *here*), `conversion_libraries` (`:283`, the libraries that can carry the whole pair, in try order), `conversion_blocker` (`:311`, names the missing library), `can_convert` (`:333`). `_ASSIMP_EXPORT_IDS` (`:211`) is the DLL's id table; `_convert_with_assimp` (`:478`) uses `with pyassimp.load(...) as scene:` and the id, and treats an empty or missing output as a failure. `CONVERSION_ERRORS` (`:144`) is `(Exception, pyassimp.AssimpError)` so the BaseException-derived one is actually caught everywhere. `_source_blocker` (`:300`) refuses an `.fbx` with no `Kaydara FBX`/`FBXHeaderExtension` header before any reader sees it, and `_CLEAN_FAILURE_FIRST` (`:223`) puts assimp ahead of MeshLab for `.fbx` sources in case the header is right and the body is not. `_read_as_trimesh` (`:718`) is the preview bridge - trimesh, then pymeshlab, then assimp, returning `(mesh, which)` so `get_conversion_preview` (`:773`) can say `opened_with` - and it is the same reader the LOD chain and the preview use, so an LOD cut from `.fbx` works like the picture above it claims to. Options are now reported instead of silently dropped: `_meaningful_options` (`:88`) ignores the defaults the panels always send, and a success through pymeshlab/assimp carries `options_skipped` and says `Converted using assimp (scale not applied)`. `_prepare_output_dir` (`:81`) fixes the bare-filename crash; `update_faces(unique_faces())` replaces the deprecated call; `convert_with_lod_generation` (`:593`) takes `options` and, for a target trimesh cannot write, cuts the chain through a scratch `.obj` inside the output dir and re-exports via `convert_file`, skipping a level that fails instead of returning a phantom path.
+
+**`src/processing/script_engine.py`** - `convert_format` (`:154`) calls `convert_file`, strips a leading dot from the format, and raises with the backend's reason instead of `"Format conversion failed"`.
+
+**`src/ui/preprocessing_tab.py`** - `FormatConversionThread` (`:65`) checks `result['success']` per file and splits `converted`/`failed` with the real `method` and `options_skipped` (`conversion_complete` is now `pyqtSignal(list, list)`, `:71`), so `show_conversion_complete` (`:1091`) builds its table from those rows and a failed batch says how many failed. `generate_lods` is passed from the checkbox instead of being read nowhere.
+
+**`src/ui/model_tab.py`** - the batch dialog lists every `SupportedFormat` (`:181`) so OFF and 3MF are reachable; the two checkboxes nothing ever read ("Merge all objects", "Apply transforms") are a line of text (`:197`), because the converter always joins the scene and bakes the transforms.
+
+### Phase 5b - the released app has the FBX writer, and the picker says when it does not
+
+The conversion stack is a python binding, a native DLL and a file dialog filter, and all three were wrong in ways that only show up away from this machine.
+
+**`requirements.txt`** declared no `pyassimp` at all - so `pip install -r requirements.txt` on a fresh box gave an app with no FBX or Collada writer and no message. It is pinned `pyassimp==5.2.5` with the reason next to it. `pymeshlab>=2022.2` was a floor nothing was tested against; it is `pymeshlab==2025.7`, the release every filter, accessor and parameter name in this app was checked against (`test_pymeshlab_calls.py` reads them out of the installed build).
+
+**`format_converter.py:24-45`** - pyassimp's `search_library()` looks in its own package folder and in **every directory already on `PATH`** (measured: `pyassimp/helper.py:202` `search_library()`, whose candidate folders are its own package dir plus `os.environ['PATH'].split(';')` added at `:52-55`); nothing looks in this app's `lib/`. The old bootstrap computed `lib/` as three directories above `__file__`, which is the repo root when run from source and the *bundle's* `_MEIPASS` when frozen - by luck, and only if the DLL is collected. `_assimp_lib_dirs()` now takes the source root, `sys._MEIPASS` and the executable's folder, keeps the ones that exist, and puts a folder that actually contains an `assimp*.dll` first. `conversion_blocker` appends where it looked, so a missing FBX writer is answered with a path rather than a guess.
+
+**`RenderFox.spec`** collected neither the binding nor the library: `pyassimp` is now a hidden import and `lib/assimp-vc143-mt.dll` is a data file. Without both, the packaged app keeps the FBX menu entry and loses every FBX file - the `.pdb` stays out.
+
+**`src/ui/preprocessing_tab.py`** - the batch picker's open filter was `*.obj *.ply *.stl *.off *.dae *.gltf *.glb *.3mf`: no `*.fbx`, so on Windows the flagship format was **invisible in the dialog**. It is in. And `_refresh_target_availability()` (`:1011`), called when files are added or cleared, now asks the converter for every loaded source and greys out a target nothing installed can write from it, with `conversion_blocker`'s sentence as the tooltip - and moves the current selection off a greyed-out row, because a picker left pointing at FBX with no assimp converts nothing and explains nothing.
+
+**`src/ui/model_tab.py`** - the *other* conversion dialog had its own format list, and it disagreed with the converter twice over: its open filter was `*.obj *.stl *.ply *.glb *.gltf *.fbx *.dae *.x3d`, which hides OFF and 3MF and offers `.x3d`, a suffix `SupportedFormat` does not contain and `batch_convert` answers with "Skipping unsupported file". The filter is now built from `SupportedFormat` itself, and a suffix the converter does not know is not added to the list. Writing this caught a second bug in the same call: the filter had been passed as the *third* positional argument, i.e. into Qt's `directory` slot, so no filter reached the dialog at all.
+
+**`tests/test_format_converter_contract.py`** (new, 23 tests, the 14th audit suite) - seeds are written by the libraries directly, never by the converter, so no test passes by believing the thing it checks. `test_01` converts **every pair in the capability table** and requires a non-empty file and a reported library that table says can do it; `test_02` reads each result back and requires the face count to survive (a cube is 12 faces to every reader here, 24 to none - the first draft asserted vertices and failed on a correct conversion); `test_05`/`test_06` reopen the FBX through *pymeshlab* and the DAE through the preview bridge, so a writer cannot pass by writing bytes only assimp can read; `test_09` hands a corrupt `.fbx` to a **child process** and asserts exit code 0, because the defect it guards is a segfault and a test that segfaults the runner reports nothing; `test_18` re-imports the module in a child with `lib/` stripped from `PATH` and requires it back (and, on a clone with no binaries, requires the blocker to say where it looked); `test_19` reads `requirements.txt` the way pip does - comments dropped, name split off the specifier - and checks the spec's `hiddenimports` and `datas` lists *as sections*, because "pyassimp appears somewhere in the file" was satisfied by my own comment about it; `test_20`-`test_22` drive the real Add Files button and the real combo, and `test_23` opens the Model tab's converter dialog and requires every `SupportedFormat` in its filter and an unknown suffix refused.
+
+- Proof: `tests/test_format_converter_contract.py` → `Ran 23 tests ... OK`; `run_audit.py` → `100% (14/14 suites passed in 127.18s)`; **22 injected defects, 22 caught by a named test** (assimp's FBX writer removed from the table, the extension passed instead of the exporter id, `.off`/`.3mf` unoffered, the preview trimesh-only again, the FBX header gate removed, options ignored by trimesh, a skipped option unreported, `library_used` fabricated, the LOD chain exported straight through trimesh, the bare-filename `makedirs`, a refusal that does not name the format, `converter.convert()` restored, the `PATH` bootstrap disabled, `pyassimp` un-declared, the DLL not collected, the binding not imported, `*.fbx` out of the filter again, the picker not consulting the converter, a greyed-out target left selected, the Model dialog hiding OFF/3MF, it accepting `.x3d`, and its filter landing in the directory slot). One was caught by a *different* named test than intended - passing the extension instead of the id is caught by `test_01`, which reaches it first - so it is counted, not hidden.
+- **Not covered here:** the build recipe is checked as *text*, not by running PyInstaller - a real bundle was never produced on this machine, so "the packaged app converts FBX" is argued from the spec plus the `_MEIPASS` path arithmetic, not observed. `pip install -r requirements.txt` was not run either; the pins are what this machine already has. Whether a genuine FBX *opens* in Blender/Unity/Maya is unverifiable here by definition - `test_05` proves a second independent library reads it, which is the strongest statement available without a DCC. And the Model tab's batch dialog still lists all nine targets; the backend refuses with a real reason, but that picker does not grey anything out the way the Preprocessing one now does.
+
 ## Known-deferred
 
 - `tools/` is gone. Its job - the pymeshlab name/parameter/enum truth - is now `tests/_pymeshlab_probe.py` + `tests/test_pymeshlab_calls.py`, which run inside the audit instead of being remembered by hand. Nothing references `tools/` any more.
 - **One string enum is still invisible to the checker**: `_transfer(attribute, ...)` in `texture_baker.py` receives `attributeenum` as a parameter, so it parses as computed. It is covered at runtime instead - `test_02` proves `'Vertex Color'` rasterises colour, `test_04` proves `'Vertex Normal'` rasterises normals - and splitting it into two literal call sites was rejected because the only thing gained would be a second copy of the same eleven lines. Say so rather than let the green checker imply full coverage.
 - `MeshAnalyzer.is_manifold` / `mesh_tools_tab.update_mesh_info` still report `is_winding_consistent` under the label "Manifold". Kept open because a correct test needs a real edge-manifold check, which belongs with the quality-scoring work, not silently patched here.
 - Running the audit dirties the working tree: tests write into tracked files (`config/batch_templates.json` records a `created_at` timestamp; `tests/test_data/repaired.obj` and `simplified.obj` are regenerated outputs, not inputs - nothing reads them). They were restored with `git restore` before the Phase 2 commit, so every commit here is clean, but the suites need to write to a temp directory. Belongs with the dead-file/phase-8 hygiene pass, not a behaviour fix.
-- `format_converter.py` calls `os.makedirs(os.path.dirname(output_file))` at lines 262, 290 and 313, which raises for a bare filename (`dirname` is `''`). Latent - every UI path passes a directory - and not reached by any test yet. Fix with the format-claims phase.
+- ~~`format_converter.py` calls `os.makedirs(os.path.dirname(output_file))` at lines 262, 290 and 313, which raises for a bare filename (`dirname` is `''`). Latent - every UI path passes a directory - and not reached by any test yet. Fix with the format-claims phase.~~ **Fixed in Phase 5a** - one `_prepare_output_dir()` (`format_converter.py:81`) with the `or '.'` the empty dirname needs, and `test_16` converts to a bare `result.stl` from a changed cwd so it stays reached.
 - `ModelViewer3D` defines `set_render_mode` twice (`:1605` and `:1860`) and `set_use_vertex_colors` twice (`:1865`/`:1889`) in the same class. Last definition wins, and both pairs do the same thing, so the Rendering tab's view modes reach the body they expect - but a reader cannot tell which one a control reaches without scrolling to the end. Left for the dead-code pass rather than edited blind.

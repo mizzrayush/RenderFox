@@ -175,9 +175,10 @@ class ModelFormatConverter(QDialog):
         settings_layout = QFormLayout()
         
         self.output_format = QComboBox()
-        # Populate from SupportedFormat to ensure compatibility with converter
-        for fmt in [SupportedFormat.OBJ, SupportedFormat.STL, SupportedFormat.PLY,
-                    SupportedFormat.GLB, SupportedFormat.GLTF, SupportedFormat.DAE, SupportedFormat.FBX]:
+        # Every format the converter knows, so the dialog cannot offer a target the
+        # backend rejects or hide one it writes (OFF and 3MF were both writable and
+        # missing here).
+        for fmt in SupportedFormat:
             self.output_format.addItem(fmt.value.upper(), fmt)
         settings_layout.addRow("Output Format:", self.output_format)
         
@@ -189,19 +190,17 @@ class ModelFormatConverter(QDialog):
         output_layout.addWidget(output_btn)
         settings_layout.addRow("Output Directory:", output_layout)
         
-        # Conversion options (mapped to converter options where applicable)
-        self.merge_objects = QCheckBox("Merge all objects into single file")
-        settings_layout.addRow("", self.merge_objects)
-        
+        # Conversion options. "Merge all objects" and "Apply transforms" were checkboxes
+        # nothing read: the converter always joins the scene into one mesh and always
+        # bakes the node transforms while doing it, so the truth is a line of text, not
+        # a switch that cannot change anything.
+        settings_layout.addRow(QLabel("Always: objects merged into one mesh,\nscene transforms applied"))
+
         self.scale_factor = QDoubleSpinBox()
         self.scale_factor.setRange(0.001, 1000.0)
         self.scale_factor.setValue(1.0)
         self.scale_factor.setDecimals(3)
         settings_layout.addRow("Scale Factor:", self.scale_factor)
-        
-        self.apply_transform = QCheckBox("Apply transforms")
-        self.apply_transform.setChecked(True)
-        settings_layout.addRow("", self.apply_transform)
         
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
@@ -221,12 +220,19 @@ class ModelFormatConverter(QDialog):
     
     def add_input_files(self):
         """Add input files for conversion."""
+        # The filter is the converter's own format list, so the dialog can neither hide
+        # a format it reads (OFF and 3MF were both absent) nor offer one it refuses
+        # (.x3d was listed, and is not a SupportedFormat).
+        patterns = ' '.join(f'*{fmt.value}' for fmt in SupportedFormat)
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Model Files",
-            "", "3D Models (*.obj *.stl *.ply *.glb *.gltf *.fbx *.dae *.x3d);;All Files (*)"
+            self, "Select Model Files", "",
+            f"3D Models ({patterns});;All Files (*)"
         )
-        
+
+        converter = FormatConverter()
         for file_path in files:
+            if not converter.is_format_supported(file_path):
+                continue
             if file_path not in self.input_files:
                 self.input_files.append(file_path)
                 self.input_list.addItem(os.path.basename(file_path))

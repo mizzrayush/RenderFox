@@ -160,14 +160,16 @@ class ScriptAPI:
         
         if not output_file:
             base = os.path.splitext(input_file)[0]
-            output_file = f"{base}.{output_format}"
+            output_file = f"{base}.{str(output_format).lstrip('.')}"
         
-        success = converter.convert(input_file, output_file, output_format)
+        # `converter.convert()` does not exist - the API is convert_file, and it answers
+        # with a dict, so the documented rfx.convert_format() raised AttributeError on
+        # every call and a failure used to report nothing about why.
+        result = converter.convert_file(input_file, output_file)
         
-        if success:
+        if result['success']:
             return output_file
-        else:
-            raise RuntimeError(f"Format conversion failed")
+        raise RuntimeError(f"Format conversion failed: {result['message']}")
     
     def generate_lod(self, input_file: str, levels: int = 3, 
                      ratios: Optional[List[float]] = None) -> List[str]:

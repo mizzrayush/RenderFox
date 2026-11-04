@@ -1,7 +1,14 @@
 PyQt6>=6.6.0
 numpy>=1.26.0
 trimesh>=4.0.0
-pymeshlab>=2022.2
+# Pinned to the release every pymeshlab call in this app was checked against. pymeshlab
+# renames its MeshSet accessors and its filters between releases, so an unpinned install
+# can pull a version where a call in this app raises.
+pymeshlab==2025.7
+# The only writer of .fbx in this app, and the only reader that can be relied on for a
+# malformed one. The python package carries no native library: RenderFox.spec collects
+# lib/assimp-vc143-mt.dll and format_converter puts that folder on PATH at import.
+pyassimp==5.2.5
 Pillow>=10.0.0
 scipy>=1.11.0
 requests>=2.31.0

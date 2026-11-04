@@ -92,6 +92,12 @@ SUITES = [
         "description": "Clicks every Rendering tab toolbar action and Render Image button and requires the viewport to change or a frame of the requested resolution and format to be written"
     },
     {
+        "id": "format_converter_contract",
+        "name": "Format Conversion Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_format_converter_contract.py")],
+        "description": "Converts every claimed format pair for real and reads the result back, opens the picker to check it only offers what the installed libraries can write, and checks the build recipe ships the FBX writer"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

@@ -65,47 +65,75 @@ class ModelExtractionThread(QThread):
 class FormatConversionThread(QThread):
     """Thread for batch format conversion."""
     
-    conversion_complete = pyqtSignal(list)
+    # (what converted, what did not). One list before: convert_file() answers with a
+    # dict, and a dict is truthy even when it says success=False, so every failure was
+    # counted and shown as a converted file.
+    conversion_complete = pyqtSignal(list, list)
     progress_update = pyqtSignal(int, str)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, input_files, output_dir, target_format, options=None, output_mode=0):
+    def __init__(self, input_files, output_dir, target_format, options=None, output_mode=0,
+                 generate_lods=False):
         super().__init__()
         self.input_files = input_files
         self.output_dir = output_dir
         self.target_format = target_format
         self.options = options
         self.output_mode = output_mode
+        self.generate_lods = generate_lods
     
+    def _output_dir_for(self, input_file):
+        if self.output_dir:
+            return self.output_dir
+        out_dir = os.path.dirname(input_file)
+        if self.output_mode == 1: # _Processed
+            out_dir = os.path.join(out_dir, "_Processed")
+            if not os.path.exists(out_dir):
+                try:
+                    os.makedirs(out_dir)
+                except OSError:
+                    pass
+        return out_dir
+
     def run(self):
         try:
             converter = FormatConverter()
-            converted_files = []
+            converted = []
+            failed = []
             
             for i, input_file in enumerate(self.input_files):
                 self.progress_update.emit(i, f"Converting {os.path.basename(input_file)}...")
                 
                 base_name = os.path.splitext(os.path.basename(input_file))[0]
+                out_dir = self._output_dir_for(input_file)
                 
-                # Determine output directory
-                if self.output_dir:
-                    out_dir = self.output_dir
-                else:
-                    out_dir = os.path.dirname(input_file)
-                    if self.output_mode == 1: # _Processed
-                        out_dir = os.path.join(out_dir, "_Processed")
-                        if not os.path.exists(out_dir):
-                            try:
-                                os.makedirs(out_dir)
-                            except OSError:
-                                pass
-                
+                if self.generate_lods:
+                    # "Generate LODs during conversion" used to be a checkbox nothing
+                    # read; when it is ticked, the LOD chain is the job's output.
+                    paths = converter.convert_with_lod_generation(
+                        input_file, out_dir, self.target_format, options=self.options)
+                    entry = {'input': input_file,
+                             'output': ', '.join(os.path.basename(p) for p in paths),
+                             'method': f'lod + {os.path.splitext(paths[0])[1].lstrip(".") if paths else "?"}'}
+                    if paths:
+                        converted.append(entry)
+                    else:
+                        entry['error'] = 'LOD generation produced no files'
+                        failed.append(entry)
+                    continue
+
                 output_file = os.path.join(out_dir, f"{base_name}{self.target_format.value}")
-                
-                if converter.convert_file(input_file, output_file, self.options):
-                    converted_files.append(output_file)
+                result = converter.convert_file(input_file, output_file, self.options)
+                entry = {'input': input_file, 'output': output_file,
+                         'method': result.get('method') or 'nothing'}
+                entry['options_skipped'] = result.get('options_skipped') or []
+                if result.get('success'):
+                    converted.append(entry)
+                else:
+                    entry['error'] = result.get('message', 'Conversion failed')
+                    failed.append(entry)
             
-            self.conversion_complete.emit(converted_files)
+            self.conversion_complete.emit(converted, failed)
         except Exception as e:
             self.error_occurred.emit(str(e))
 
@@ -968,15 +996,47 @@ class PreProcessingTab(QWidget):
         """Add files to the batch conversion list."""
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select Files for Batch Conversion",
-            "", "3D Model Files (*.obj *.ply *.stl *.off *.dae *.gltf *.glb *.3mf);;All Files (*)")
-        
+            "", "3D Model Files (*.obj *.ply *.stl *.off *.dae *.gltf *.glb *.3mf *.fbx);;All Files (*)")
+
         for file_path in files:
             if self.format_converter.is_format_supported(file_path):
                 self.conversion_files_list.addItem(file_path)
-    
+        self._refresh_target_availability()
+
     def clear_conversion_files(self):
         """Clear the conversion files list."""
         self.conversion_files_list.clear()
+        self._refresh_target_availability()
+
+    def _refresh_target_availability(self):
+        """Grey out the targets no library installed here can write from the loaded files.
+
+        The picker listed every SupportedFormat whatever was installed, so a machine
+        without an assimp build was still offered FBX and the whole batch came back as
+        failures with the reason buried in a results dialog.
+        """
+        sources = {os.path.splitext(self.conversion_files_list.item(i).text())[1].lower()
+                   for i in range(self.conversion_files_list.count())}
+        model = self.target_format.model()
+        if model is None:
+            return
+
+        for index in range(self.target_format.count()):
+            fmt = self.target_format.itemData(index)
+            blocker = None
+            for source in sorted(sources):
+                if not self.format_converter.can_convert(source, fmt.value):
+                    blocker = self.format_converter.conversion_blocker(source, fmt.value)
+                    break
+            model.item(index).setEnabled(blocker is None)
+            self.target_format.setItemData(index, blocker or '', Qt.ItemDataRole.ToolTipRole)
+
+        current = self.target_format.currentIndex()
+        if current >= 0 and not model.item(current).isEnabled():
+            for index in range(self.target_format.count()):
+                if model.item(index).isEnabled():
+                    self.target_format.setCurrentIndex(index)
+                    break
     
     def convert_batch_files(self):
         """Convert all files in the batch conversion list."""
@@ -1012,9 +1072,11 @@ class PreProcessingTab(QWidget):
         
         # Start conversion thread
         output_mode = self.output_folder_combo.currentIndex()
-        self.conversion_thread = FormatConversionThread(input_files, output_dir, target_format, options, output_mode)
+        self.conversion_thread = FormatConversionThread(
+            input_files, output_dir, target_format, options, output_mode,
+            generate_lods=self.convert_with_lod.isChecked())
         self.conversion_thread.conversion_complete.connect(
-            lambda files: self.show_conversion_complete(files, progress))
+            lambda converted, failed: self.show_conversion_complete(converted, failed, progress))
         self.conversion_thread.progress_update.connect(
             lambda i, msg: self.update_conversion_progress(progress, i, msg))
         self.conversion_thread.error_occurred.connect(
@@ -1026,23 +1088,26 @@ class PreProcessingTab(QWidget):
         progress_dialog.setValue(current)
         progress_dialog.setLabelText(message)
     
-    def show_conversion_complete(self, converted_files, progress_dialog):
-        """Show conversion completion message."""
+    def show_conversion_complete(self, converted_files, failed_files, progress_dialog):
+        """Show the results the conversion actually reported."""
         progress_dialog.close()
         
-        # Get the actual input files from the list widget
-        input_files = []
-        for i in range(self.conversion_files_list.count()):
-            input_files.append(self.conversion_files_list.item(i).text())
+        # The old version zipped the successes against the whole input list, so a row
+        # only lined up when nothing failed, and 'method' was the literal
+        # 'format_converter' rather than the library that did the work.
+        errors = [f"{entry['input']}: {entry.get('error', 'Conversion failed')}"
+                  for entry in failed_files]
+        for entry in converted_files:
+            if entry.get('options_skipped'):
+                errors.append(f"{entry['input']}: written without "
+                              f"{', '.join(entry['options_skipped'])} "
+                              f"- the {entry.get('method', 'library')} used cannot apply them")
         
-        # Create results dictionary for the new dialog
         results = {
-            'total_files': len(input_files),
-            'successful': [{'input': f, 'output': cf, 'method': 'format_converter'} 
-                          for f, cf in zip(input_files, converted_files) if cf],
-            'failed': [{'input': f, 'output': None, 'error': 'Conversion failed'} 
-                      for f, cf in zip(input_files, converted_files) if not cf],
-            'errors': []
+            'total_files': len(converted_files) + len(failed_files),
+            'successful': converted_files,
+            'failed': failed_files,
+            'errors': errors
         }
         
         # Show the new results dialog
