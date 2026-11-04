@@ -104,6 +104,12 @@ SUITES = [
         "description": "Adds a real folder, drops a real file in it and requires the tab's log to name it, checks the filter fields and Watch Events boxes reach the watcher, and makes each Auto Action prove its result on disk or say it failed"
     },
     {
+        "id": "automation_tasks_contract",
+        "name": "Automation Task Scheduler Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_automation_tasks_contract.py")],
+        "description": "Schedules a real task, waits for the polling thread to fire it and requires the run, the saved record, the next-run time, the exit code of a real command and every scheduler button to be true rather than a printed claim"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

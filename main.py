@@ -115,14 +115,15 @@ def main():
             print(f"Error launching downloader: {e}")
             sys.exit(1)
     
-    # Create main window
-    # Import here to allow splash screen to show first
-    from src.ui.main_window import MainWindow
-    main_window = MainWindow()
-    
     # Register Automation Actions
+    # Before the window, because the Automation tab fills its task-type list from the
+    # registry while it constructs; registered after, a pcd.* action is in no list the
+    # user can reach - on this start or any other.
+    # No engine is started here on purpose. The tab owns the app's one engine, and a
+    # second instance reads the same tasks file and gives every task its own calendar,
+    # so a saved schedule would fire once per live engine.
     try:
-        from src.features.automation_engine import ActionRegistry, AutomationEngine
+        from src.features.automation_engine import ActionRegistry
         from src.processing.point_cloud_processor import PointCloudProcessor
         
         # Create a headless processor for automation
@@ -137,14 +138,15 @@ def main():
         ActionRegistry.register("pcd.reconstruct.poisson", processor.reconstruct_mesh, "Poisson reconstruction", {'file_path': str, 'output_path': str, 'method': 'poisson', 'depth': int, 'scale': float})
         
         print("Core automation actions registered.")
-        
-        # Start Automation Engine
-        engine = AutomationEngine()
-        engine.start()
-        print("Automation Engine started.")
-        
+
     except Exception as e:
         print(f"Failed to register automation actions: {e}")
+
+    # Create main window
+    # Import here to allow splash screen to show first
+    from src.ui.main_window import MainWindow
+    main_window = MainWindow()
+    
 
     main_window.showMaximized()
     

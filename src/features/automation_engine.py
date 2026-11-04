@@ -7,6 +7,8 @@ import os
 import time
 import json
 import fnmatch
+import calendar
+import subprocess
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field
@@ -43,6 +45,19 @@ class TriggerType(Enum):
     EVENT_BASED = "event_based"
     CONDITION = "condition"
     MANUAL = "manual"
+
+
+def app_data_dir() -> str:
+    """The folder RenderFox keeps its own state in, as the library and telemetry do.
+
+    Tasks and workflows used to be written relative to the working directory, so the app
+    only found its saved work when it happened to be started from the right folder, and a
+    packaged build pointed at ``sys._MEIPASS`` wrote into a temporary directory.
+    """
+    path = os.path.join(os.path.expanduser('~'), '.renderfox')
+    os.makedirs(path, exist_ok=True)
+    return path
+
 
 
 class ActionRegistry:
@@ -117,123 +132,129 @@ class ActionRegistry:
 
     @classmethod
     def register_default_actions(cls):
-        """Register default system actions."""
+        """Register the actions a task or a workflow step is allowed to name.
+
+        Each one reports what it can prove rather than what it intended: a copy is
+        confirmed by the bytes at the destination, a command is judged by its exit
+        code, and the two processing actions name the files they actually wrote.
+        """
         import shutil
-        
+
         def copy_file(source: str, destination: str):
+            if not os.path.isfile(source):
+                raise FileNotFoundError(f"there is no file to copy at {source}")
+            size = os.path.getsize(source)
             shutil.copy2(source, destination)
-            return f"Copied {source} to {destination}"
-            
+            if not os.path.isfile(destination) or os.path.getsize(destination) != size:
+                raise RuntimeError(f"{destination} is not a full copy of {source}")
+            return f"Copied {os.path.basename(source)} ({size} bytes) to {destination}"
+
         cls.register("file.copy", copy_file, "Copy a file", {
             "source": {"type": "str", "required": True},
             "destination": {"type": "str", "required": True}
         })
-        
+
         def move_file(source: str, destination: str):
+            if not os.path.isfile(source):
+                raise FileNotFoundError(f"there is no file to move at {source}")
             shutil.move(source, destination)
-            return f"Moved {source} to {destination}"
-            
+            if os.path.exists(source) or not os.path.isfile(destination):
+                raise RuntimeError(f"{source} is still where it was and {destination} is not a file")
+            return f"Moved {os.path.basename(source)} to {destination}"
+
         cls.register("file.move", move_file, "Move a file", {
             "source": {"type": "str", "required": True},
             "destination": {"type": "str", "required": True}
         })
-        
+
         def delete_file(path: str):
+            if os.path.isdir(path):
+                raise IsADirectoryError(f"{path} is a folder; this action deletes single files")
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"{path} is already gone")
+            size = os.path.getsize(path)
             os.remove(path)
-            return f"Deleted {path}"
-            
+            if os.path.exists(path):
+                raise RuntimeError(f"{path} was not deleted")
+            return f"Deleted {path} ({size} bytes)"
+
         cls.register("file.delete", delete_file, "Delete a file", {
             "path": {"type": "str", "required": True}
         })
-        
+
         def run_command(command: str):
-            os.system(command)
-            return f"Executed: {command}"
-            
-        cls.register("system.run_command", run_command, "Run shell command", {
+            try:
+                completed = subprocess.run(command, shell=True, capture_output=True,
+                                           text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                return {'success': False,
+                        'error': 'the command was still running after 300 seconds and was killed'}
+            output = ((completed.stdout or '') + (completed.stderr or '')).strip()
+            tail = output[-400:] if output else ''
+            if completed.returncode != 0:
+                return {'success': False, 'exit_code': completed.returncode,
+                        'error': f"the command exited {completed.returncode}: "
+                                 f"{tail or 'it printed nothing'}"}
+            return {'success': True, 'exit_code': 0,
+                    'result': tail or 'the command exited 0 and printed nothing'}
+
+        cls.register("system.run_command", run_command,
+                     "Run a shell command; its exit code is the verdict", {
             "command": {"type": "str", "required": True}
         })
 
         # --- Processing Actions ---
-        
+
         def bake_texture(high_poly: str, low_poly: str, output_dir: str, resolution: int = 2048):
             from ..processing.texture_baker import TextureBaker
+            for path, label in ((high_poly, 'high-poly'), (low_poly, 'low-poly')):
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"the {label} model is not a file: {path}")
             baker = TextureBaker()
-            # Default to all maps for automation
-            baker.bake(high_poly, low_poly, output_dir, resolution, True, True, True)
-            return f"Baking complete for {os.path.basename(low_poly)}"
-            
+            complaints = []
+            baker.error_occurred.connect(lambda message: complaints.append(message))
+            maps = baker.bake(high_poly, low_poly, output_dir, int(resolution), True, True, True) or {}
+            written = {kind: path for kind, path in maps.items()
+                       if os.path.isfile(path) and os.path.getsize(path) > 0}
+            if not written:
+                return {'success': False,
+                        'error': f"no baked map could be read back for "
+                                 f"{os.path.basename(low_poly)}: "
+                                 + (complaints[-1] if complaints else 'the baker gave no reason')}
+            return {'success': True,
+                    'result': f"Baked {len(written)} map(s) for {os.path.basename(low_poly)}: "
+                              + ', '.join(sorted(written)),
+                    'maps': written}
+
         cls.register("processing.bake_texture", bake_texture, "Bake textures", {
             "high_poly": {"type": "str", "required": True},
             "low_poly": {"type": "str", "required": True},
             "output_dir": {"type": "str", "required": True},
             "resolution": {"type": "int", "required": False}
         })
-        
-        def generate_lod(input_path: str, output_path: str, count: int = 3):
-            # Placeholder wrapper for LOD logic
-            # In real implementation, this would call LODGenerator
-            return f"Generated {count} LODs for {os.path.basename(input_path)}"
-            
+
+        def generate_lod(input_file: str, output_dir: str, levels: int = 3):
+            from ..processing.lod_generator import LODGenerator, LODSettings
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            levels = max(1, int(levels))
+            files = LODGenerator(LODSettings(levels=levels)).generate_lods(input_file, output_dir) or []
+            written = [path for path in files
+                       if os.path.isfile(path) and os.path.getsize(path) > 0]
+            if not written:
+                return {'success': False,
+                        'error': f"no LOD file was written for {os.path.basename(input_file)}"}
+            return {'success': True,
+                    'result': f"Wrote {len(written)} LOD(s) into {output_dir}: "
+                              + ', '.join(os.path.basename(path) for path in written),
+                    'files': written}
+
         cls.register("processing.generate_lod", generate_lod, "Generate LODs", {
-            "input_path": {"type": "str", "required": True},
-            "output_path": {"type": "str", "required": True},
-            "count": {"type": "int", "required": False}
+            "input_file": {"type": "str", "required": True},
+            "output_dir": {"type": "str", "required": True},
+            "levels": {"type": "int", "required": False}
         })
 
-
-class Task:
-    """Represents a scheduled task."""
-    
-    def __init__(self, name: str, task_type: str, action: Callable, 
-                 schedule: str = "manual", parameters: Dict = None,
-                 priority: TaskPriority = TaskPriority.NORMAL):
-        self.task_id = str(uuid.uuid4())
-        self.name = name
-        self.task_type = task_type
-        self.action = action
-        self.schedule = schedule  # "manual", "daily", "weekly", "monthly", "cron"
-        self.parameters = parameters or {}
-        self.priority = priority
-        self.status = TaskStatus.PENDING
-        self.created_at = datetime.now()
-        self.last_run = None
-        self.next_run = None
-        self.enabled = True
-        self.result = None
-        self.error = None
-    
-    def to_dict(self) -> Dict:
-        """Convert task to dictionary."""
-        return {
-            'task_id': self.task_id,
-            'name': self.name,
-            'task_type': self.task_type,
-            'schedule': self.schedule,
-            'parameters': self.parameters,
-            'priority': self.priority.value,
-            'status': self.status.value,
-            'enabled': self.enabled,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'last_run': self.last_run.isoformat() if self.last_run else None,
-            'next_run': self.next_run.isoformat() if self.next_run else None
-        }
-    
-    @staticmethod
-    def from_dict(data: Dict) -> 'Task':
-        """Create task from dictionary."""
-        task = Task(
-            name=data['name'],
-            task_type=data['task_type'],
-            action=None,  # Action will be resolved at runtime via ActionRegistry
-            schedule=data.get('schedule', 'manual'),
-            parameters=data.get('parameters', {}),
-            priority=TaskPriority(data.get('priority', 2))
-        )
-        task.task_id = data['task_id']
-        task.enabled = data.get('enabled', True)
-        task.status = TaskStatus(data.get('status', 'pending'))
-        return task
 
 
 class WorkflowStep:
@@ -287,7 +308,8 @@ class AutomationTask:
     name: str
     task_type: str
     parameters: Dict[str, Any]
-    schedule_time: Optional[str] = None # Added for persistence
+    schedule_time: Optional[str] = None
+    enabled: bool = True
     status: TaskStatus = TaskStatus.PENDING
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
@@ -303,6 +325,7 @@ class AutomationTask:
             'task_type': self.task_type,
             'parameters': self.parameters,
             'schedule_time': self.schedule_time,
+            'enabled': self.enabled,
             'status': self.status.value,
             'created_at': self.created_at,
             'started_at': self.started_at,
@@ -310,6 +333,27 @@ class AutomationTask:
             'result': self.result,
             'error': self.error
         }
+
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> 'AutomationTask':
+        """Rebuild a saved task; a record with no id or no name is not a task."""
+        task = AutomationTask(
+            task_id=data['task_id'],
+            name=data['name'],
+            task_type=data.get('task_type', ''),
+            parameters=data.get('parameters') or {},
+            schedule_time=data.get('schedule_time'),
+            enabled=bool(data.get('enabled', True)),
+            status=TaskStatus(data.get('status', 'pending')),
+            created_at=data.get('created_at', time.time()),
+        )
+        task.started_at = data.get('started_at')
+        task.completed_at = data.get('completed_at')
+        task.result = data.get('result')
+        task.error = data.get('error')
+        return task
+
 
 
 class Workflow:
@@ -365,81 +409,186 @@ class Workflow:
         return workflow
 
 
+SCHEDULE_UNITS = ('seconds', 'minutes', 'hours', 'days')
+
+#: The schedule strings the Automation tab composes and this class understands:
+#:   hourly / daily / weekly            plain intervals
+#:   HH:MM                              every day at that time
+#:   weekly@HH:MM / monthly@HH:MM       every 7 days / every month at that time
+#:   every_N_unit                       N >= 1, unit in SCHEDULE_UNITS
+#:   once:YYYY-MM-DDTHH:MM              one shot, then forgotten
+
+
+def _time_part(spec: str) -> str:
+    """The HH:MM inside a schedule string, or an empty string."""
+    if '@' in spec:
+        return spec.split('@', 1)[1]
+    return spec if len(spec) == 5 and spec[2] == ':' else ''
+
+
+def _monthly_occurrence(day: int, hour: int, minute: int, after: datetime) -> datetime:
+    """The next run on `day` - or that month's last day - strictly after `after`."""
+    candidate = after.replace(day=min(day, calendar.monthrange(after.year, after.month)[1]),
+                              hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate > after:
+        return candidate
+    year, month = (after.year + 1, 1) if after.month == 12 else (after.year, after.month + 1)
+    return datetime(year, month, min(day, calendar.monthrange(year, month)[1]), hour, minute)
+
+
 class TaskScheduler(QObject):
-    """Schedule and manage task execution."""
-    
-    task_executed = pyqtSignal(str, object)  # task_id, result
-    task_failed = pyqtSignal(str, str)  # task_id, error
-    
+    """Hand tasks to the `schedule` library and run what is due on a polling thread."""
+
     def __init__(self):
         super().__init__()
         self.scheduled_tasks: Dict[str, schedule.Job] = {}
         self.is_running = False
         self._scheduler_thread = None
-        
+        # A scheduler of this instance's own. The `schedule` module's default is a
+        # module global, so a second engine would run this one's jobs as well and a
+        # task would fire once per live engine.
+        self._jobs = schedule.Scheduler()
+
     def schedule_task(self, task_id: str, schedule_time: str, callback: Callable) -> bool:
-        """Schedule a task to run at specific time."""
-        try:
-            if schedule_time == "daily":
-                job = schedule.every().day.do(callback)
-            elif schedule_time == "hourly":
-                job = schedule.every().hour.do(callback)
-            elif schedule_time.startswith("every_"):
-                # e.g., "every_5_minutes"
-                parts = schedule_time.split('_')
-                interval = int(parts[1])
-                unit = parts[2]
-                
-                if unit == "minutes":
-                    job = schedule.every(interval).minutes.do(callback)
-                elif unit == "hours":
-                    job = schedule.every(interval).hours.do(callback)
-                elif unit == "days":
-                    job = schedule.every(interval).days.do(callback)
-                else:
-                    return False
-            else:
-                # Specific time (e.g., "14:30")
-                job = schedule.every().day.at(schedule_time).do(callback)
-            
-            self.scheduled_tasks[task_id] = job
-            return True
-        except Exception as e:
-            print(f"Error scheduling task: {e}")
+        """Register one task. False means this app cannot honour that schedule."""
+        spec = (schedule_time or '').strip().lower()
+        if not spec or callback is None:
             return False
-    
+
+        self.cancel_task(task_id)
+        # `schedule` has no try/except of its own: a callback that raises skips
+        # _schedule_next_run(), which leaves that job due forever - and being first in the
+        # sorted list each pass, it starves every other job behind it. One broken task
+        # would quietly stop every schedule in the app, so nothing reaches the library raw.
+        callback = self._guarded(task_id, callback)
+
+        try:
+            if spec == 'hourly':
+                job = self._jobs.every().hour.do(callback)
+            elif spec == 'daily':
+                job = self._jobs.every().day.do(callback)
+            elif spec == 'weekly':
+                job = self._jobs.every().week.do(callback)
+            elif _time_part(spec):
+                clock = _time_part(spec)
+                if spec.startswith('weekly@'):
+                    # This build of `schedule` only allows .at() on days, hours and
+                    # minutes, so a weekly job at a time is seven days at that time.
+                    job = self._jobs.every(7).days.at(clock).do(callback)
+                elif spec.startswith('monthly@'):
+                    hour, minute = (int(part) for part in clock.split(':')[:2])
+                    now = datetime.now()
+                    first = _monthly_occurrence(now.day, hour, minute, now)
+                    return self._schedule_absolute(
+                        task_id, first, callback,
+                        lambda past: _monthly_occurrence(first.day, hour, minute, past))
+                else:
+                    job = self._jobs.every().day.at(clock).do(callback)
+            elif spec.startswith('every_'):
+                parts = spec.split('_')
+                if len(parts) != 3 or parts[2] not in SCHEDULE_UNITS:
+                    return False
+                interval = int(parts[1])
+                if interval < 1:
+                    # schedule.every(0) never returns: it spins forever in
+                    # _schedule_next_run and freezes whichever thread asked for it.
+                    return False
+                job = getattr(self._jobs.every(interval), parts[2]).do(callback)
+            elif spec.startswith('once:'):
+                when = datetime.fromisoformat(spec[5:])
+                if when <= datetime.now():
+                    return False
+                return self._schedule_absolute(task_id, when, callback, None)
+            else:
+                return False
+        except Exception as error:
+            print(f"Could not schedule task {task_id} as {schedule_time!r}: {error}")
+            return False
+
+        self.scheduled_tasks[task_id] = job
+        return True
+
+    def _schedule_absolute(self, task_id: str, when: datetime, callback: Callable,
+                           rearm) -> bool:
+        """Fire at an exact moment; `schedule` has no absolute API and no month unit.
+
+        `rearm` turns the moment that just fired into the next one, or is None for a
+        one-off job that takes itself out of the registry once it has run.
+        """
+        delay = (when - datetime.now()).total_seconds()
+        if delay <= 0:
+            if rearm is None:
+                return False
+            when = rearm(when)
+            delay = (when - datetime.now()).total_seconds()
+
+        def fire():
+            finished = self.scheduled_tasks.pop(task_id, None)
+            if finished is not None:
+                self._jobs.cancel_job(finished)
+            try:
+                callback()
+            finally:
+                if rearm is not None:
+                    self._schedule_absolute(task_id, rearm(when), callback, rearm)
+
+        job = self._jobs.every(max(1, int(delay))).seconds.do(fire)
+        job.next_run = when
+        self.scheduled_tasks[task_id] = job
+        return True
+
+    @staticmethod
+    def _guarded(task_id: str, callback: Callable) -> Callable:
+        """Let the failure be reported here rather than inside the scheduler loop."""
+        def run():
+            try:
+                callback()
+            except Exception as error:
+                print(f"Scheduled task {task_id} raised: {error}")
+        return run
+
+    def next_run(self, task_id: str):
+        """When this task is next due, or None when nothing is waiting for it."""
+        job = self.scheduled_tasks.get(task_id)
+        return job.next_run if job is not None else None
+
     def cancel_task(self, task_id: str) -> bool:
-        """Cancel a scheduled task."""
-        if task_id in self.scheduled_tasks:
-            schedule.cancel_job(self.scheduled_tasks[task_id])
-            del self.scheduled_tasks[task_id]
-            return True
-        return False
-    
+        """Take a task out of the schedule registry."""
+        job = self.scheduled_tasks.pop(task_id, None)
+        if job is None:
+            return False
+        self._jobs.cancel_job(job)
+        return True
+
     def start_scheduler(self):
-        """Start the scheduler thread."""
+        """Start the polling thread that runs whatever is due."""
         if self.is_running:
             return
-        
         self.is_running = True
         self._scheduler_thread = threading.Thread(target=self._run_scheduler, daemon=True)
         self._scheduler_thread.start()
-    
+
     def stop_scheduler(self):
-        """Stop the scheduler thread."""
+        """Stop the polling thread."""
         self.is_running = False
         if self._scheduler_thread:
-            self._scheduler_thread.join(timeout=2)
-    
+            self._scheduler_thread.join(timeout=3)
+            self._scheduler_thread = None
+
     def _run_scheduler(self):
-        """Run scheduler loop."""
+        """Run the schedule library until asked to stop."""
         while self.is_running:
             try:
-                schedule.run_pending()
-            except Exception as e:
-                print(f"Scheduler error: {e}")
-                # Log to telemetry if possible
-            time.sleep(1)
+                self._jobs.run_pending()
+            except Exception as error:
+                print(f"Scheduler error: {error}")
+            # Ten short sleeps rather than one long one: stop_scheduler() sets a
+            # flag and joins, so a full second of sleep makes every teardown wait.
+            for _ in range(10):
+                if not self.is_running:
+                    break
+                time.sleep(0.1)
+
 
 
 WATCH_EVENTS = ('created', 'modified', 'deleted', 'moved')
@@ -873,142 +1022,193 @@ class AutomationEngine(QObject):
         self.workflows: Dict[str, Workflow] = {}
         self.triggers: Dict[str, Dict[str, Any]] = {}
         
-        # Load saved workflows
         # Load saved workflows and tasks
         ActionRegistry.register_default_actions()
         self._load_workflows()
         self._load_tasks()
     
+    def _tasks_file(self) -> str:
+        return os.path.join(app_data_dir(), 'tasks.json')
+
     def _save_tasks(self):
-        """Save tasks to disk."""
+        """Write every task, with its schedule and its last verdict."""
         try:
             data = [task.to_dict() for task in self.tasks.values()]
-            with open("tasks.json", "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"Error saving tasks: {e}")
+            with open(self._tasks_file(), 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, indent=2)
+        except Exception as error:
+            print(f"Could not save tasks: {error}")
 
     def _load_tasks(self):
-        """Load tasks from disk."""
-        if not os.path.exists("tasks.json"):
+        """Read the tasks back and put the ones that are due on the scheduler.
+
+        A one-off whose moment has already passed cannot fire, so it comes back
+        CANCELLED rather than as something the user might still wait for.
+        """
+        path = self._tasks_file()
+        if not os.path.exists(path):
             return
-        
+
         try:
-            with open("tasks.json", "r") as f:
-                data = json.load(f)
-                
-            for task_data in data:
-                # Reconstruct AutomationTask (which is a dataclass, distinct from the Task class above? 
-                # Wait, there are two task classes: Task (lines 99-151) and AutomationTask (lines 197-225).
-                # The AutomationEngine uses AutomationTask in create_task (line 643).
-                # But Task class has to_dict/from_dict logic.
-                # It seems there is a confusion in the original code between Task and AutomationTask.
-                # AutomationTask (dataclass) doesn't have from_dict.
-                # I should probably unify or handle AutomationTask persistence.
-                
-                # Let's assume we are using AutomationTask for the engine as per line 632.
-                # I will implement from_dict for AutomationTask logic here manually or add it to the class.
-                
-                task = AutomationTask(
-                    task_id=task_data['task_id'],
-                    name=task_data['name'],
-                    task_type=task_data['task_type'],
-                    parameters=task_data['parameters'],
-                    status=TaskStatus(task_data['status']),
-                    created_at=task_data['created_at'],
-                    started_at=task_data.get('started_at'),
-                    completed_at=task_data.get('completed_at'),
-                    result=task_data.get('result'),
-                    error=task_data.get('error')
-                )
-                self.tasks[task.task_id] = task
-                
-                # Reschedule if it was scheduled
-                # Note: The schedule info is not in AutomationTask, it was in the Task class.
-                # The create_task method (line 639) creates AutomationTask but doesn't take schedule.
-                # schedule_task (line 683) takes schedule_time.
-                # We need to store schedule time in AutomationTask to persist it!
-                
-        except Exception as e:
-            print(f"Error loading tasks: {e}")
-    
-    def create_task(self, name: str, task_type: str, parameters: Dict[str, Any]) -> str:
-        """Create a new automation task."""
-        task_id = f"task_{int(time.time() * 1000)}"
-        
-        task = AutomationTask(
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except Exception as error:
+            print(f"Could not read {path}: {error}")
+            return
+
+        if not isinstance(data, list):
+            print(f"Ignoring {path}: expected a list of task records")
+            return
+
+        for record in data:
+            try:
+                task = AutomationTask.from_dict(record)
+            except Exception as error:
+                print(f"Skipping an unreadable task record: {error}")
+                continue
+            self.tasks[task.task_id] = task
+            if task.enabled and task.schedule_time and not self.schedule_task(task.task_id, task.schedule_time):
+                task.status = TaskStatus.CANCELLED
+
+        if data:
+            self._save_tasks()
+
+
+    def create_task(self, name: str, task_type: str, parameters: Dict[str, Any],
+                    enabled: bool = True) -> str:
+        """Store a task. Putting it on the calendar is `schedule_task`'s job."""
+        # A millisecond stamp, walked forward while it is taken. The old retry reused a
+        # counter that only changes once the task is stored, so a second collision looped.
+        stamp = int(time.time() * 1000)
+        task_id = f"task_{stamp}"
+        while task_id in self.tasks:
+            stamp += 1
+            task_id = f"task_{stamp}"
+
+        self.tasks[task_id] = AutomationTask(
             task_id=task_id,
             name=name,
             task_type=task_type,
-            parameters=parameters
+            parameters=parameters or {},
+            enabled=enabled
         )
-        
-        self.tasks[task_id] = task
         self._save_tasks()
         return task_id
-    
-    def execute_task(self, task_id: str) -> bool:
-        """Execute a task immediately."""
-        if task_id not in self.tasks:
+
+    def update_task(self, task_id: str, name: str = None, task_type: str = None,
+                    parameters: Dict[str, Any] = None, enabled: bool = None) -> bool:
+        """Change the parts of a task that were given and leave the rest alone."""
+        task = self.tasks.get(task_id)
+        if task is None:
             return False
-        
-        task = self.tasks[task_id]
+        if name is not None:
+            task.name = name
+        if task_type is not None:
+            task.task_type = task_type
+        if parameters is not None:
+            task.parameters = parameters
+        if enabled is not None:
+            task.enabled = enabled
+            if not enabled:
+                self.scheduler.cancel_task(task_id)
+                if task.status == TaskStatus.SCHEDULED:
+                    task.status = TaskStatus.CANCELLED
+        self._save_tasks()
+        return True
+
+
+    def execute_task(self, task_id: str) -> bool:
+        """Run one task now. The action's own verdict decides the status."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+        if not task.enabled:
+            self.task_completed.emit(task_id, False, {'error': f"'{task.name}' is disabled"})
+            return False
+
         task.status = TaskStatus.RUNNING
         task.started_at = time.time()
-        
         self.task_started.emit(task_id)
-        
+
         try:
-            # Execute task based on type
             result = self._execute_task_type(task)
-            
-            task.status = TaskStatus.COMPLETED
-            task.completed_at = time.time()
-            task.result = result
-            
-            self.task_completed.emit(task_id, True, result)
-            return True
-            
-        except Exception as e:
-            task.status = TaskStatus.FAILED
-            task.completed_at = time.time()
-            task.error = str(e)
-            
-            self.task_completed.emit(task_id, False, {'error': str(e)})
-            return False
-    
-    def schedule_task(self, task_id: str, schedule_time: str) -> bool:
-        """Schedule a task for later execution."""
-        if task_id not in self.tasks:
-            return False
-        
-        task = self.tasks[task_id]
-        task.status = TaskStatus.SCHEDULED
-        
-        def execute_callback():
-            self.execute_task(task_id)
-        
-        task.schedule_time = schedule_time # Save schedule time
+        except Exception as error:
+            success = False
+            result = {'success': False, 'error': str(error)}
+        else:
+            success = bool(result.get('success', False)) if isinstance(result, dict) else result is not None
+            if not success and isinstance(result, dict) and not result.get('error'):
+                result = dict(result, error='the action reported no reason')
+
+        task.status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
+        task.completed_at = time.time()
+        task.result = result
+        task.error = None if success else str(result.get('error'))
         self._save_tasks()
-        
+        self.task_completed.emit(task_id, success, result)
+        return success
+
+    def schedule_task(self, task_id: str, schedule_time: str) -> bool:
+        """Put an existing task on the scheduler and remember when it is due."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+
         def execute_callback():
             self.execute_task(task_id)
-        
-        return self.scheduler.schedule_task(task_id, schedule_time, execute_callback)
-    
-    def cancel_task(self, task_id: str) -> bool:
-        """Cancel a task."""
-        if task_id not in self.tasks:
+
+        if not self.scheduler.schedule_task(task_id, schedule_time, execute_callback):
             return False
-        
-        task = self.tasks[task_id]
-        
-        if task.status == TaskStatus.SCHEDULED:
-            self.scheduler.cancel_task(task_id)
-        
-        task.status = TaskStatus.CANCELLED
+
+        task.schedule_time = schedule_time
+        task.status = TaskStatus.SCHEDULED
+        self._save_tasks()
         return True
-    
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Take a task off the scheduler; it stays saved and can be scheduled again."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+
+        self.scheduler.cancel_task(task_id)
+        task.schedule_time = None
+        task.status = TaskStatus.CANCELLED
+        self._save_tasks()
+        return True
+
+    def delete_task(self, task_id: str) -> bool:
+        """Remove a task from the scheduler, the table and the file."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+
+        self.scheduler.cancel_task(task_id)
+        del self.tasks[task_id]
+        self._save_tasks()
+        return True
+
+    def set_task_enabled(self, task_id: str, enabled: bool) -> bool:
+        """Enable or disable a task, keeping the scheduler in step with it."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+
+        task.enabled = enabled
+        if not enabled:
+            self.scheduler.cancel_task(task_id)
+            if task.status == TaskStatus.SCHEDULED:
+                task.status = TaskStatus.CANCELLED
+        elif task.schedule_time:
+            self.schedule_task(task_id, task.schedule_time)
+        self._save_tasks()
+        return True
+
+    def next_run(self, task_id: str):
+        """When this task is next due, or None."""
+        return self.scheduler.next_run(task_id)
+
+
     def create_workflow(self, name: str, description: str, steps: List[Dict[str, Any]]) -> str:
         """Create a new workflow."""
         workflow_id = f"workflow_{int(time.time() * 1000)}"
@@ -1103,46 +1303,38 @@ class AutomationEngine(QObject):
         self.file_watcher.stop_watching()
     
     def _execute_task_type(self, task: AutomationTask) -> Dict[str, Any]:
-        """Execute task based on its type (action ID)."""
-        # The task_type field holds the action_id registered in ActionRegistry
-        return ActionRegistry.execute(task.task_type, **task.parameters)
-        """Execute specific task type."""
-        # Use ActionRegistry to execute the action
+        """Run the task's action id through the registry; task_type *is* the action id."""
         if not task.task_type:
-            return {'success': False, 'error': 'No task type specified'}
-            
+            return {'success': False, 'error': 'this task has no action chosen'}
         return ActionRegistry.execute(task.task_type, **task.parameters)
-    
+
+    def _workflows_file(self) -> str:
+        return os.path.join(app_data_dir(), 'workflows.json')
+
     def _save_workflows(self):
-        """Save workflows to file."""
-        workflow_file = os.path.join(os.path.dirname(__file__), '..', '..', 'output', 'workflows.json')
-        os.makedirs(os.path.dirname(workflow_file), exist_ok=True)
-        
-        workflows_data = {wid: w.to_dict() for wid, w in self.workflows.items()}
-        
-        with open(workflow_file, 'w') as f:
-            json.dump(workflows_data, f, indent=2)
-    
-    def _load_workflows(self):
-        """Load workflows from file."""
-        workflow_file = os.path.join(os.path.dirname(__file__), '..', '..', 'output', 'workflows.json')
-        
-        if not os.path.exists(workflow_file):
-            return
-        
+        """Write every workflow, keyed by id, with its steps."""
         try:
-            with open(workflow_file, 'r') as f:
-                workflows_data = json.load(f)
-            
-            for wid, data in workflows_data.items():
-                workflow = Workflow(
-                    workflow_id=data['workflow_id'],
-                    name=data['name'],
-                    description=data['description'],
-                    steps=data['steps'],
-                    enabled=data.get('enabled', True),
-                    created_at=data.get('created_at', time.time())
-                )
-                self.workflows[wid] = workflow
-        except Exception as e:
-            print(f"Error loading workflows: {e}")
+            data = {wid: workflow.to_dict() for wid, workflow in self.workflows.items()}
+            with open(self._workflows_file(), 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, indent=2)
+        except Exception as error:
+            print(f"Could not save workflows: {error}")
+
+    def _load_workflows(self):
+        """Rebuild saved workflows through `Workflow.from_dict`.
+
+        This used to call `Workflow(workflow_id=..., steps=..., enabled=...,
+        created_at=...)`, which is not that constructor: every record raised TypeError
+        into the except, so a workflow that had been saved was silently never seen again.
+        """
+        path = self._workflows_file()
+        if not os.path.exists(path):
+            return
+
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+            for wid, record in (data or {}).items():
+                self.workflows[wid] = Workflow.from_dict(record)
+        except Exception as error:
+            print(f"Could not read workflows from {path}: {error}")

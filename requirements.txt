@@ -9,6 +9,13 @@ pymeshlab==2025.7
 # malformed one. The python package carries no native library: RenderFox.spec collects
 # lib/assimp-vc143-mt.dll and format_converter puts that folder on PATH at import.
 pyassimp==5.2.5
+# The Automation tab's schedules only exist because this drives a real polling thread.
+# Pinned, because the task code relies on three things measured on 1.2.2 rather than
+# documented: `every().week.at(...)` raises instead of firing weekly, there is no month
+# unit at all (so "Monthly" is composed from days and clamped to the calendar), and
+# `every(0)` never returns. A release that changes any of those makes a saved schedule
+# silently mean something else.
+schedule==1.2.2
 Pillow>=10.0.0
 scipy>=1.11.0
 requests>=2.31.0

@@ -31,6 +31,7 @@ sys.path.insert(0, ROOT)
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from src.core.library_manager import LibraryManager
+from src.features import automation_engine as engine_module
 from src.features.automation_engine import (
     FileWatcher, _event_set, _glob_list, _is_excluded, _name_matches)
 from src.ui import automation_tab as tab_module
@@ -232,6 +233,11 @@ class AutomationTabCase(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
         cls.previous_dialog = QFileDialog.getExistingDirectory
+        # Constructing the tab starts the engine, and the engine reads and writes its task
+        # file; that file must be in a temp dir, not in the user's real ~/.renderfox.
+        cls.home = tempfile.mkdtemp(prefix='renderfox_home_')
+        cls.previous_data_dir = engine_module.app_data_dir
+        engine_module.app_data_dir = lambda: cls.home
         # Some of these slots end in a modal box; a modal box cannot be clicked headlessly.
         cls.previous_boxes = (QMessageBox.information, QMessageBox.critical,
                               QMessageBox.warning)
@@ -243,7 +249,9 @@ class AutomationTabCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         QFileDialog.getExistingDirectory = cls.previous_dialog
+        engine_module.app_data_dir = cls.previous_data_dir
         QMessageBox.information, QMessageBox.critical, QMessageBox.warning = cls.previous_boxes
+        shutil.rmtree(cls.home, ignore_errors=True)
 
     def setUp(self):
         self.work = tempfile.mkdtemp(prefix='renderfox_atab_')
@@ -273,6 +281,7 @@ class AutomationTabCase(unittest.TestCase):
 
     def tearDown(self):
         self.tab.file_watcher.stop_watching()
+        self.tab.automation_engine.stop()
         self.tab._library.close()
         self.tab.deleteLater()
         shutil.rmtree(self.work, ignore_errors=True)
@@ -284,6 +293,10 @@ class AutomationTabCase(unittest.TestCase):
 
     def log(self):
         return self.tab.file_events_log.toPlainText()
+
+    def activity(self):
+        return [self.tab.activity_list.item(i).text()
+                for i in range(self.tab.activity_list.count())]
 
     def spin(self, want, timeout=8.0):
         """Run the event loop until the watcher's thread has had its say."""
@@ -536,13 +549,14 @@ class AutomationTabCase(unittest.TestCase):
 
     def test_24_timestamped_lines_survive_the_datetime_import(self):
         """`import datetime` plus `datetime.now()` raised AttributeError on every slot."""
-        self.tab.on_task_executed('task_1', {'ok': True})
-        self.tab.on_task_failed('task_2', 'boom')
+        self.tab.on_task_started('task_1')
+        self.tab.on_task_completed('task_2', False, {'error': 'boom'})
         self.tab.on_workflow_started('wf_1')
         self.tab.on_workflow_failed('wf_1', 'nope')
         self.tab.on_file_created(os.path.join(self.watched, 'cube.obj'))
-        lines = self.log().splitlines()
-        for needle in ('Task task_1 executed', 'Task task_2 FAILED', 'File created'):
+        lines = self.activity() + self.log().splitlines()
+        for needle in ("Task 'task_1' started", "Task 'task_2' FAILED: boom",
+                       'Workflow wf_1 started', 'File created'):
             matched = [line for line in lines if needle in line]
             self.assertTrue(matched, f'{needle} never logged: {lines}')
             self.assertRegex(matched[0], r'^\[\d\d:\d\d:\d\d\]', 'no timestamp on the line')

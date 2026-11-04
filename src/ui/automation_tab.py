@@ -8,6 +8,7 @@ import sys
 import shutil
 import threading
 import subprocess
+import ast
 from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QPushButton, QComboBox, QLabel, QGroupBox, QFormLayout, 
@@ -22,9 +23,10 @@ from .icon_provider import get_icon
 
 # Import automation engine
 from ..features.automation_engine import (
-    AutomationEngine, TaskScheduler, FileWatcher, WorkflowExecutor,
-    Task, Workflow, WorkflowStep, BatchProcessor, ActionRegistry
+    AutomationEngine, FileWatcher, WorkflowExecutor,
+    Workflow, WorkflowStep, BatchProcessor, ActionRegistry
 )
+
 
 BACKUP_SUBFOLDER = ".renderfox_backups"
 
@@ -80,7 +82,6 @@ class AutomationTab(QWidget):
         
         # Initialize automation engine
         self.automation_engine = AutomationEngine()
-        self.task_scheduler = TaskScheduler()
         self.file_watcher = FileWatcher()
         self.workflow_executor = WorkflowExecutor()
         self.batch_processor = BatchProcessor()
@@ -91,8 +92,8 @@ class AutomationTab(QWidget):
         self.automation_engine.workflow_failed.connect(self.on_workflow_failed)
         self.automation_engine.workflow_progress.connect(self.on_workflow_progress)
         
-        self.task_scheduler.task_executed.connect(self.on_task_executed)
-        self.task_scheduler.task_failed.connect(self.on_task_failed)
+        self.automation_engine.task_started.connect(self.on_task_started)
+        self.automation_engine.task_completed.connect(self.on_task_completed)
         
         self.file_watcher.file_created.connect(self.on_file_created)
         self.file_watcher.file_modified.connect(self.on_file_modified)
@@ -106,21 +107,23 @@ class AutomationTab(QWidget):
         self.active_workflows = {}
         self.watch_requests = {}
         self._library = None
-        self.scheduled_tasks = []
-        self.workflow_templates = {}
+        self._task_rows = []
+        self.current_task_id = None
         self.init_ui()
         self.setup_connections()
         self.load_sample_data()
-        
-        # Load saved workflows and tasks
-        self.load_workflows()
-        self.load_tasks()
-        
+        self.refresh_task_table()
+        self._update_schedule_controls()
+
+        # The engine's polling thread is what makes a schedule happen at all.
+        self.automation_engine.start()
+
         # Dashboard update timer
         self.dashboard_timer = QTimer()
         self.dashboard_timer.timeout.connect(self.update_dashboard_metrics)
         self.dashboard_timer.start(2000)
-        
+
+
     def init_ui(self):
         """Initialize the automation interface."""
         main_layout = QVBoxLayout(self)
@@ -549,8 +552,6 @@ class AutomationTab(QWidget):
             "Task Name", "Type", "Schedule", "Next Run", "Status", "Last Result"
         ])
         
-        # Add sample tasks
-        self.populate_sample_tasks()
         
         tasks_layout.addWidget(self.scheduled_tasks_table)
         tasks_group.setLayout(tasks_layout)
@@ -567,11 +568,11 @@ class AutomationTab(QWidget):
         self.task_name_edit.setPlaceholderText("Enter task name...")
         
         self.task_type_combo = QComboBox()
-        self.task_type_combo.addItems([
-            "Batch Processing", "File Cleanup", "Backup", "Report Generation",
-            "System Maintenance", "Model Validation", "Custom Script"
-        ])
-        
+        for action_id, label in self._task_action_choices():
+            self.task_type_combo.addItem(label, action_id)
+        self.task_type_combo.setToolTip("The action this task runs, as the registry names it.")
+
+
         self.task_enabled_cb = QCheckBox("Task Enabled")
         self.task_enabled_cb.setChecked(True)
         
@@ -587,24 +588,34 @@ class AutomationTab(QWidget):
         
         self.schedule_type_combo = QComboBox()
         self.schedule_type_combo.addItems([
-            "One Time", "Daily", "Weekly", "Monthly", "On Startup", "On File Change"
+            "One Time", "Hourly", "Daily", "Weekly", "Monthly", "Repeated interval"
         ])
-        
+
+        # "One Time" beside today's date is a moment that has usually already gone by, so
+        # the pane would open refusing its own Save click. Daily is the first choice that
+        # is valid exactly as these fields are showing it.
+        self.schedule_type_combo.setCurrentText("Daily")
+
         self.schedule_time_edit = QTimeEdit()
         self.schedule_time_edit.setTime(QTime(9, 0))
-        
+
         self.schedule_date_edit = QDateEdit()
         self.schedule_date_edit.setDate(QDate.currentDate())
-        
+
         self.repeat_interval_spin = QSpinBox()
         self.repeat_interval_spin.setRange(1, 999)
         self.repeat_interval_spin.setValue(1)
-        
+
+        self.repeat_unit_combo = QComboBox()
+        self.repeat_unit_combo.addItems(["Minutes", "Hours", "Days"])
+
         schedule_layout.addRow("Schedule Type:", self.schedule_type_combo)
         schedule_layout.addRow("Time:", self.schedule_time_edit)
         schedule_layout.addRow("Date:", self.schedule_date_edit)
         schedule_layout.addRow("Repeat Every:", self.repeat_interval_spin)
-        
+        schedule_layout.addRow("Unit:", self.repeat_unit_combo)
+
+
         schedule_group.setLayout(schedule_layout)
         editor_layout.addWidget(schedule_group)
         
@@ -614,7 +625,7 @@ class AutomationTab(QWidget):
         
         self.task_actions_edit = QPlainTextEdit()
         self.task_actions_edit.setMaximumHeight(100)
-        self.task_actions_edit.setPlaceholderText("Define task actions and parameters...")
+        self.task_actions_edit.setPlaceholderText("Parameters as name/value pairs, e.g. \"levels\": 3")
         
         actions_layout.addWidget(self.task_actions_edit)
         actions_group.setLayout(actions_layout)
@@ -1032,26 +1043,7 @@ class AutomationTab(QWidget):
         
         return widget
         
-    def populate_sample_tasks(self):
-        """Populate sample scheduled tasks."""
-        self.scheduled_tasks_table.setRowCount(5)
-        
-        tasks = [
-            ("Daily Model Backup", "Backup", "Daily 02:00", "Tomorrow 02:00", "Enabled", "Success"),
-            ("Weekly Report Generation", "Report", "Weekly Mon 09:00", "Mon 09:00", "Enabled", "Success"),
-            ("Cleanup Temp Files", "Cleanup", "Daily 23:00", "Today 23:00", "Enabled", "Success"),
-            ("Model Validation Check", "Validation", "Hourly", "15:00", "Enabled", "Running"),
-            ("System Health Check", "Maintenance", "Every 6 hours", "18:00", "Disabled", "Failed")
-        ]
-        
-        for row, (name, task_type, schedule, next_run, status, result) in enumerate(tasks):
-            self.scheduled_tasks_table.setItem(row, 0, QTableWidgetItem(name))
-            self.scheduled_tasks_table.setItem(row, 1, QTableWidgetItem(task_type))
-            self.scheduled_tasks_table.setItem(row, 2, QTableWidgetItem(schedule))
-            self.scheduled_tasks_table.setItem(row, 3, QTableWidgetItem(next_run))
-            self.scheduled_tasks_table.setItem(row, 4, QTableWidgetItem(status))
-            self.scheduled_tasks_table.setItem(row, 5, QTableWidgetItem(result))
-            
+
     def setup_connections(self):
         """Setup signal connections."""
         # Workflow builder
@@ -1067,10 +1059,18 @@ class AutomationTab(QWidget):
         self.browse_output_btn.clicked.connect(self.browse_output_folder)
         
         # Scheduler
-        self.create_task_btn.clicked.connect(self.create_scheduled_task)
+        self.create_task_btn.clicked.connect(self.new_task)
         self.save_task_btn.clicked.connect(self.save_scheduled_task)
+        self.edit_task_btn.clicked.connect(self.load_task_details)
+        self.delete_task_btn.clicked.connect(self.delete_scheduled_task)
+        self.enable_task_btn.clicked.connect(lambda checked=False: self.set_task_enabled(True))
+        self.disable_task_btn.clicked.connect(lambda checked=False: self.set_task_enabled(False))
+        self.test_task_btn.clicked.connect(self.test_task)
+        self.run_now_btn.clicked.connect(self.run_task_now)
         self.scheduled_tasks_table.itemSelectionChanged.connect(self.load_task_details)
-        
+        self.schedule_type_combo.currentTextChanged.connect(self._update_schedule_controls)
+
+
         # File watcher
         self.add_watch_btn.clicked.connect(self.add_watch_folder)
         self.start_watching_btn.clicked.connect(self.start_file_watching)
@@ -1129,10 +1129,14 @@ class AutomationTab(QWidget):
             step_name = self.steps_table.item(row, 1).text() if self.steps_table.item(row, 1) else "Step"
             step_params = self.steps_table.item(row, 2).text() if self.steps_table.item(row, 2) else "{}"
             
+            params, problem = self._parse_parameters(step_params)
+            if problem:
+                QMessageBox.warning(self, "Warning", f"Step '{step_name}': {problem}")
+                return
             step = WorkflowStep(
                 name=step_name,
                 action=step_name.lower().replace(' ', '_'),
-                parameters=eval(f"{{{step_params}}}") if step_params else {}
+                parameters=params
             )
             workflow.add_step(step)
         
@@ -1173,20 +1177,28 @@ class AutomationTab(QWidget):
         self.batch_progress.setValue(progress)
         self.batch_status_label.setText(f"Step {step_index}/{total_steps}: {step_name}")
         
-    def on_task_executed(self, task_id, result):
-        """Handle task execution from scheduler."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.file_events_log.appendPlainText(f"[{timestamp}] Task {task_id} executed: {result}")
-        if hasattr(self, 'activity_list'):
-             self.activity_list.addItem(f"[{timestamp}] Task {task_id} executed")
-        
-    def on_task_failed(self, task_id, error):
-        """Handle task failure from scheduler."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.file_events_log.appendPlainText(f"[{timestamp}] Task {task_id} FAILED: {error}")
-        if hasattr(self, 'activity_list'):
-             self.activity_list.addItem(f"[{timestamp}] Task {task_id} failed: {error}")
-        
+    def on_task_started(self, task_id):
+        """Note that a run began; the verdict arrives on task_completed."""
+        task = self.automation_engine.tasks.get(task_id)
+        self._log_activity(f"Task '{task.name if task else task_id}' started")
+
+    def on_task_completed(self, task_id, success, result):
+        """Report what a run really did, from whichever thread asked for it."""
+        task = self.automation_engine.tasks.get(task_id)
+        name = task.name if task else task_id
+        detail = result.get('result') if isinstance(result, dict) else result
+        if success:
+            self._log_activity(f"Task '{name}' completed: {detail or 'it printed nothing'}")
+        else:
+            reason = result.get('error') if isinstance(result, dict) else result
+            self._log_activity(f"Task '{name}' FAILED: {reason or 'no reason given'}")
+        self.refresh_task_table()
+
+    def _log_activity(self, message):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.activity_list.addItem(f"[{stamp}] {message}")
+
+
     def on_file_created(self, file_path):
         """One new file in a watched folder: log it, then run the Auto Actions."""
         self._log_watch_event('created', file_path)
@@ -1365,36 +1377,7 @@ class AutomationTab(QWidget):
         self.batch_status_label.setText("Batch operation completed!")
         self.batch_log.appendPlainText(f"Completed: {results}")
         
-    def load_workflows(self):
-        """Load saved workflows from disk."""
-        workflows_file = "data/workflows.json"
-        if os.path.exists(workflows_file):
-            try:
-                with open(workflows_file, 'r') as f:
-                    workflows_data = json.load(f)
-                    for workflow_data in workflows_data:
-                        workflow = Workflow.from_dict(workflow_data)
-                        self.workflow_templates[workflow.workflow_id] = workflow
-            except Exception as e:
-                print(f"Error loading workflows: {e}")
-                
-    def load_tasks(self):
-        """Load saved tasks from disk."""
-        tasks_file = "data/tasks.json"
-        if os.path.exists(tasks_file):
-            try:
-                with open(tasks_file, 'r') as f:
-                    tasks_data = json.load(f)
-                    for task_data in tasks_data:
-                        task = Task.from_dict(task_data)
-                        self.task_scheduler.schedule_task(
-                            task.task_id, 
-                            task.schedule, 
-                            lambda: self.automation_engine.execute_task(task.task_id)
-                        )
-            except Exception as e:
-                print(f"Error loading tasks: {e}")
-            
+
     def add_workflow_step(self):
         """Add a new workflow step."""
         row = self.steps_table.rowCount()
@@ -1449,28 +1432,229 @@ class AutomationTab(QWidget):
         if folder:
             self.output_path_edit.setText(folder)
             
-    def create_scheduled_task(self):
-        """Create a new scheduled task."""
+    def _task_action_choices(self):
+        """The actions a task can name, read from the registry rather than typed here."""
+        choices = []
+        for action_id, meta in sorted(ActionRegistry.get_all_actions().items()):
+            description = (meta.get('description') or '').strip()
+            choices.append((action_id, f"{action_id} - {description}" if description else action_id))
+        return choices
+
+    def _parse_parameters(self, text):
+        """Read the parameters box as a JSON object; nothing is evaluated.
+
+        This cell used to be handed to eval(), so a pasted line or a workflow file from
+        anywhere could run any python the app had the rights to.
+        """
+        raw = (text or '').strip()
+        if not raw:
+            return {}, None
+        candidates = [raw] if raw.startswith('{') else [raw, '{' + raw + '}']
+        for candidate in candidates:
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    value = loader(candidate)
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(value, dict):
+                    return {str(key): item for key, item in value.items()}, None
+        return None, ('the parameters are not a set of name/value pairs. Try '
+                      '"levels": 3 or {"path": "D:/models/hero.obj"}')
+
+    def _validate_parameters(self, action_id, params):
+        """What the registry would refuse, said before it gets the chance."""
+        spec = (ActionRegistry.get_all_actions().get(action_id) or {}).get('parameters') or {}
+        checks = {'str': str, 'int': int, 'float': (int, float), 'bool': bool}
+        complaints = []
+        for name, rule in spec.items():
+            if rule.get('required') and name not in params:
+                complaints.append(f"{action_id} needs a value for '{name}'")
+            elif name in params:
+                expected = checks.get(rule.get('type'))
+                if expected and not isinstance(params[name], expected):
+                    complaints.append(f"'{name}' must be {rule.get('type')}, "
+                                      f"not {type(params[name]).__name__}")
+        unknown = sorted(key for key in params if key not in spec)
+        if unknown:
+            complaints.append(f"{action_id} has no parameter named: " + ', '.join(unknown))
+        return complaints
+
+    def _task_schedule_spec(self):
+        """Compose the schedule string the engine reads, or say why there is not one."""
+        kind = self.schedule_type_combo.currentText()
+        clock = self.schedule_time_edit.time().toString('HH:mm')
+        if kind == 'One Time':
+            when = f"{self.schedule_date_edit.date().toString('yyyy-MM-dd')}T{clock}"
+            if datetime.strptime(when, '%Y-%m-%dT%H:%M') <= datetime.now():
+                return None, (f"{when} has already passed. Choose a moment in the future, "
+                              "or leave the task unscheduled and run it by hand.")
+            return f"once:{when}", None
+        if kind == 'Hourly':
+            return 'hourly', None
+        if kind in ('Daily', 'Weekly', 'Monthly'):
+            return f"{kind.lower()}@{clock}", None
+        if kind == 'Repeated interval':
+            return (f"every_{self.repeat_interval_spin.value()}_"
+                    f"{self.repeat_unit_combo.currentText().lower()}"), None
+        return None, f"'{kind}' is not a schedule this app knows."
+
+    def _update_schedule_controls(self):
+        """Turn off the fields the chosen schedule type cannot use."""
+        kind = self.schedule_type_combo.currentText()
+        self.schedule_date_edit.setEnabled(kind == 'One Time')
+        self.schedule_time_edit.setEnabled(kind in ('One Time', 'Daily', 'Weekly', 'Monthly'))
+        repeated = kind == 'Repeated interval'
+        self.repeat_interval_spin.setEnabled(repeated)
+        self.repeat_unit_combo.setEnabled(repeated)
+
+    def _selected_task_id(self):
+        row = self.scheduled_tasks_table.currentRow()
+        if 0 <= row < len(self._task_rows):
+            return self._task_rows[row]
+        return None
+
+    def refresh_task_table(self):
+        """Rebuild the list from the engine, which is where the tasks live."""
+        tasks = sorted(self.automation_engine.tasks.values(), key=lambda item: item.created_at)
+        self._task_rows = [task.task_id for task in tasks]
+        self.scheduled_tasks_table.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            if task.error:
+                outcome = task.error
+            elif isinstance(task.result, dict):
+                outcome = str(task.result.get('result') or task.result.get('error') or '')
+            else:
+                outcome = str(task.result or '')
+            next_run = self.automation_engine.next_run(task.task_id)
+            cells = [task.name, task.task_type, task.schedule_time or 'not scheduled',
+                     next_run.strftime('%Y-%m-%d %H:%M') if next_run else '-',
+                     task.status.value + ('' if task.enabled else ' (disabled)'), outcome]
+            for column, value in enumerate(cells):
+                self.scheduled_tasks_table.setItem(row, column, QTableWidgetItem(value))
+        self.update_dashboard_metrics()
+
+    def new_task(self):
+        """Clear the editor so a task can be written from scratch."""
+        self.current_task_id = None
         self.task_name_edit.clear()
         self.task_actions_edit.clear()
         self.task_enabled_cb.setChecked(True)
-        
+        self.schedule_type_combo.setCurrentText('Daily')
+        self.scheduled_tasks_table.clearSelection()
+        self.task_name_edit.setFocus()
+
     def save_scheduled_task(self):
-        """Save the current scheduled task."""
-        task_name = self.task_name_edit.text()
-        if not task_name:
-            QMessageBox.warning(self, "Warning", "Please enter a task name!")
+        """Write the editor's task into the engine and put it on the schedule."""
+        name = self.task_name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Warning", "Give the task a name before saving it.")
             return
-            
-        QMessageBox.information(self, "Success", f"Task '{task_name}' saved successfully!")
-        
+        action_id = self.task_type_combo.currentData()
+        if not action_id:
+            QMessageBox.warning(self, "Warning",
+                                "No actions are registered, so there is nothing to run.")
+            return
+        params, problem = self._parse_parameters(self.task_actions_edit.toPlainText())
+        if problem:
+            QMessageBox.warning(self, "Warning", problem)
+            return
+        complaints = self._validate_parameters(action_id, params)
+        if complaints:
+            QMessageBox.warning(self, "Warning", "\n".join(complaints))
+            return
+        spec, schedule_problem = self._task_schedule_spec()
+        if schedule_problem:
+            QMessageBox.warning(self, "Warning", schedule_problem)
+            return
+
+        enabled = self.task_enabled_cb.isChecked()
+        if self.current_task_id in self.automation_engine.tasks:
+            task_id = self.current_task_id
+            self.automation_engine.update_task(task_id, name=name, task_type=action_id,
+                                               parameters=params, enabled=enabled)
+        else:
+            task_id = self.automation_engine.create_task(name, action_id, params, enabled=enabled)
+            self.current_task_id = task_id
+
+        self.automation_engine.cancel_task(task_id)
+        if enabled and not self.automation_engine.schedule_task(task_id, spec):
+            self.refresh_task_table()
+            QMessageBox.warning(self, "Warning",
+                                f"The task is saved, but '{spec}' is not a schedule this app "
+                                "can honour, so it will not run on its own.")
+            return
+        self.refresh_task_table()
+
     def load_task_details(self):
-        """Load details for selected task."""
-        current_row = self.scheduled_tasks_table.currentRow()
-        if current_row >= 0:
-            task_name = self.scheduled_tasks_table.item(current_row, 0).text()
-            self.task_name_edit.setText(task_name)
-            
+        """Point the editor at the selected task."""
+        task_id = self._selected_task_id()
+        task = self.automation_engine.tasks.get(task_id) if task_id else None
+        if task is None:
+            return
+        self.current_task_id = task.task_id
+        self.task_name_edit.setText(task.name)
+        index = self.task_type_combo.findData(task.task_type)
+        if index >= 0:
+            self.task_type_combo.setCurrentIndex(index)
+        self.task_enabled_cb.setChecked(task.enabled)
+        self.task_actions_edit.setPlainText(
+            json.dumps(task.parameters, indent=2) if task.parameters else '')
+
+    def delete_scheduled_task(self):
+        """Take the selected task off the schedule and out of the file."""
+        task_id = self._selected_task_id()
+        task = self.automation_engine.tasks.get(task_id) if task_id else None
+        if task is None:
+            QMessageBox.warning(self, "Warning", "Select a task in the list first.")
+            return
+        answer = QMessageBox.question(
+            self, "Delete Task", f"Delete the scheduled task '{task.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.automation_engine.delete_task(task_id)
+        if self.current_task_id == task_id:
+            self.current_task_id = None
+        self.refresh_task_table()
+
+    def set_task_enabled(self, enabled):
+        """Enable or disable the selected task, and its schedule with it."""
+        task_id = self._selected_task_id()
+        if task_id is None or not self.automation_engine.set_task_enabled(task_id, enabled):
+            QMessageBox.warning(self, "Warning", "Select a task in the list first.")
+            return
+        if self.current_task_id == task_id:
+            self.task_enabled_cb.setChecked(enabled)
+        self.refresh_task_table()
+
+    def test_task(self):
+        """Say whether the editor's task could run, without running it."""
+        action_id = self.task_type_combo.currentData()
+        params, problem = self._parse_parameters(self.task_actions_edit.toPlainText())
+        complaints = [problem] if problem else self._validate_parameters(action_id, params)
+        spec, schedule_problem = self._task_schedule_spec()
+        if schedule_problem:
+            complaints.append(schedule_problem)
+        if complaints:
+            QMessageBox.warning(self, "Task cannot run", "\n".join(complaints))
+            return
+        name = self.task_name_edit.text().strip() or '(no name)'
+        QMessageBox.information(
+            self, "Task is ready",
+            f"'{name}' would run {action_id} with {json.dumps(params) or 'no parameters'}, "
+            + (f"on the schedule {spec}." if spec else "and only when you press Run Now."))
+
+    def run_task_now(self):
+        """Run the selected task on a worker thread; the verdict comes back by signal."""
+        task_id = self._selected_task_id()
+        if task_id is None:
+            QMessageBox.warning(self, "Warning", "Select a task in the list first.")
+            return
+        threading.Thread(target=self.automation_engine.execute_task,
+                         args=(task_id,), daemon=True).start()
+
+
     def add_watch_folder(self):
         """Add a folder to the watch list, with the filter the settings pane shows."""
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Watch")
@@ -1603,7 +1787,7 @@ class AutomationTab(QWidget):
             self.active_workflows_label.setText(str(active_count))
         
         # Scheduled Tasks
-        task_count = len(self.task_scheduler.scheduled_tasks)
+        task_count = len(self.automation_engine.tasks)
         if hasattr(self, 'scheduled_tasks_label'):
             self.scheduled_tasks_label.setText(str(task_count))
         
