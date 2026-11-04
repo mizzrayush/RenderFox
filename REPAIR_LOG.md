@@ -28,7 +28,7 @@ Claimable: ~56k raw / ~42k code lines. After dead-code removal: ~50k / ~37k.
 ## Verification commands
 
 ```bash
-python run_audit.py                       # 8-suite health audit (~82s)
+python run_audit.py                       # 9-suite health audit (~111s)
 python -X utf8 tests/test_mesh_tools_contract.py   # clicks every Mesh Tools control
 python -X utf8 tests/test_pymeshlab_calls.py       # every filter/param/enum/method name vs the installed build
 python -X utf8 tests/test_texture_bake.py          # bakes 3 maps and reads the pixels back
@@ -47,7 +47,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 | 0 | Baseline push + this file | DONE |
 | 1 | Mesh Tools UI-to-backend contract | DONE |
 | 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
-| 3 | Mock DCC harness | not started |
+| 3 | Mock DCC harness | DONE - `tests/mock_dcc/` runs every engine's real command line against a real child process; 16 tests |
 | 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | not started |
 | 5 | FBX/DAE claims + requirements gaps | not started |
 | 6 | Fabricated results presented as real | not started |
@@ -177,6 +177,42 @@ Clicks every control through the real UI path and requires an artefact: 19 mutat
 - `python -X utf8 tests/test_pymeshlab_calls.py` → `Ran 8 tests ... OK`, exit 0 (no 139).
 - `python -X utf8 tests/test_texture_bake.py` → `Ran 11 tests ... OK`.
 - `python run_audit.py` → `100% (8/8 suites passed in 82.15s)`.
+
+### Phase 3 — Mock DCC harness
+
+Nothing in `render_engines.py` had ever been executed: `detect_available_software`, the four `get_render_command` builders, `is_available`, `render_job`, `stop`, `pause`, `resume` - all of it unrun, because no 3D package is installed. This phase adds the stand-in that makes the whole launch path testable, and the next phase is written against it.
+
+**`tests/mock_dcc/mock_dcc.py` (333 lines, new)** - one script that emulates all four packages, chosen by its first argument. It is strict on purpose:
+
+- `blender` demands `--background`, exactly one `.blend`, `--render-output`, `--render-format` and either `--render-anim` or `--render-frame`, and rejects any flag it does not know. Unknown or missing flags exit 20.
+- `maya` demands `-batch -file <scene> -command "<mel>"` and parses the MEL for `workspace -fr "images"`, `imageFilePrefix`, `startFrame`/`endFrame`; a `-command` that never calls `render` is rejected.
+- `cinema4d` demands `-nogui -render <file>` and a `-frame start..end` span it can actually parse.
+- `unreal` takes the `.uproject`, requires `-MoviePipelineConfig=` pointing at a file that exists, and reads OutputDirectory / Resolution / StartFrame / EndFrame out of that JSON.
+- Success prints the package's own progress syntax then exits 0; failure writes to **stderr** and exits 30 (render stopped), 31 (no output directory) or 32 (unusable frame range). It writes a real file per frame so progress can be observed from disk while the process runs.
+- Scene knobs live in the project file, like a real scene: `seconds_per_frame`, `frame_count`, `output_dir`, `prefix`, `fail_after`, `hang`, `write_files`, `format`.
+
+**`tests/mock_dcc/harness.py` (76 lines, new)** - installs `.cmd`/POSIX shims named `blender`, `maya`, `cinema4d`, `UnrealEditor`, each forwarding to `mock_dcc.py` with its package name, and writes a `config.json` of absolute paths. The app reads `config.json` from the working directory as its own "user configured the path" mechanism, so detection and `JobManager._get_executable_path` are exercised through the production code path - there is no test-only branch in `src/` and nothing is monkeypatched.
+
+**`tests/test_mock_dcc.py` (286 lines, new, 16 tests)** - `TestMockPackageBehaviour` checks the stand-in itself: version banners satisfy each engine's probe, `BlenderEngine.get_version()` parses `4.3.0`, each package's progress syntax appears, failures land on stderr and reach `job.error_message`, and six malformed command lines are refused with exit 20 (so the suite cannot pass because the mock is lenient). `TestEngineLaunchPath` drives the real engine classes: all four render their own command end to end, Blender's frame range reaches the command line and produces frames 7-9, a single-frame job produces one frame, Maya's MEL carries resolution/format/frames, Unreal's config file exists with the promised OutputDirectory, the factory maps each `SoftwareType` to the right class, a configured path is discovered, `stop()` terminates a running 40-frame render, and `pause()` freezes frame production (measured: the frame count is unchanged across 0.8 s) while `resume()` finishes the job. `tearDown` stops and resumes every engine the test created, so a failure between pause and resume cannot leave a suspended process on the machine.
+
+**`src/processing/render_engines.py` (+5 / -1)** - the harness found a live bug on its first run: `UnrealEngine` passed no frame range anywhere, so every Unreal animation job - 1 frame or 1000 - rendered exactly one frame. `_create_movie_pipeline_config` now writes `StartFrame`/`EndFrame` from `job.frame_range` into the JSON the app already owns, and the mock refuses a config whose range is unusable (exit 32). Nothing was deleted.
+
+**Proof that the harness bites** - six command-line defects injected one at a time, each caught, then the file restored byte-identical:
+
+| injected defect | failing tests |
+|---|---|
+| drop `--background` from the Blender command | 7 |
+| drop `--render-format` | 7 |
+| `--render-output` → `--output` | 7 |
+| Maya MEL no longer sets the image workspace | 2 |
+| Unreal config loses its frame range | 3 |
+| drop `-nogui` from the Cinema 4D command | 2 |
+
+**Measured facts Phase 4 has to work with**
+
+- `test_10_nothing_about_the_render_is_readable_while_it_runs` records the current ceiling deliberately: `get_progress()` returns a constant `0.0`, nothing calls it, and `render_job` uses `communicate()`, so stdout is only available after the render ends. Phase 4 replaces that test with one requiring the `Fra:` lines above to drive the bar - it must not be kept.
+- `detect_available_software()` returns only `blender` even when `config.json` names all four correctly (`_get_user_configured_path('maya' / 'cinema4d' / 'unreal')` all return the path, but only `_get_blender_paths` asks for it). `JobManager._process_queue` gates on that dict, so a configured Maya/C4D/Unreal job fails with "No render engine available for maya" before the command is ever built. This is Phase 4's first fix, not a harness limitation.
+- `pause()` and `resume()` do nothing without psutil - they set no state and report no error, so the Pause button would lie. psutil 6.0.0 is installed here but is **not** in `requirements.txt` (Phase 5).
 
 ## Known-deferred
 

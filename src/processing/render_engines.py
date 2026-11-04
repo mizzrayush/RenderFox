@@ -428,7 +428,11 @@ class UnrealEngine(RenderEngine):
         config = {
             "OutputDirectory": os.path.dirname(job.output_path),
             "OutputFormat": job.output_format,
-            "Resolution": job.resolution
+            "Resolution": job.resolution,
+            # The command line carries no frame range for Unreal, so the config
+            # file has to or an animation job renders exactly one frame.
+            "StartFrame": job.frame_range[0] if job.frame_range else 1,
+            "EndFrame": job.frame_range[1] if job.frame_range else 1
         }
         
         config_path = os.path.join(

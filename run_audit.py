@@ -68,6 +68,12 @@ SUITES = [
         "description": "Bakes normal, diffuse and AO maps and requires real greyscale/colour pixels at the requested resolution"
     },
     {
+        "id": "mock_dcc_launch",
+        "name": "Mock DCC Launch & Process Control",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_mock_dcc.py")],
+        "description": "Runs every engine's real command line against a stand-in renderer process and checks versions, progress syntax, exit codes, pause and stop"
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
