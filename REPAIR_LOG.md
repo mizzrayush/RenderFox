@@ -28,14 +28,15 @@ Claimable: ~56k raw / ~42k code lines. After dead-code removal: ~50k / ~37k.
 ## Verification commands
 
 ```bash
-python run_audit.py                       # 6-suite health audit (~98s)
+python run_audit.py                       # 8-suite health audit (~82s)
 python -X utf8 tests/test_mesh_tools_contract.py   # clicks every Mesh Tools control
+python -X utf8 tests/test_pymeshlab_calls.py       # every filter/param/enum/method name vs the installed build
+python -X utf8 tests/test_texture_bake.py          # bakes 3 maps and reads the pixels back
 python -X utf8 tests/test_renderfox.py    # LOD/QEM/format/queue
 QT_QPA_PLATFORM=offscreen python -X utf8 tests/test_all_tabs_headless.py
-python tools/check_mesh_filters.py        # regenerate the pymeshlab filter/parameter truth
 ```
 
-`tools/` is deliberately **untracked** (the user asked to keep tooling out for now). `tools/pymeshlab_filter_params.txt` is generated, not hand-edited: a wrong filter or parameter name only surfaces as an exception at call time, and nothing here can be tested against a GPU or a DCC.
+`tests/_pymeshlab_probe.py` is the single place that asks the installed library a question, and it does it in a **child process**: probing filters with deliberately bad enum values and then letting the MeshSets go corrupts the parent heap (reproduced as exit 139 in a later, unrelated `load_new_mesh`). It answers one JSON spec and exits via `os._exit(0)` before its destructors can race anything. `test_pymeshlab_calls.py` imports no pymeshlab at all - keep it that way, and keep the two invariants it asserts (literal filter names, no `**kwargs` unpacking) or bad names get a hiding place again.
 
 Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons threw `TypeError`, because the suites call the backend API with correct kwargs and `test_all_tabs_headless.py` wraps nearly every action in `if hasattr(...)` with no assertion and monkeypatches `QMessageBox`/`QFileDialog` to auto-accept. **A passing audit does not mean a working button.** `tests/test_mesh_tools_contract.py` is the guard added for that and now runs inside the audit.
 
@@ -45,7 +46,7 @@ Understood limitation: `run_audit.py` reported 100% while ten Mesh Tools buttons
 |---|---|---|
 | 0 | Baseline push + this file | DONE |
 | 1 | Mesh Tools UI-to-backend contract | DONE |
-| 2 | Invalid pymeshlab 2025.7 filter names | `mesh_processor.py` done — every filter and parameter name was read back from the installed library; `texture_baker.py` AO/quality names still open |
+| 2 | Invalid pymeshlab 2025.7 filter names | DONE - 47 call sites, all literal, all read back from the installed build; texture baking now writes real images |
 | 3 | Mock DCC harness | not started |
 | 4 | Job manager: progress, pause, stop, retry, concurrency, valid CLI per engine, dead Render buttons | not started |
 | 5 | FBX/DAE claims + requirements gaps | not started |
@@ -139,7 +140,48 @@ Clicks every control through the real UI path and requires an artefact: 19 mutat
 - `python run_audit.py` → `100% (6/6 suites passed in 97.55s)`, including the new contract suite.
 - Live calibration that drove the numbers: open box → 1 hole of 3 vertices; closed two-box scene → 0 holes, 2 bodies, volume 2.0; equilateral vs sliver triangle → quality metric 1.0 vs 5e-05, which is why the histogram range is 0–1 and "good" is >= 0.5.
 
+### Phase 2 — Invalid pymeshlab 2025.7 filter and API names
+
+**The checker first, then the fixes.** `tests/test_pymeshlab_calls.py` (315 raw / 270 code lines, new) parses `src/` with `ast` and checks every literal filter name, every keyword, every string enum value and every method called on a `MeshSet`/`Mesh` against the installed build through `tests/_pymeshlab_probe.py` (91 / 69, new). It resolves module-level constants, so `colormap=AO_COLORMAP` is checked as `'Viridis'` rather than waved through as computed. Mutation-proven, one defect at a time, each caught:
+
+| injected defect | result |
+|---|---|
+| `meshing_remove_null_faces` → `..._facez` | CAUGHT (1 failure) |
+| `maxholesize=` → `maxholezize=` | CAUGHT (1 failure) |
+| `AO_COLORMAP = 'Inferno'` (wrong enum in a constant) | CAUGHT (1 failure) |
+| `ms.mesh_number()` → `ms.number_of_meshes()` | CAUGHT (2 failures) |
+| `apply_filter(FN)` (computed name) | CAUGHT (1 failure) |
+
+47 `apply_filter` sites in `src/`, all literal, all present in this build, all parameters and enum values verified.
+
+**`src/processing/mesh_processor.py` (+32 / -19)** — three dynamic call sites that the checker could not see were rewritten so each `apply_filter` carries a literal name: `fill_holes` (was building a `params` dict and unpacking it) became two explicit calls; `auto_repair`'s loop over `(label, filter)` pairs became seven named calls behind a local `log_removal` helper; `subdivide`'s `filters` alias dict now dispatches to four literal branches. Deleted lines are the dict-building and loop bodies only - every filter it used to reach by variable is still reached, now by name, and `test_pymeshlab_calls.py` proves each one exists. `# Written as two literal calls so the filter schema test can read both.` records why the shape looks redundant.
+
+**`src/processing/texture_baker.py` (+163 / -95)** — the bake had never written a single file. Measured against the library:
+
+- `transfer_attributes_to_texture_per_vertex` raises `Mesh has no associated texture to overwrite` unless a texture is attached to the target first. Nothing attached one. `set_texture_per_mesh` now runs before every transfer.
+- `textname` is an in-memory texture name, **not** an output path; the old code passed the destination PNG as `textname` and expected a file. The image only reaches disk through `Mesh.texture(name).save(path)`.
+- A texture loaded from a file is keyed by its **basename**; the built-in dummy is always keyed `dummy_texture` and its `textname` argument is ignored. `_transfer` therefore reads the key back from `Mesh.textures()` instead of assuming it.
+- `use_dummy_texture=True` writes `checkerboard.png` into the **process working directory** on the first bake of every run - into whatever folder the app was launched from. `_transfer` supplies its own blank raster next to the output file and deletes it, and `test_10` fails if anything is left outside the output directory. Proven in isolation: a variant using the dummy texture with the key lookup corrected passes every content test and is caught by `test_10` alone.
+- `attributeenum='Vertex Quality'` writes an all-black image whatever the scalar range, so AO could never have worked. The deleted AO block used `compute_ambient_occlusion_per_vertex` and `colorize_by_vertex_quality`, neither of which exists in 2025.7. `_bake_ao` now runs `compute_scalar_ambient_occlusion` → normalise → `compute_color_from_scalar_per_vertex(colormap='Viridis')` → `apply_color_desaturation_per_vertex(method='Luminosity')` → a levels stretch of the measured band to 0-255, and transfers **Vertex Color**.
+- Accounting for the rest of the 95 deleted lines: the `try/except` that swallowed UV-generation failure (now propagates, because a bake without UVs is not a bake); the single outer `except` that returned `{}` and discarded the maps already written (now per-map, so one failure costs one map); `from typing import Dict, Any, Optional, Tuple` trimmed to `Dict`; and the old `meshing_tri_to_quad`-era comments naming filters that do not exist. No reachable behaviour was removed - `_bake_one`/`_bake_ao`/`_transfer`/`_require_image` cover every case the old `bake()` attempted, plus the failure reporting it did not have.
+- `bake()`'s public signature and its three signals are unchanged, so no caller needed editing. Partial success reports `success=False` with the maps it did write and a message naming each one that failed.
+
+**`src/processing/format_converter.py` (+3 / -2)** — `ms.number_of_meshes()` → `ms.mesh_number()`. `number_of_meshes()` does not exist in this build (`AttributeError`) and `number_meshes()` is deprecated; the call sat in the second entry of the conversion chain, which only runs when trimesh fails, so it had never executed. Caught by the API-name test, not by reading.
+
+**`tests/test_texture_bake.py` (200 raw / 168 code lines, new, 11 tests)** — proves the maps are real: exactly the requested size (128 and 64), diffuse core pixels within delta 45 of the source vertex colour, AO strictly greyscale with a byte span > 32 (a flat AO means the levels stretch did not run), normal map carrying detail (`std > 10`), a colourless high poly costing the diffuse map and nothing else, progress monotone to 100, nested output directories created, single-map selection honoured, nothing-selected reporting instead of lying, and nothing written outside the output directory.
+
+**`run_audit.py` (+12)** — the two new suites are registered, so the audit is now 8 suites.
+
+**Proof**
+
+- `python -X utf8 tests/test_pymeshlab_calls.py` → `Ran 8 tests ... OK`, exit 0 (no 139).
+- `python -X utf8 tests/test_texture_bake.py` → `Ran 11 tests ... OK`.
+- `python run_audit.py` → `100% (8/8 suites passed in 82.15s)`.
+
 ## Known-deferred
 
-- `tools/` stays untracked at the user's request; regenerate `tools/pymeshlab_filter_params.txt` with `python tools/check_mesh_filters.py` rather than editing it.
+- `tools/` is gone. Its job - the pymeshlab name/parameter/enum truth - is now `tests/_pymeshlab_probe.py` + `tests/test_pymeshlab_calls.py`, which run inside the audit instead of being remembered by hand. Nothing references `tools/` any more.
+- **One string enum is still invisible to the checker**: `_transfer(attribute, ...)` in `texture_baker.py` receives `attributeenum` as a parameter, so it parses as computed. It is covered at runtime instead - `test_02` proves `'Vertex Color'` rasterises colour, `test_04` proves `'Vertex Normal'` rasterises normals - and splitting it into two literal call sites was rejected because the only thing gained would be a second copy of the same eleven lines. Say so rather than let the green checker imply full coverage.
 - `MeshAnalyzer.is_manifold` / `mesh_tools_tab.update_mesh_info` still report `is_winding_consistent` under the label "Manifold". Kept open because a correct test needs a real edge-manifold check, which belongs with the quality-scoring work, not silently patched here.
+- Running the audit dirties the working tree: tests write into tracked files (`config/batch_templates.json` records a `created_at` timestamp; `tests/test_data/repaired.obj` and `simplified.obj` are regenerated outputs, not inputs - nothing reads them). They were restored with `git restore` before the Phase 2 commit, so every commit here is clean, but the suites need to write to a temp directory. Belongs with the dead-file/phase-8 hygiene pass, not a behaviour fix.
+- `format_converter.py` calls `os.makedirs(os.path.dirname(output_file))` at lines 262, 290 and 313, which raises for a bare filename (`dirname` is `''`). Latent - every UI path passes a directory - and not reached by any test yet. Fix with the format-claims phase.

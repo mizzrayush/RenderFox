@@ -56,6 +56,18 @@ SUITES = [
         "description": "Clicks every Mesh Tools control and requires a written mesh, a report, an undo step or an export from it"
     },
     {
+        "id": "pymeshlab_calls",
+        "name": "PyMeshLab Filter & API Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_pymeshlab_calls.py")],
+        "description": "Reads every filter name, parameter, enum value and object method out of src/ and checks it against the installed PyMeshLab"
+    },
+    {
+        "id": "texture_bake",
+        "name": "Texture Bake Output Verification",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_texture_bake.py")],
+        "description": "Bakes normal, diffuse and AO maps and requires real greyscale/colour pixels at the requested resolution"
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

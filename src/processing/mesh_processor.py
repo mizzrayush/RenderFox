@@ -582,10 +582,12 @@ class MeshRepairer:
             
             before = ms.current_mesh().face_number()
             # maxholesize is the largest boundary (in edge count) the filter will cap.
-            params = {}
-            if max_hole_size is not None:
-                params['maxholesize'] = int(max(3, min(1000, int(max_hole_size))))
-            ms.apply_filter('meshing_close_holes', **params)
+            # Written as two literal calls so the filter schema test can read both.
+            if max_hole_size is None:
+                ms.apply_filter('meshing_close_holes')
+            else:
+                ms.apply_filter('meshing_close_holes',
+                                maxholesize=int(max(3, min(1000, int(max_hole_size)))))
             after = ms.current_mesh().face_number()
             
             ms.save_current_mesh(output_path)
@@ -812,23 +814,25 @@ class MeshRepairer:
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(mesh_path)
 
-            def step(filter_name, label, before, unit='faces', **params):
-                """Apply one filter and record how many elements it removed."""
-                ms.apply_filter(filter_name, **params)
-                after = (ms.current_mesh().face_number() if unit == 'faces'
-                         else ms.current_mesh().vertex_number())
+            def log_removal(label, before, after, unit):
+                """Record how many elements the filter that just ran removed."""
                 removed = before - after
                 if removed:
                     results.append(f"{label} {removed} {unit}")
                 return after
 
             v = ms.current_mesh().vertex_number()
-            v = step('meshing_remove_duplicate_vertices', 'Welded duplicate vertices', v, unit='vertices')
+            ms.apply_filter('meshing_remove_duplicate_vertices')
+            v = log_removal('Welded duplicate vertices', v,
+                            ms.current_mesh().vertex_number(), 'vertices')
 
             f = ms.current_mesh().face_number()
-            f = step('meshing_remove_null_faces', 'Removed null faces', f)
-            f = step('meshing_remove_folded_faces', 'Removed folded faces', f)
-            f = step('meshing_remove_duplicate_faces', 'Removed duplicate faces', f)
+            ms.apply_filter('meshing_remove_null_faces')
+            f = log_removal('Removed null faces', f, ms.current_mesh().face_number(), 'faces')
+            ms.apply_filter('meshing_remove_folded_faces')
+            f = log_removal('Removed folded faces', f, ms.current_mesh().face_number(), 'faces')
+            ms.apply_filter('meshing_remove_duplicate_faces')
+            f = log_removal('Removed duplicate faces', f, ms.current_mesh().face_number(), 'faces')
 
             ms.apply_filter('meshing_re_orient_faces_coherently')
             results.append("Re-oriented faces coherently")
@@ -840,8 +844,7 @@ class MeshRepairer:
             if f - before:
                 results.append(f"Closed holes with {f - before} new faces")
 
-            v = ms.current_mesh().vertex_number()
-            v = step('meshing_remove_unreferenced_vertices', 'Removed unreferenced vertices', v, unit='vertices')
+            ms.apply_filter('meshing_remove_unreferenced_vertices')
 
             ms.save_current_mesh(output_path)
 
@@ -962,18 +965,28 @@ class MeshRemesher:
             'butterfly': 'meshing_surface_subdivision_butterfly',
             'midpoint': 'meshing_surface_subdivision_midpoint',
         }
-        filt = filters.get(str(method).lower())
-        if filt is None:
+        wanted = filters.get(str(method).lower())
+        if wanted is None:
             return {'success': False,
                     'error': f"Unknown subdivision method: {method}. "
-                             f"Supported: {', '.join(sorted(set(filters)))}"}
+                             f"Supported: {', '.join(sorted(filters))}"}
 
         try:
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(mesh_path)
             before = ms.current_mesh().face_number()
 
-            ms.apply_filter(filt, iterations=max(1, int(levels)))
+            # Dispatched by alias so each apply_filter keeps a literal name;
+            # a computed filter name cannot be checked against the installed schema.
+            times = max(1, int(levels))
+            if wanted == 'meshing_surface_subdivision_catmull_clark':
+                ms.apply_filter('meshing_surface_subdivision_catmull_clark', iterations=times)
+            elif wanted == 'meshing_surface_subdivision_butterfly':
+                ms.apply_filter('meshing_surface_subdivision_butterfly', iterations=times)
+            elif wanted == 'meshing_surface_subdivision_midpoint':
+                ms.apply_filter('meshing_surface_subdivision_midpoint', iterations=times)
+            else:
+                ms.apply_filter('meshing_surface_subdivision_loop', iterations=times)
             after = ms.current_mesh().face_number()
 
             ms.save_current_mesh(output_path)

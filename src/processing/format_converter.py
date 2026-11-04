@@ -281,8 +281,9 @@ class FormatConverter(QObject):
             # Load the input file
             ms.load_new_mesh(input_file)
             
-            # Apply any necessary processing
-            if ms.number_of_meshes() == 0:
+            # mesh_number() is the 2025.7 name; number_of_meshes() raises here and
+            # this fallback only runs when trimesh fails, so it never surfaced.
+            if ms.mesh_number() == 0:
                 return {'success': False, 'message': 'No mesh data found'}
             
             # Create output directory
