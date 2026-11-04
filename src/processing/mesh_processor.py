@@ -207,59 +207,288 @@ class MeshAnalyzer:
         return issues
 
 
+class MeshMeasure:
+    """Geometric and topological measurements that the summary statistics omit."""
+
+    @staticmethod
+    def load_single_mesh(mesh_path: str):
+        """Load a file and flatten any scene into one triangle mesh."""
+        if not TRIMESH_AVAILABLE:
+            raise RuntimeError('Trimesh not available')
+        data = trimesh.load(mesh_path)
+        if isinstance(data, trimesh.Scene):
+            geometries = [g for g in data.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            if not geometries:
+                raise ValueError('File contains no triangle mesh')
+            data = trimesh.util.concatenate(geometries)
+        return data
+
+    @staticmethod
+    def boundary_loops(mesh: Any) -> List[List[int]]:
+        """Return each open edge loop as the vertices bounding a hole.
+
+        A boundary edge belongs to exactly one face, so the loops are the mesh's
+        holes. Isolated vertices are excluded because they bound nothing.
+        """
+        import trimesh.graph as tg
+        from trimesh.grouping import group_rows
+
+        if not len(mesh.edges_sorted):
+            return []
+        boundary = mesh.edges_sorted[group_rows(mesh.edges_sorted, require_count=1)]
+        if not len(boundary):
+            return []
+
+        nodes = np.unique(boundary)
+        index = {int(node): position for position, node in enumerate(nodes)}
+        relabelled = np.array([[index[int(a)], index[int(b)]] for a, b in boundary])
+        labels = tg.connected_component_labels(edges=relabelled, node_count=len(nodes))
+        return [
+            [int(nodes[position]) for position in np.where(labels == label)[0]]
+            for label in sorted(set(labels.tolist()))
+        ]
+
+    @staticmethod
+    def measurements(mesh_path: str) -> Dict[str, Any]:
+        """Volume, area, extents, topology and hole counts for a mesh."""
+        try:
+            mesh = MeshMeasure.load_single_mesh(mesh_path)
+            loops = MeshMeasure.boundary_loops(mesh)
+            bounds = mesh.bounds
+            return {
+                'success': True,
+                'vertices': int(len(mesh.vertices)),
+                'faces': int(len(mesh.faces)),
+                'edges': int(len(mesh.edges_unique)),
+                'volume': float(mesh.volume),
+                'surface_area': float(mesh.area),
+                'extents': [float(x) for x in mesh.extents],
+                'min_bound': [float(x) for x in bounds[0]],
+                'max_bound': [float(x) for x in bounds[1]],
+                'centroid': [float(x) for x in mesh.centroid],
+                'euler_number': int(mesh.euler_number),
+                'body_count': int(mesh.body_count),
+                'is_watertight': bool(mesh.is_watertight),
+                'is_winding_consistent': bool(mesh.is_winding_consistent),
+                'hole_count': len(loops),
+                'hole_sizes': [len(loop) for loop in loops],
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def components(mesh_path: str) -> Dict[str, Any]:
+        """Break the mesh into disconnected bodies and measure each one."""
+        try:
+            mesh = MeshMeasure.load_single_mesh(mesh_path)
+            bodies = mesh.split(only_watertight=False)
+            reports = []
+            for i, body in enumerate(bodies):
+                reports.append({
+                    'index': i,
+                    'faces': int(len(body.faces)),
+                    'vertices': int(len(body.vertices)),
+                    'volume': float(body.volume),
+                    'surface_area': float(body.area),
+                    'watertight': bool(body.is_watertight),
+                })
+            return {'success': True, 'body_count': len(reports), 'components': reports}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def curvature(mesh_path: str) -> Dict[str, Any]:
+        """Discrete mean and Gaussian curvature statistics per vertex."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+            result = {'success': True}
+            for label, kind in (('mean', 'Mean Curvature'), ('gaussian', 'Gaussian Curvature')):
+                ms.apply_filter('compute_scalar_by_discrete_curvature_per_vertex',
+                                curvaturetype=kind)
+                stats = ms.get_scalar_statistics_per_vertex()
+                result[label] = {key: float(value) for key, value in stats.items()}
+            return result
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def face_quality(mesh_path: str, bins: int = 10) -> Dict[str, Any]:
+        """Distribution of the inradius/circumradius triangle quality metric.
+
+        PyMeshLab normalises this metric so 1.0 is a perfect equilateral triangle
+        and 0.0 is a collapsed one, which makes the low end of the distribution
+        exactly where rendering artefacts come from.
+        """
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+            ms.apply_filter('compute_scalar_by_aspect_ratio_per_face',
+                            metric='inradius/circumradius')
+            values = np.asarray(ms.current_mesh().face_scalar_array(), dtype=float)
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                return {'success': False, 'error': 'Mesh has no measurable faces'}
+            counts, edges = np.histogram(finite, bins=max(2, int(bins)), range=(0.0, 1.0))
+            stats = ms.get_scalar_statistics_per_face()
+            return {
+                'success': True,
+                'statistics': {key: float(value) for key, value in stats.items()},
+                'counts': [int(c) for c in counts],
+                'edges': [float(e) for e in edges],
+                'good_faces': int(np.count_nonzero(finite >= 0.5)),
+                'poor_faces': int(np.count_nonzero(finite < 0.2)),
+                'total_faces': int(finite.size),
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+
 class MeshSimplifier:
     """Simplify meshes using various algorithms."""
     
     @staticmethod
-    def simplify_quadric(mesh_path: str, output_path: str, target_faces: int) -> Dict[str, Any]:
-        """Simplify mesh using quadric edge collapse."""
-        if not TRIMESH_AVAILABLE:
-            return {'success': False, 'error': 'Trimesh not available'}
-        
+    def simplify_quadric(mesh_path: str, output_path: str, target_faces: int,
+                         preserve_boundary: bool = False, preserve_normal: bool = False,
+                         preserve_topology: bool = False, planar: bool = False,
+                         planar_weight: float = 0.001,
+                         quality_threshold: float = 0.3) -> Dict[str, Any]:
+        """Collapse edges down to target_faces using quadric error metrics."""
         try:
-            mesh = trimesh.load(mesh_path)
-            original_faces = len(mesh.faces)
-            
-            if hasattr(mesh, 'simplify_quadric_decimation'):
-                # Trimesh expects a percentage (0.0 - 1.0) of faces to keep
-                percent = min(1.0, max(0.0, target_faces / original_faces))
-                simplified = mesh.simplify_quadric_decimation(percent)
-            else:
-                return {'success': False, 'error': 'Simplification not supported'}
-            
-            simplified.export(output_path)
-            
-            return {
-                'success': True,
-                'original_faces': original_faces,
-                'output_faces': len(simplified.faces),
-                'reduction': ((original_faces - len(simplified.faces)) / original_faces) * 100,
-                'output_path': output_path
-            }
+            original_faces = MeshSimplifier._face_count(mesh_path)
+            if original_faces is None:
+                return {'success': False, 'error': 'Could not read mesh faces'}
+            target_faces = int(max(1, min(target_faces, original_faces)))
         except Exception as e:
             return {'success': False, 'error': str(e)}
-    
-    @staticmethod
-    def simplify_ratio(mesh_path: str, output_path: str, ratio: float) -> Dict[str, Any]:
-        """Simplify mesh by reduction ratio."""
+
+        if PYMESHLAB_AVAILABLE:
+            try:
+                ms = pymeshlab.MeshSet()
+                ms.load_new_mesh(mesh_path)
+                ms.apply_filter(
+                    'meshing_decimation_quadric_edge_collapse',
+                    targetfacenum=target_faces,
+                    preserveboundary=bool(preserve_boundary),
+                    preservenormal=bool(preserve_normal),
+                    preservetopology=bool(preserve_topology),
+                    planarquadric=bool(planar),
+                    planarweight=float(planar_weight),
+                    qualitythr=min(1.0, max(0.0, float(quality_threshold))),
+                    autoclean=True,
+                    optimalplacement=True,
+                )
+                ms.save_current_mesh(output_path)
+                final_faces = ms.current_mesh().face_number()
+                return MeshSimplifier._result(original_faces, final_faces, output_path)
+            except Exception as e:
+                return {'success': False, 'error': str(e)}
+
         if not TRIMESH_AVAILABLE:
-            return {'success': False, 'error': 'Trimesh not available'}
-        
+            return {'success': False, 'error': 'Neither PyMeshLab nor Trimesh available'}
         try:
             mesh = trimesh.load(mesh_path)
-            original_faces = len(mesh.faces)
-            target_faces = int(original_faces * ratio)
-            
+            if not hasattr(mesh, 'simplify_quadric_decimation'):
+                return {'success': False, 'error': 'Simplification not supported'}
+            # face_count is an absolute target, not a fraction.
+            simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
+            simplified.export(output_path)
+            return MeshSimplifier._result(original_faces, len(simplified.faces), output_path)
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def simplify_ratio(mesh_path: str, output_path: str, ratio: float) -> Dict[str, Any]:
+        """Simplify mesh by reduction ratio (fraction of faces to keep)."""
+        try:
+            original_faces = MeshSimplifier._face_count(mesh_path)
+            if original_faces is None:
+                return {'success': False, 'error': 'Could not read mesh faces'}
+            target_faces = max(1, int(original_faces * min(1.0, max(0.0, ratio))))
             return MeshSimplifier.simplify_quadric(mesh_path, output_path, target_faces)
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def cluster_simplify(mesh_path: str, output_path: str, threshold: float) -> Dict[str, Any]:
+        """Reduce face count by clustering vertices inside a grid of the given size."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+            original_faces = ms.current_mesh().face_number()
+            # The UI exposes a 0.001-1.0 fraction of the mesh diagonal; the filter
+            # wants a percentage of the bounding-box diagonal.
+            pct = max(0.01, min(100.0, float(threshold) * 100.0))
+            ms.apply_filter('meshing_decimation_clustering',
+                            threshold=pymeshlab.PercentageValue(pct))
+            final_faces = ms.current_mesh().face_number()
+            ms.save_current_mesh(output_path)
+            return MeshSimplifier._result(original_faces, final_faces, output_path)
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def planar_simplify(mesh_path: str, output_path: str, target_faces: int,
+                        angle_threshold: float = 1.0) -> Dict[str, Any]:
+        """Collapse aggressively on flat regions, keeping faces that span sharp angles."""
+        return MeshSimplifier.simplify_quadric(
+            mesh_path, output_path, target_faces,
+            planar=True,
+            planar_weight=MeshSimplifier._angle_to_planar_weight(angle_threshold),
+        )
+
+    @staticmethod
+    def _angle_to_planar_weight(angle_deg: float) -> float:
+        """Map an angle tolerance in degrees onto PyMeshLab's planarweight penalty.
+
+        planarweight scales the dihedral-angle penalty when deciding whether two
+        faces count as coplanar, so a wider accepted angle must produce a smaller
+        weight. Clamped to the range the filter documents as usable.
+        """
+        angle_deg = max(0.1, float(angle_deg))
+        return max(1e-6, min(1.0, 0.001 * (1.0 / angle_deg)))
+
+    @staticmethod
+    def _face_count(mesh_path: str):
+        if PYMESHLAB_AVAILABLE:
+            try:
+                ms = pymeshlab.MeshSet()
+                ms.load_new_mesh(mesh_path)
+                return ms.current_mesh().face_number()
+            except Exception:
+                pass
+        if TRIMESH_AVAILABLE:
+            try:
+                return len(trimesh.load(mesh_path).faces)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _result(original_faces: int, final_faces: int, output_path: str) -> Dict[str, Any]:
+        reduction = ((original_faces - final_faces) / original_faces) * 100 if original_faces else 0.0
+        return {
+            'success': True,
+            'original_faces': original_faces,
+            'output_faces': final_faces,
+            'reduction': reduction,
+            'output_path': output_path,
+        }
+
 
 
 class MeshSmoother:
     """Smooth mesh surfaces."""
     
     @staticmethod
-    def laplacian_smooth(mesh_path: str, output_path: str, iterations: int = 5) -> Dict[str, Any]:
+    def laplacian_smooth(mesh_path: str, output_path: str, iterations: int = 5,
+                         boundary: bool = True) -> Dict[str, Any]:
         """Apply Laplacian smoothing."""
         if not PYMESHLAB_AVAILABLE:
             return {'success': False, 'error': 'PyMeshLab not available'}
@@ -269,7 +498,9 @@ class MeshSmoother:
             ms.load_new_mesh(mesh_path)
             
             # Apply Laplacian smoothing
-            ms.apply_filter('apply_coord_laplacian_smoothing', stepsmoothnum=iterations)
+            ms.apply_filter('apply_coord_laplacian_smoothing',
+                            stepsmoothnum=max(1, int(iterations)),
+                            boundary=bool(boundary))
             
             ms.save_current_mesh(output_path)
             
@@ -280,6 +511,34 @@ class MeshSmoother:
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
+    
+    @staticmethod
+    def depth_smooth(mesh_path: str, output_path: str, iterations: int = 3,
+                     delta: float = 100.0) -> Dict[str, Any]:
+        """Apply depth smoothing, which relaxes detail along the view depth axis."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            # stepsmoothnum is the iteration count; delta is a percentage of the
+            # mesh diagonal controlling how far a vertex may move.
+            ms.apply_filter('apply_coord_depth_smoothing',
+                            stepsmoothnum=max(1, int(iterations)),
+                            delta=pymeshlab.PercentageValue(max(1.0, min(100.0, float(delta)))))
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'iterations': iterations,
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
     
     @staticmethod
     def taubin_smooth(mesh_path: str, output_path: str, lambda_param: float = 0.5, mu_param: float = -0.53, iterations: int = 10) -> Dict[str, Any]:
@@ -312,8 +571,8 @@ class MeshRepairer:
     """Repair common mesh issues."""
     
     @staticmethod
-    def fill_holes(mesh_path: str, output_path: str) -> Dict[str, Any]:
-        """Fill holes in mesh."""
+    def fill_holes(mesh_path: str, output_path: str, max_hole_size: int = None) -> Dict[str, Any]:
+        """Fill boundary holes, optionally capped to a maximum hole perimeter."""
         if not PYMESHLAB_AVAILABLE:
             return {'success': False, 'error': 'PyMeshLab not available'}
         
@@ -321,21 +580,27 @@ class MeshRepairer:
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(mesh_path)
             
-            # Close holes
-            ms.apply_filter('meshing_close_holes')
+            before = ms.current_mesh().face_number()
+            # maxholesize is the largest boundary (in edge count) the filter will cap.
+            params = {}
+            if max_hole_size is not None:
+                params['maxholesize'] = int(max(3, min(1000, int(max_hole_size))))
+            ms.apply_filter('meshing_close_holes', **params)
+            after = ms.current_mesh().face_number()
             
             ms.save_current_mesh(output_path)
             
             return {
                 'success': True,
+                'filled_faces': max(0, after - before),
                 'output_path': output_path
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
     @staticmethod
-    def remove_duplicate_vertices(mesh_path: str, output_path: str) -> Dict[str, Any]:
-        """Remove duplicate vertices."""
+    def remove_duplicate_vertices(mesh_path: str, output_path: str, threshold: float = None) -> Dict[str, Any]:
+        """Weld coincident vertices; a threshold welds everything within that fraction of the diagonal."""
         if not PYMESHLAB_AVAILABLE:
             return {'success': False, 'error': 'PyMeshLab not available'}
         
@@ -345,8 +610,14 @@ class MeshRepairer:
             
             original_vertices = ms.current_mesh().vertex_number()
             
-            # Remove duplicate vertices
-            ms.apply_filter('meshing_remove_duplicate_vertices')
+            if threshold is not None:
+                # meshing_remove_duplicate_vertices only welds exactly-equal vertices.
+                # Anything with a tolerance is a merge-close-vertices operation.
+                ms.apply_filter('meshing_merge_close_vertices',
+                                threshold=pymeshlab.PercentageValue(
+                                    max(0.0001, min(100.0, float(threshold) * 100.0))))
+            else:
+                ms.apply_filter('meshing_remove_duplicate_vertices')
             
             final_vertices = ms.current_mesh().vertex_number()
             
@@ -362,26 +633,145 @@ class MeshRepairer:
 
     @staticmethod
     def remove_degenerate_faces(mesh_path: str, output_path: str) -> Dict[str, Any]:
-        """Remove degenerate faces."""
-        if not TRIMESH_AVAILABLE:
-            return {'success': False, 'error': 'Trimesh not available'}
-        
+        """Drop zero-area and folded faces."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
         try:
-            mesh = trimesh.load(mesh_path)
-            original_faces = len(mesh.faces)
-            
-            # Remove degenerate faces
-            mesh.remove_degenerate_faces()
-            
-            mesh.export(output_path)
-            
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            original_faces = ms.current_mesh().face_number()
+            ms.apply_filter('meshing_remove_null_faces')
+            ms.apply_filter('meshing_remove_folded_faces')
+            ms.apply_filter('meshing_remove_duplicate_faces')
+            final_faces = ms.current_mesh().face_number()
+
+            ms.save_current_mesh(output_path)
+
             return {
                 'success': True,
-                'removed': original_faces - len(mesh.faces),
+                'removed': original_faces - final_faces,
                 'output_path': output_path
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def remove_unreferenced_vertices(mesh_path: str, output_path: str) -> Dict[str, Any]:
+        """Delete vertices no face points at."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            original_vertices = ms.current_mesh().vertex_number()
+            ms.apply_filter('meshing_remove_unreferenced_vertices')
+            final_vertices = ms.current_mesh().vertex_number()
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'removed': original_vertices - final_vertices,
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def repair_non_manifold_edges(mesh_path: str, output_path: str) -> Dict[str, Any]:
+        """Remove or collapse edges shared by more than two faces."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            original_faces = ms.current_mesh().face_number()
+            ms.apply_filter('meshing_repair_non_manifold_edges', method='Remove Faces')
+            final_faces = ms.current_mesh().face_number()
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'removed': original_faces - final_faces,
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def repair_non_manifold_vertices(mesh_path: str, output_path: str) -> Dict[str, Any]:
+        """Split vertices whose fans are not manifold."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            original_vertices = ms.current_mesh().vertex_number()
+            ms.apply_filter('meshing_repair_non_manifold_vertices', vertdispratio=0.1)
+            final_vertices = ms.current_mesh().vertex_number()
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'added': final_vertices - original_vertices,
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def make_manifold(mesh_path: str, output_path: str) -> Dict[str, Any]:
+        """Repair non-manifold edges and vertices, then drop what is left over."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            original = ms.current_mesh().face_number()
+            ms.apply_filter('meshing_repair_non_manifold_edges', method='Remove Faces')
+            ms.apply_filter('meshing_repair_non_manifold_vertices', vertdispratio=0.1)
+            ms.apply_filter('meshing_remove_duplicate_vertices')
+            ms.apply_filter('meshing_remove_unreferenced_vertices')
+            final = ms.current_mesh().face_number()
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'original_faces': original,
+                'output_faces': final,
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def invert_normals(mesh_path: str, output_path: str) -> Dict[str, Any]:
+        """Flip every face orientation."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            ms.apply_filter('meshing_invert_face_orientation', forceflip=True, onlyselected=False)
+
+            ms.save_current_mesh(output_path)
+
+            return {'success': True, 'output_path': output_path}
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
@@ -408,56 +798,59 @@ class MeshRepairer:
     
     @staticmethod
     def auto_repair(mesh_path: str, output_path: str) -> Dict[str, Any]:
-        """Automatically repair common mesh issues (Optimized)."""
+        """Run the standard repair sequence in one pass, staying inside PyMeshLab.
+
+        The previous version ping-ponged PyMeshLab -> trimesh -> PyMeshLab, which
+        silently discarded UVs, vertex colours and normals on the round trip.
+        """
         results = []
-        
-        if not (TRIMESH_AVAILABLE and PYMESHLAB_AVAILABLE):
-            return {'success': False, 'error': 'Both Trimesh and PyMeshLab required'}
-            
+
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
         try:
-            # 1. Load with PyMeshLab (for duplicate vertices)
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(mesh_path)
-            
-            # Remove duplicate vertices
-            original_verts = ms.current_mesh().vertex_number()
-            ms.apply_filter('meshing_remove_duplicate_vertices')
-            new_verts = ms.current_mesh().vertex_number()
-            if original_verts != new_verts:
-                results.append(f"Removed {original_verts - new_verts} duplicate vertices")
-            
-            # 2. Convert to Trimesh (for degenerate faces)
-            # In-memory transfer: PyMeshLab -> Trimesh
-            m = ms.current_mesh()
-            # Note: vertex_matrix() returns numpy array of vertices
-            # face_matrix() returns numpy array of faces
-            mesh = trimesh.Trimesh(vertices=m.vertex_matrix(), faces=m.face_matrix())
-            
-            # Remove degenerate faces
-            original_faces = len(mesh.faces)
-            mesh.remove_degenerate_faces()
-            if len(mesh.faces) != original_faces:
-                results.append(f"Removed {original_faces - len(mesh.faces)} degenerate faces")
-            
-            # 3. Convert back to PyMeshLab (for filling holes)
-            # In-memory transfer: Trimesh -> PyMeshLab
-            ms = pymeshlab.MeshSet()
-            m_pym = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
-            ms.add_mesh(m_pym)
-            
-            # Fill holes
+
+            def step(filter_name, label, before, unit='faces', **params):
+                """Apply one filter and record how many elements it removed."""
+                ms.apply_filter(filter_name, **params)
+                after = (ms.current_mesh().face_number() if unit == 'faces'
+                         else ms.current_mesh().vertex_number())
+                removed = before - after
+                if removed:
+                    results.append(f"{label} {removed} {unit}")
+                return after
+
+            v = ms.current_mesh().vertex_number()
+            v = step('meshing_remove_duplicate_vertices', 'Welded duplicate vertices', v, unit='vertices')
+
+            f = ms.current_mesh().face_number()
+            f = step('meshing_remove_null_faces', 'Removed null faces', f)
+            f = step('meshing_remove_folded_faces', 'Removed folded faces', f)
+            f = step('meshing_remove_duplicate_faces', 'Removed duplicate faces', f)
+
+            ms.apply_filter('meshing_re_orient_faces_coherently')
+            results.append("Re-oriented faces coherently")
+
+            # Closing holes adds faces rather than removing them, so it is counted up.
+            before = f
             ms.apply_filter('meshing_close_holes')
-            results.append("Filled holes")
-            
-            # Save final result
+            f = ms.current_mesh().face_number()
+            if f - before:
+                results.append(f"Closed holes with {f - before} new faces")
+
+            v = ms.current_mesh().vertex_number()
+            v = step('meshing_remove_unreferenced_vertices', 'Removed unreferenced vertices', v, unit='vertices')
+
             ms.save_current_mesh(output_path)
-            
+
             return {
                 'success': True,
                 'operations': results,
                 'output_path': output_path
             }
-            
+
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
@@ -467,23 +860,40 @@ class MeshRemesher:
     """Remesh operations."""
     
     @staticmethod
-    def uniform_remesh(mesh_path: str, output_path: str, target_edge_length: float) -> Dict[str, Any]:
-        """Create uniform remesh."""
+    def uniform_remesh(mesh_path: str, output_path: str, target_edge_length: float,
+                       iterations: int = 10, adaptive: bool = False) -> Dict[str, Any]:
+        """Rebuild the surface with near-equal length edges."""
         if not PYMESHLAB_AVAILABLE:
             return {'success': False, 'error': 'PyMeshLab not available'}
         
         try:
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(mesh_path)
+            before = ms.current_mesh().face_number()
             
-            # Isotropic remeshing
-            ms.apply_filter('meshing_isotropic_explicit_remeshing', 
-                          targetlen=pymeshlab.AbsoluteValue(target_edge_length))
+            # targetlen is a PercentageValue of the mesh bounding-box diagonal.
+            # The UI slider is a fraction of that diagonal, hence the *100.
+            pct = max(0.01, min(100.0, float(target_edge_length) * 100.0))
+            ms.apply_filter(
+                'meshing_isotropic_explicit_remeshing',
+                targetlen=pymeshlab.PercentageValue(pct),
+                iterations=max(1, int(iterations)),
+                adaptive=bool(adaptive),
+                featuredeg=30.0,
+                splitflag=True,
+                collapseflag=True,
+                swapflag=True,
+                smoothflag=True,
+                reprojectflag=True,
+            )
+            after = ms.current_mesh().face_number()
             
             ms.save_current_mesh(output_path)
             
             return {
                 'success': True,
+                'original_faces': before,
+                'output_faces': after,
                 'output_path': output_path
             }
         except Exception as e:
@@ -491,26 +901,92 @@ class MeshRemesher:
     
     @staticmethod
     def quad_remesh(mesh_path: str, output_path: str) -> Dict[str, Any]:
-        """Convert to quad mesh."""
+        """Pair triangles into quads."""
         if not PYMESHLAB_AVAILABLE:
             return {'success': False, 'error': 'PyMeshLab not available'}
         
         try:
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(mesh_path)
+            before = ms.current_mesh().face_number()
             
-            # Turn into quad mesh
             ms.apply_filter('meshing_poly_to_tri')
-            ms.apply_filter('meshing_tri_to_quad')
+            ms.apply_filter('meshing_tri_to_quad_by_smart_triangle_pairing')
+            after = ms.current_mesh().face_number()
             
             ms.save_current_mesh(output_path)
             
             return {
                 'success': True,
+                'original_faces': before,
+                'output_faces': after,
                 'output_path': output_path
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def voronoi_filtering(mesh_path: str, output_path: str, threshold: float = 10.0) -> Dict[str, Any]:
+        """Fair the mesh by Voronoi-based edge flipping."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+
+            ms.apply_filter('generate_voronoi_filtering',
+                            threshold=max(0.0, min(2000.0, float(threshold))))
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'output_faces': ms.current_mesh().face_number(),
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def subdivide(mesh_path: str, output_path: str, method: str = 'loop', levels: int = 1) -> Dict[str, Any]:
+        """Refine the mesh by repeated subdivision."""
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        filters = {
+            'loop': 'meshing_surface_subdivision_loop',
+            'catmull-clark': 'meshing_surface_subdivision_catmull_clark',
+            'catmull_clark': 'meshing_surface_subdivision_catmull_clark',
+            'catmullclark': 'meshing_surface_subdivision_catmull_clark',
+            'butterfly': 'meshing_surface_subdivision_butterfly',
+            'midpoint': 'meshing_surface_subdivision_midpoint',
+        }
+        filt = filters.get(str(method).lower())
+        if filt is None:
+            return {'success': False,
+                    'error': f"Unknown subdivision method: {method}. "
+                             f"Supported: {', '.join(sorted(set(filters)))}"}
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+            before = ms.current_mesh().face_number()
+
+            ms.apply_filter(filt, iterations=max(1, int(levels)))
+            after = ms.current_mesh().face_number()
+
+            ms.save_current_mesh(output_path)
+
+            return {
+                'success': True,
+                'original_faces': before,
+                'output_faces': after,
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
 
 
 class MeshTransformer:
@@ -731,53 +1207,165 @@ class MeshProcessor(QObject):
     def detect_issues(self, mesh_path: str) -> List[Dict[str, str]]:
         """Detect mesh issues."""
         return self.analyzer.detect_issues(mesh_path)
+
+    def export(self, mesh_path: str, output_path: str, include_normals: bool = True,
+               include_textures: bool = True, include_colors: bool = True) -> Dict[str, Any]:
+        """Write a mesh to output_path, converting format from the file extension.
+
+        Normals are only selectable for OBJ: PLY, STL and OFF have no place to
+        store per-vertex normals that a reader would not recompute anyway.
+        """
+        if not os.path.exists(mesh_path):
+            return {'success': False, 'error': f'Source mesh not found: {mesh_path}'}
+        if not TRIMESH_AVAILABLE:
+            return {'success': False, 'error': 'Trimesh not available'}
+
+        try:
+            mesh = trimesh.load(mesh_path)
+            if isinstance(mesh, trimesh.Scene):
+                geometries = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+                if not geometries:
+                    return {'success': False, 'error': 'File contains no triangle mesh'}
+                mesh = trimesh.util.concatenate(geometries)
+
+            if not (include_textures and include_colors):
+                kept_colors = None
+                if include_colors and mesh.visual.kind in ('vertex', 'face'):
+                    kept_colors = np.array(mesh.visual.vertex_colors)
+                mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
+                if kept_colors is not None:
+                    mesh.visual.vertex_colors = kept_colors
+
+            kwargs = {}
+            if os.path.splitext(output_path)[1].lower() == '.obj':
+                kwargs['include_normals'] = bool(include_normals)
+            mesh.export(output_path, **kwargs)
+            return {'success': True, 'output_path': output_path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def simplify(self, mesh_path: str, output_path: str, method: str = 'ratio', **kwargs) -> Dict[str, Any]:
-        """Simplify mesh."""
-        if method == 'ratio':
-            ratio = kwargs.get('ratio', 0.5)
-            return self.simplifier.simplify_ratio(mesh_path, output_path, ratio)
-        elif method == 'faces':
-            target_faces = kwargs.get('target_faces', 1000)
-            return self.simplifier.simplify_quadric(mesh_path, output_path, target_faces)
+        """Simplify mesh.
+
+        method is one of: faces, ratio, clustering, planar.
+        """
+        if method == 'faces':
+            return self.simplifier.simplify_quadric(
+                mesh_path, output_path,
+                target_faces=int(kwargs.get('target_faces', 1000)),
+                preserve_boundary=bool(kwargs.get('preserve_boundary', False)),
+                preserve_normal=bool(kwargs.get('preserve_normal', False)),
+                preserve_topology=bool(kwargs.get('preserve_topology', False)),
+                quality_threshold=float(kwargs.get('quality_threshold', 0.3)),
+            )
+        elif method == 'ratio':
+            return self.simplifier.simplify_ratio(
+                mesh_path, output_path, ratio=float(kwargs.get('ratio', 0.5)))
+        elif method == 'clustering':
+            return self.simplifier.cluster_simplify(
+                mesh_path, output_path, threshold=float(kwargs.get('threshold', 0.01)))
+        elif method == 'planar':
+            return self.simplifier.planar_simplify(
+                mesh_path, output_path,
+                target_faces=int(kwargs.get('target_faces', 1000)),
+                angle_threshold=float(kwargs.get('angle', 1.0)),
+            )
         else:
-            return {'success': False, 'error': f'Unknown method: {method}'}
+            return {'success': False,
+                    'error': f"Unknown method: {method} (expected faces, ratio, clustering or planar)"}
     
     def smooth(self, mesh_path: str, output_path: str, method: str = 'laplacian', **kwargs) -> Dict[str, Any]:
-        """Smooth mesh."""
+        """Smooth mesh.
+
+        method is one of: laplacian, taubin, depth.
+        """
         if method == 'laplacian':
-            iterations = kwargs.get('iterations', 5)
-            return self.smoother.laplacian_smooth(mesh_path, output_path, iterations)
+            return self.smoother.laplacian_smooth(
+                mesh_path, output_path,
+                iterations=int(kwargs.get('iterations', 5)),
+                boundary=bool(kwargs.get('boundary', True)),
+            )
         elif method == 'taubin':
-            iterations = kwargs.get('iterations', 10)
-            return self.smoother.taubin_smooth(mesh_path, output_path, iterations=iterations)
+            return self.smoother.taubin_smooth(
+                mesh_path, output_path,
+                lambda_param=float(kwargs.get('lambda_param', 0.5)),
+                mu_param=float(kwargs.get('mu_param', -0.53)),
+                iterations=int(kwargs.get('iterations', 10)),
+            )
+        elif method == 'depth':
+            return self.smoother.depth_smooth(
+                mesh_path, output_path,
+                iterations=int(kwargs.get('iterations', 3)),
+                delta=float(kwargs.get('delta', 100.0)),
+            )
         else:
-            return {'success': False, 'error': f'Unknown method: {method}'}
+            return {'success': False,
+                    'error': f"Unknown method: {method} (expected laplacian, taubin or depth)"}
     
-    def repair(self, mesh_path: str, output_path: str, operation: str = 'auto') -> Dict[str, Any]:
-        """Repair mesh."""
+    def repair(self, mesh_path: str, output_path: str, operation: str = 'auto', **kwargs) -> Dict[str, Any]:
+        """Repair mesh.
+
+        operation is one of: auto, fill_holes, remove_duplicates, remove_degenerate,
+        remove_unreferenced, fix_normals, invert_normals, repair_non_manifold_edges,
+        repair_non_manifold_vertices, make_manifold.
+        """
         if operation == 'auto':
             return self.repairer.auto_repair(mesh_path, output_path)
         elif operation == 'fill_holes':
-            return self.repairer.fill_holes(mesh_path, output_path)
+            max_hole_size = kwargs.get('max_hole_size')
+            return self.repairer.fill_holes(
+                mesh_path, output_path,
+                max_hole_size=None if max_hole_size is None else int(max_hole_size))
         elif operation == 'remove_duplicates':
-            return self.repairer.remove_duplicate_vertices(mesh_path, output_path)
+            threshold = kwargs.get('threshold')
+            return self.repairer.remove_duplicate_vertices(
+                mesh_path, output_path,
+                threshold=None if threshold is None else float(threshold))
         elif operation == 'remove_degenerate':
             return self.repairer.remove_degenerate_faces(mesh_path, output_path)
+        elif operation == 'remove_unreferenced':
+            return self.repairer.remove_unreferenced_vertices(mesh_path, output_path)
         elif operation == 'fix_normals':
             return self.repairer.fix_normals(mesh_path, output_path)
+        elif operation == 'invert_normals':
+            return self.repairer.invert_normals(mesh_path, output_path)
+        elif operation == 'repair_non_manifold_edges':
+            return self.repairer.repair_non_manifold_edges(mesh_path, output_path)
+        elif operation == 'repair_non_manifold_vertices':
+            return self.repairer.repair_non_manifold_vertices(mesh_path, output_path)
+        elif operation == 'make_manifold':
+            return self.repairer.make_manifold(mesh_path, output_path)
         else:
             return {'success': False, 'error': f'Unknown operation: {operation}'}
     
     def remesh(self, mesh_path: str, output_path: str, method: str = 'uniform', **kwargs) -> Dict[str, Any]:
-        """Remesh."""
+        """Remesh.
+
+        method is one of: uniform, quad, voronoi, subdivision.
+        """
         if method == 'uniform':
-            edge_length = kwargs.get('edge_length', 0.1)
-            return self.remesher.uniform_remesh(mesh_path, output_path, edge_length)
+            return self.remesher.uniform_remesh(
+                mesh_path, output_path,
+                target_edge_length=float(kwargs.get('edge_length', 0.1)),
+                iterations=int(kwargs.get('iterations', 10)),
+                adaptive=bool(kwargs.get('adaptive', False)),
+            )
         elif method == 'quad':
             return self.remesher.quad_remesh(mesh_path, output_path)
+        elif method == 'voronoi':
+            return self.remesher.voronoi_filtering(
+                mesh_path, output_path,
+                threshold=float(kwargs.get('threshold', 10.0)),
+            )
+        elif method == 'subdivision':
+            return self.remesher.subdivide(
+                mesh_path, output_path,
+                method=str(kwargs.get('sub_method', 'loop')),
+                levels=int(kwargs.get('levels', 1)),
+            )
         else:
-            return {'success': False, 'error': f'Unknown method: {method}'}
+            return {'success': False,
+                    'error': f"Unknown method: {method} (expected uniform, quad, voronoi or subdivision)"}
     
     def transform(self, mesh_path: str, output_path: str, operation: str = 'scale', **kwargs) -> Dict[str, Any]:
         """Transform mesh."""

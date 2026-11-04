@@ -14,7 +14,7 @@ from PyQt6.QtGui import QFont, QColor
 
 # Import mesh processor backend
 from ..processing.mesh_processor import (
-    MeshProcessor, MeshAnalyzer, MeshStatistics
+    MeshProcessor, MeshAnalyzer, MeshMeasure, MeshStatistics
 )
 from .unified_viewer import UnifiedOpen3DViewer
 from ..utils.worker import Worker
@@ -34,6 +34,9 @@ class MeshToolsTab(QWidget):
         self.current_mesh = None
         self.current_model_path = None
         self.processing_history = []
+        self.undo_steps = []
+        self._pending_source = None
+        self._pending_label = "Mesh operation"
         # Current model header
         # Initialize layout
         main_layout = QVBoxLayout(self)
@@ -324,12 +327,21 @@ class MeshToolsTab(QWidget):
         self.preserve_topology_cb = QCheckBox("Preserve Topology")
         self.preserve_topology_cb.setChecked(False)
         
+        self.percentage_target_cb = QCheckBox("Use Target Percentage")
+        self.percentage_target_cb.setToolTip(
+            "Reduce by a percentage of the original face count instead of an absolute target.")
+        self.percentage_target_cb.setChecked(False)
+        
         quadric_layout.addRow("Target Faces:", self.target_faces_spin)
+        quadric_layout.addRow(self.percentage_target_cb)
         quadric_layout.addRow("Target Percentage:", self.target_percentage_spin)
         quadric_layout.addRow("Quality Threshold:", self.quality_threshold_spin)
         quadric_layout.addRow(self.preserve_boundary_cb)
         quadric_layout.addRow(self.preserve_normal_cb)
         quadric_layout.addRow(self.preserve_topology_cb)
+        
+        self.percentage_target_cb.toggled.connect(self.on_percentage_target_toggled)
+        self.on_percentage_target_toggled(False)
         
         self.simplify_quadric_btn = QPushButton("Apply Quadric Simplification")
         self.simplify_quadric_btn.setToolTip("Reduce face count using Quadric Error Metrics (high quality).")
@@ -362,11 +374,16 @@ class MeshToolsTab(QWidget):
         planar_group = QGroupBox("Planar Simplification")
         planar_layout = QFormLayout()
         
+        self.planar_target_faces_spin = QSpinBox()
+        self.planar_target_faces_spin.setRange(100, 10000000)
+        self.planar_target_faces_spin.setValue(5000)
+        
         self.planar_angle_spin = QDoubleSpinBox()
         self.planar_angle_spin.setRange(0.1, 30.0)
         self.planar_angle_spin.setValue(1.0)
         self.planar_angle_spin.setSuffix("°")
         
+        planar_layout.addRow("Target Faces:", self.planar_target_faces_spin)
         planar_layout.addRow("Angle Threshold:", self.planar_angle_spin)
         
         self.simplify_planar_btn = QPushButton("Apply Planar Simplification")
@@ -448,12 +465,13 @@ class MeshToolsTab(QWidget):
         self.depth_steps_spin.setValue(3)
         
         self.depth_threshold_spin = QDoubleSpinBox()
-        self.depth_threshold_spin.setRange(0.1, 10.0)
-        self.depth_threshold_spin.setValue(1.0)
+        self.depth_threshold_spin.setRange(1.0, 100.0)
+        self.depth_threshold_spin.setValue(100.0)
+        self.depth_threshold_spin.setSuffix("%")
         self.depth_threshold_spin.setSingleStep(0.1)
         
         depth_layout.addRow("Smoothing Steps:", self.depth_steps_spin)
-        depth_layout.addRow("Delta Threshold:", self.depth_threshold_spin)
+        depth_layout.addRow("Delta Strength:", self.depth_threshold_spin)
         
         self.smooth_depth_btn = QPushButton("Apply Depth Smoothing")
         
@@ -505,11 +523,14 @@ class MeshToolsTab(QWidget):
         voronoi_group = QGroupBox("Voronoi Remeshing")
         voronoi_layout = QFormLayout()
         
-        self.voronoi_samples_spin = QSpinBox()
-        self.voronoi_samples_spin.setRange(100, 100000)
-        self.voronoi_samples_spin.setValue(5000)
+        self.voronoi_threshold_spin = QDoubleSpinBox()
+        self.voronoi_threshold_spin.setRange(0.0, 2000.0)
+        self.voronoi_threshold_spin.setValue(10.0)
+        self.voronoi_threshold_spin.setSingleStep(1.0)
+        self.voronoi_threshold_spin.setToolTip(
+            "Planarity threshold for the Voronoi-based decimation. 0 keeps every facet.")
         
-        voronoi_layout.addRow("Sample Count:", self.voronoi_samples_spin)
+        voronoi_layout.addRow("Planarity Threshold:", self.voronoi_threshold_spin)
         
         self.remesh_voronoi_btn = QPushButton("Apply Voronoi Remeshing")
         
@@ -562,6 +583,9 @@ class MeshToolsTab(QWidget):
         self.quality_results.setMaximumHeight(120)
         self.quality_results.setReadOnly(True)
         
+        self.compute_quality_btn.clicked.connect(self.compute_mesh_quality)
+        self.quality_histogram_btn.clicked.connect(self.show_quality_histogram)
+        
         quality_layout.addWidget(self.compute_quality_btn)
         quality_layout.addWidget(self.quality_histogram_btn)
         quality_layout.addWidget(self.quality_results)
@@ -577,6 +601,11 @@ class MeshToolsTab(QWidget):
         self.compute_area_btn = QPushButton("Compute Surface Area")
         self.compute_curvature_btn = QPushButton("Compute Curvature")
         self.geometric_info_btn = QPushButton("Geometric Information")
+        
+        self.compute_volume_btn.clicked.connect(self.compute_volume)
+        self.compute_area_btn.clicked.connect(self.compute_surface_area)
+        self.compute_curvature_btn.clicked.connect(self.compute_curvature)
+        self.geometric_info_btn.clicked.connect(self.show_geometric_info)
         
         measurements_layout.addWidget(self.compute_volume_btn)
         measurements_layout.addWidget(self.compute_area_btn)
@@ -594,6 +623,11 @@ class MeshToolsTab(QWidget):
         self.check_watertight_btn = QPushButton("Check Watertight")
         self.count_components_btn = QPushButton("Count Components")
         self.find_holes_btn = QPushButton("Find Holes")
+        
+        self.check_manifold_btn.clicked.connect(self.check_manifold)
+        self.check_watertight_btn.clicked.connect(self.check_watertight)
+        self.count_components_btn.clicked.connect(self.count_components)
+        self.find_holes_btn.clicked.connect(self.find_holes)
         
         topology_layout.addWidget(self.check_manifold_btn)
         topology_layout.addWidget(self.check_watertight_btn)
@@ -772,6 +806,9 @@ class MeshToolsTab(QWidget):
         self.screenshot_btn = QPushButton("Screenshot")
         self.screenshot_btn.setIcon(get_icon("camera"))
         
+        self.reset_view_btn.clicked.connect(self.reset_view)
+        self.screenshot_btn.clicked.connect(self.take_screenshot)
+        
         controls_layout.addWidget(self.wireframe_cb)
         controls_layout.addWidget(self.show_edges_cb)
         controls_layout.addWidget(self.show_normals_cb)
@@ -841,6 +878,9 @@ class MeshToolsTab(QWidget):
         self.clear_history_btn = QPushButton("Clear History")
         self.undo_last_btn = QPushButton("Undo Last Operation")
         
+        self.clear_history_btn.clicked.connect(self.clear_history)
+        self.undo_last_btn.clicked.connect(self.undo_last)
+        
         history_layout.addWidget(self.history_list)
         
         history_buttons = QHBoxLayout()
@@ -868,6 +908,11 @@ class MeshToolsTab(QWidget):
         self.export_stl_btn = QPushButton("Export STL")
         self.export_off_btn = QPushButton("Export OFF")
         
+        self.export_obj_btn.clicked.connect(lambda: self.export_to_format(".obj"))
+        self.export_ply_btn.clicked.connect(lambda: self.export_to_format(".ply"))
+        self.export_stl_btn.clicked.connect(lambda: self.export_to_format(".stl"))
+        self.export_off_btn.clicked.connect(lambda: self.export_to_format(".off"))
+        
         export_layout.addWidget(self.export_obj_btn, 0, 0)
         export_layout.addWidget(self.export_ply_btn, 0, 1)
         export_layout.addWidget(self.export_stl_btn, 1, 0)
@@ -881,7 +926,9 @@ class MeshToolsTab(QWidget):
         options_layout = QFormLayout()
         
         self.export_normals_cb = QCheckBox("Include Normals")
+        self.export_normals_cb.setToolTip("Written as vn lines in OBJ; other formats recompute normals.")
         self.export_textures_cb = QCheckBox("Include Textures")
+        self.export_textures_cb.setToolTip("Unchecking drops UVs and the material file.")
         self.export_colors_cb = QCheckBox("Include Vertex Colors")
         
         options_layout.addRow(self.export_normals_cb)
@@ -894,209 +941,6 @@ class MeshToolsTab(QWidget):
         layout.addStretch()
         return widget
 
-    def close_holes(self):
-        """Close holes in the mesh."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        self.operation_label.setText("Closing holes...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            # Use mesh processor backend
-            output_path = self.current_model_path.replace('.', '_holes_filled.')
-            result = self.mesh_processor.repair(
-                self.current_model_path,
-                output_path,
-                operation='fill_holes'
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText("Holes closed successfully")
-                self.add_to_history("Close All Holes")
-                QMessageBox.information(self, "Success", "Holes filled successfully!")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to close holes: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-
-    def remove_duplicate_vertices(self):
-        """Remove duplicate vertices."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        threshold = self.duplicate_threshold_spin.value()
-        self.operation_label.setText("Removing duplicate vertices...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_no_duplicates.')
-            result = self.mesh_processor.repair(
-                self.current_model_path,
-                output_path,
-                operation='remove_duplicates'
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                removed = result.get('removed', 0)
-                self.operation_label.setText(f"Removed {removed} duplicate vertices")
-                self.add_to_history(f"Remove Duplicates (removed: {removed})")
-                QMessageBox.information(self, "Success", f"Removed {removed} duplicate vertices!")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to remove duplicates: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def fix_face_normals(self):
-        """Fix face normals."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        self.operation_label.setText("Fixing face normals...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_normals_fixed.')
-            result = self.mesh_processor.repair(
-                self.current_model_path,
-                output_path,
-                operation='fix_normals'
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText("Face normals fixed")
-                self.add_to_history("Fix Face Normals")
-                QMessageBox.information(self, "Success", "Face normals fixed successfully!")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to fix normals: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def apply_quadric_simplification(self):
-        """Apply quadric edge collapse simplification."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        target_faces = self.target_faces_spin.value()
-        
-        self.operation_label.setText("Applying quadric simplification...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_simplified.')
-            result = self.mesh_processor.simplify(
-                self.current_model_path,
-                output_path,
-                method='faces',
-                target_faces=target_faces
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                original = result.get('original_faces', 0)
-                output = result.get('output_faces', 0)
-                reduction = result.get('reduction', 0)
-                self.operation_label.setText(f"Simplified: {original} → {output} faces ({reduction:.1f}% reduction)")
-                self.add_to_history(f"Quadric Simplification ({output} faces, {reduction:.1f}% reduction)")
-                QMessageBox.information(self, "Success", f"Simplified to {output} faces ({reduction:.1f}% reduction)!")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to simplify: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def apply_laplacian_smoothing(self):
-        """Apply Laplacian smoothing."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        steps = self.laplacian_steps_spin.value()
-        
-        self.operation_label.setText("Applying Laplacian smoothing...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_smoothed.')
-            result = self.mesh_processor.smooth(
-                self.current_model_path,
-                output_path,
-                method='laplacian',
-                iterations=steps
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText(f"Laplacian smoothing applied ({steps} steps)")
-                self.add_to_history(f"Laplacian Smoothing ({steps} steps)")
-                QMessageBox.information(self, "Success", f"Laplacian smoothing applied with {steps} iterations!")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to smooth: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def apply_taubin_smoothing(self):
-        """Apply Taubin smoothing."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        lambda_val = self.taubin_lambda_spin.value()
-        mu_val = self.taubin_mu_spin.value()
-        steps = self.taubin_steps_spin.value()
-        
-        self.operation_label.setText("Applying Taubin smoothing...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_taubin_smoothed.')
-            result = self.mesh_processor.smooth(
-                self.current_model_path,
-                output_path,
-                method='taubin',
-                iterations=steps
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText(f"Taubin smoothing applied ({steps} steps)")
-                self.add_to_history(f"Taubin Smoothing (λ={lambda_val}, μ={mu_val}, {steps} steps)")
-                QMessageBox.information(self, "Success", f"Taubin smoothing applied with {steps} iterations!")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to smooth: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
     def compute_mesh_quality(self):
         """Compute mesh quality metrics using backend."""
         if not self.current_model_path:
@@ -1168,92 +1012,222 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
                 
                 self.detailed_analysis.setPlainText(issues_text)
                 self.operation_label.setText(f"Found {len(issues)} issue(s)")
-                
-                if len(issues) == 0:
-                    QMessageBox.information(self, "Manifold Check", "Mesh is manifold and has no issues!")
-                else:
-                    QMessageBox.warning(self, "Issues Found", f"Found {len(issues)} issue(s). Check Detailed Analysis.")
+                QMessageBox.warning(self, "Issues Found",
+                                    f"Found {len(issues)} issue(s). Check Detailed Analysis.")
             else:
+                self.detailed_analysis.setPlainText("No issues detected.")
                 self.operation_label.setText("No issues detected")
                 QMessageBox.information(self, "Success", "Mesh has no detectable issues!")
         except Exception as e:
             self.operation_label.setText(f"Error: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to check manifold: {str(e)}")
-            
-    def apply_transformation(self):
-        """Apply the current transformation."""
+
+    def run_measurement(self, label, measure, format_result):
+        """Run a read-only measurement off the UI thread and show its report."""
         if not self.current_model_path:
             QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
             return
-            
-        trans_x = self.trans_x_spin.value()
-        trans_y = self.trans_y_spin.value()
-        trans_z = self.trans_z_spin.value()
-        scale_x = self.scale_x_spin.value()
-        
-        self.operation_label.setText("Applying transformation...")
+
+        self.operation_label.setText(f"{label}...")
         self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_transformed.')
-            
-            # Apply scale if not 1.0
-            if abs(scale_x - 1.0) > 0.001:
-                result = self.mesh_processor.transform(
-                    self.current_model_path,
-                    output_path,
-                    operation='scale',
-                    scale_factor=scale_x
-                )
-                
-                if result['success']:
-                    self.current_model_path = output_path
-                    self.operation_label.setText(f"Transformation applied (scale: {scale_x})")
-                    self.add_to_history(f"Transform (Scale: {scale_x})")
-                    QMessageBox.information(self, "Success", "Transformation applied!")
-                else:
-                    QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-            else:
-                QMessageBox.information(self, "Info", "No transformation needed (scale = 1.0)")
-                
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to transform: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def center_mesh(self):
-        """Center the mesh."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
-            return
-            
-        self.operation_label.setText("Centering mesh...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_centered.')
-            result = self.mesh_processor.transform(
-                self.current_model_path,
-                output_path,
-                operation='center'
+        model_path = self.current_model_path
+
+        def worker_func(progress_callback=None):
+            return measure(model_path)
+
+        def show_result(result):
+            self.detailed_analysis.setPlainText(format_result(result))
+
+        worker = Worker(worker_func)
+        worker.signals.result.connect(show_result)
+        worker.signals.error.connect(self.on_operation_error)
+        worker.signals.finished.connect(self.on_measurement_finished)
+        self.threadpool.start(worker)
+
+    def on_measurement_finished(self):
+        """Finish a read-only measurement without reloading the mesh."""
+        self.progress_bar.setVisible(False)
+        self.operation_label.setText("Measurement complete")
+
+    @staticmethod
+    def _requirement(result):
+        """Return the backend error as a report when a measurement failed."""
+        if result.get('success'):
+            return None
+        return f"Measurement failed: {result.get('error', 'Unknown error')}"
+
+    @staticmethod
+    def _histogram(counts, edges, width=34):
+        """Render a measurement distribution as text bars."""
+        peak = max(counts) if counts else 0
+        lines = []
+        for i, count in enumerate(counts):
+            bar = "#" * (int(round(count / peak * width)) if peak else 0)
+            lines.append(f"{edges[i]:.2f}-{edges[i + 1]:.2f} | {bar} {count:,}")
+        return "\n".join(lines)
+
+    def show_quality_histogram(self):
+        """Face-shape quality distribution using inradius/circumradius."""
+        self.run_measurement(
+            "Measuring face quality",
+            MeshMeasure.face_quality,
+            lambda r: self._format_quality(r)
+        )
+
+    def _format_quality(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        stats = result['statistics']
+        total = result['total_faces']
+        good = result['good_faces']
+        poor = result['poor_faces']
+        return (
+            "Face shape quality (1.00 = equilateral, 0.00 = collapsed)\n\n"
+            f"Faces measured: {total:,}\n"
+            f"Average quality: {stats['avg']:.3f}\n"
+            f"Median quality:  {stats['med']:.3f}\n"
+            f"Worst quality:   {stats['min']:.4f}\n\n"
+            f"Good (>= 0.50): {good:,} ({good / total:.1%})\n"
+            f"Poor (< 0.20):  {poor:,} ({poor / total:.1%})\n\n"
+            + self._histogram(result['counts'], result['edges'])
+        )
+
+    def compute_volume(self):
+        """Mesh volume, with the watertight guarantee the number depends on."""
+        self.run_measurement("Computing volume", MeshMeasure.measurements,
+                             self._format_volume)
+
+    def _format_volume(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        note = ("Watertight: the volume is the enclosed solid."
+                if result['is_watertight'] else
+                "Not watertight: volume is computed on the open shell and will be wrong.")
+        return (f"Volume: {result['volume']:.6f} cubic units\n"
+                f"Surface area: {result['surface_area']:.6f} square units\n"
+                f"Holes: {result['hole_count']}\n\n{note}")
+
+    def compute_surface_area(self):
+        """Total triangle area."""
+        self.run_measurement("Computing surface area", MeshMeasure.measurements,
+                             self._format_area)
+
+    def _format_area(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        faces = result['faces']
+        lines = [f"Surface area: {result['surface_area']:.6f} square units",
+                 f"Faces: {faces:,}"]
+        if faces:
+            lines.append(f"Average face area: {result['surface_area'] / faces:.8f}")
+        return "\n".join(lines)
+
+    def compute_curvature(self):
+        """Discrete mean and Gaussian curvature statistics."""
+        self.run_measurement("Computing curvature", MeshMeasure.curvature,
+                             self._format_curvature)
+
+    def _format_curvature(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        lines = ["Discrete curvature per vertex\n"]
+        for key, name in (('mean', 'Mean curvature'), ('gaussian', 'Gaussian curvature')):
+            stats = result[key]
+            lines.append(
+                f"{name}:\n"
+                f"  min  {stats['min']:.5f}\n"
+                f"  mean {stats['avg']:.5f}\n"
+                f"  max  {stats['max']:.5f}\n"
+                f"  std  {stats['stddev']:.5f}\n"
             )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                center = result.get('original_center', (0, 0, 0))
-                self.operation_label.setText(f"Mesh centered (was at {center})")
-                self.add_to_history("Center Mesh")
-                QMessageBox.information(self, "Success", f"Mesh centered! Original center: {center}")
-            else:
-                self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to center: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
+        lines.append("Sharp edges show up as large spreads between min and max.")
+        return "\n".join(lines)
+
+    def show_geometric_info(self):
+        """Bounding box, extents, centroid and topology."""
+        self.run_measurement("Gathering geometry", MeshMeasure.measurements,
+                             self._format_geometry)
+
+    def _format_geometry(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        return (
+            "Geometric information\n\n"
+            f"Vertices: {result['vertices']:,}   Faces: {result['faces']:,}   "
+            f"Edges: {result['edges']:,}\n"
+            f"Extents: {result['extents'][0]:.4f} x {result['extents'][1]:.4f} x "
+            f"{result['extents'][2]:.4f}\n"
+            f"Min corner:  {result['min_bound']}\n"
+            f"Max corner:  {result['max_bound']}\n"
+            f"Centroid:    {result['centroid']}\n"
+            f"Euler number: {result['euler_number']}   Bodies: {result['body_count']}\n"
+            f"Watertight: {'Yes' if result['is_watertight'] else 'No'}   "
+            f"Holes: {result['hole_count']}"
+        )
+
+    def check_watertight(self):
+        """Whether the mesh encloses a solid."""
+        self.run_measurement("Checking watertightness", MeshMeasure.measurements,
+                             self._format_watertight)
+
+    def _format_watertight(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        if result['is_watertight']:
+            return "Mesh is watertight: every edge is shared by exactly two faces."
+        return (
+            f"Mesh is NOT watertight.\n\n"
+            f"Open edge loops (holes): {result['hole_count']}\n"
+            f"Hole sizes (vertices): {result['hole_sizes'][:20]}"
+        )
+
+    def count_components(self):
+        """Disconnected bodies and how big each one is."""
+        self.run_measurement("Counting components", MeshMeasure.components,
+                             self._format_components)
+
+    def _format_components(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        bodies = sorted(result['components'], key=lambda b: b['faces'], reverse=True)
+        lines = [f"Disconnected bodies: {result['body_count']}\n"]
+        for body in bodies[:25]:
+            lines.append(
+                f"Body {body['index']}: {body['faces']:,} faces, "
+                f"{body['volume']:.4f} volume, "
+                f"{'watertight' if body['watertight'] else 'open'}"
+            )
+        if len(bodies) > 25:
+            lines.append(f"... and {len(bodies) - 25} more")
+        return "\n".join(lines)
+
+    def find_holes(self):
+        """Open edge loops, largest first."""
+        self.run_measurement("Finding holes", MeshMeasure.measurements,
+                             self._format_holes)
+
+    def _format_holes(self, result):
+        failed = self._requirement(result)
+        if failed:
+            return failed
+        sizes = sorted(result['hole_sizes'], reverse=True)
+        if not sizes:
+            return "No holes found: every edge is shared by two faces."
+        return (
+            f"Holes found: {len(sizes)}\n"
+            f"Largest hole: {sizes[0]} boundary vertices\n"
+            f"Smallest hole: {sizes[-1]} boundary vertices\n\n"
+            f"Loop sizes (vertices): {sizes[:30]}"
+            + ("\n... showing 30 largest" if len(sizes) > 30 else "")
+        )
+
     def on_uniform_scale_toggled(self, checked):
         """Handle uniform scale checkbox."""
         if checked:
@@ -1302,7 +1276,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         # Load mesh for processing
         self.load_mesh_file(file_path)
 
-    def load_mesh_file(self, file_path):
+    def load_mesh_file(self, file_path, notify=True):
         """Load a mesh file directly (called from other tabs)."""
         if not os.path.exists(file_path):
             QMessageBox.warning(self, "Error", f"File not found:\n{file_path}")
@@ -1327,13 +1301,14 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
                 file_name = os.path.basename(file_path)
                 self.operation_label.setText(f"Loaded: {file_name}")
                 
-                QMessageBox.information(
-                    self,
-                    "Success",
-                    f"Mesh loaded successfully!\n\nFile: {file_name}\n"
-                    f"Vertices: {len(mesh.vertices):,}\n"
-                    f"Faces: {len(mesh.faces):,}"
-                )
+                if notify:
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"Mesh loaded successfully!\n\nFile: {file_name}\n"
+                        f"Vertices: {len(mesh.vertices):,}\n"
+                        f"Faces: {len(mesh.faces):,}"
+                    )
             else:
                 QMessageBox.warning(self, "Error", "Failed to load mesh!")
                 
@@ -1359,38 +1334,44 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         else:
             QMessageBox.warning(self, "No Model", "No model loaded to add to library.")
 
+    def on_percentage_target_toggled(self, checked):
+        """Show which of the two quadric target controls the button will honour."""
+        self.target_faces_spin.setEnabled(not checked)
+        self.target_percentage_spin.setEnabled(checked)
+
     def simplify_quadric(self):
         """Apply quadric simplification using worker thread."""
         if not self.current_model_path:
             QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
             return
             
-        # Get parameters
-        target_faces = self.target_faces_spin.value()
-        # target_percentage = self.target_percentage_spin.value() # Not used in basic call?
+        faces_in_mesh = len(self.current_mesh.faces) if self.current_mesh is not None else 0
+        if self.percentage_target_cb.isChecked():
+            percent = self.target_percentage_spin.value()
+            target_faces = max(1, int(round(faces_in_mesh * percent / 100.0)))
+            self.operation_label.setText(
+                f"Simplifying to {percent:g}% of {faces_in_mesh:,} faces...")
+        else:
+            target_faces = self.target_faces_spin.value()
+            self.operation_label.setText(f"Simplifying to {target_faces:,} faces...")
+            
         preserve_boundary = self.preserve_boundary_cb.isChecked()
         preserve_normal = self.preserve_normal_cb.isChecked()
         preserve_topology = self.preserve_topology_cb.isChecked()
-        
-        self.operation_label.setText(f"Simplifying to {target_faces} faces...")
-        
-        # Define the worker function
-        # Note: We can't access self inside the worker function if we want to be safe, 
-        # but since we are using QRunnable, we can pass args.
-        # However, we need to call self.mesh_processor.simplify.
-        # Ideally, we pass the processor and path.
+        quality_threshold = self.quality_threshold_spin.value()
         
         output_path = self.get_output_path(self.current_model_path, "_simplified")
         
-        def worker_func(processor, path, out_path, faces, boundary, normal, topology, **kwargs):
+        def worker_func(processor, path, out_path, faces, boundary, normal, topology, quality, **kwargs):
             result = processor.simplify(
                 path,
                 out_path,
-                method='quadric',
+                method='faces',
                 target_faces=faces,
                 preserve_boundary=boundary,
                 preserve_normal=normal,
-                preserve_topology=topology
+                preserve_topology=topology,
+                quality_threshold=quality
             )
             return result
 
@@ -1403,7 +1384,8 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
             target_faces,
             preserve_boundary,
             preserve_normal,
-            preserve_topology
+            preserve_topology,
+            quality_threshold
         )
 
     def close_holes(self):
@@ -1418,7 +1400,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_closed")
         
         def worker_func(processor, path, out_path, size, **kwargs):
-            result = processor.repair(path, out_path, method='close_holes', max_hole_size=size)
+            result = processor.repair(path, out_path, operation='fill_holes', max_hole_size=size)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, max_size)
@@ -1434,7 +1416,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_manifold")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='make_manifold')
+            result = processor.repair(path, out_path, operation='make_manifold')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1469,7 +1451,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_smooth")
         
         def worker_func(processor, path, out_path, s, b, **kwargs):
-            result = processor.smooth(path, out_path, method='laplacian', steps=s, boundary=b)
+            result = processor.smooth(path, out_path, method='laplacian', iterations=s, boundary=b)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, steps, boundary)
@@ -1488,7 +1470,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_taubin")
         
         def worker_func(processor, path, out_path, s, l, m, **kwargs):
-            result = processor.smooth(path, out_path, method='taubin', steps=s, lambda_param=l, mu_param=m)
+            result = processor.smooth(path, out_path, method='taubin', iterations=s, lambda_param=l, mu_param=m)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, steps, lam, mu)
@@ -1506,7 +1488,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_depth")
         
         def worker_func(processor, path, out_path, s, t, **kwargs):
-            result = processor.smooth(path, out_path, method='depth', steps=s, threshold=t)
+            result = processor.smooth(path, out_path, method='depth', iterations=s, delta=t)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, steps, threshold)
@@ -1525,7 +1507,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_remesh")
         
         def worker_func(processor, path, out_path, l, i, a, **kwargs):
-            result = processor.remesh(path, out_path, method='uniform', target_len=l, iterations=i, adaptive=a)
+            result = processor.remesh(path, out_path, method='uniform', edge_length=l, iterations=i, adaptive=a)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, length, iters, adaptive)
@@ -1536,16 +1518,16 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
             QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
             return
             
-        samples = self.voronoi_samples_spin.value()
+        threshold = self.voronoi_threshold_spin.value()
         self.operation_label.setText("Voronoi remeshing...")
         
         output_path = self.get_output_path(self.current_model_path, "_voronoi")
         
-        def worker_func(processor, path, out_path, s, **kwargs):
-            result = processor.remesh(path, out_path, method='voronoi', samples=s)
+        def worker_func(processor, path, out_path, t, **kwargs):
+            result = processor.remesh(path, out_path, method='voronoi', threshold=t)
             return result
             
-        self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, samples)
+        self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, threshold)
 
     def apply_subdivision(self):
         """Subdivision asynchronously."""
@@ -1578,26 +1560,19 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         
         if file_path:
             try:
-                # Use mesh processor to save
-                # Assuming save_mesh method exists or using export
-                # For now, we can use trimesh or similar if processor doesn't have it
-                # But let's assume processor has a save/export method
-                # Or we can just copy the current file if no changes were made?
-                # But we likely made changes.
-                
-                # Let's try to use the processor's export/save capability
-                # If not available, we might need to implement it
-                
-                # Assuming mesh_processor has a save_mesh method
-                # If not, we'll need to check src/processing/mesh_processor.py
-                # For now, let's assume it does or we can use the last output path
-                
-                # Actually, we should probably just move the current temp file to the destination
-                import shutil
-                shutil.copy2(self.current_model_path, file_path)
-                
+                result = self.mesh_processor.export(
+                    self.current_model_path, file_path,
+                    include_normals=self.export_normals_cb.isChecked(),
+                    include_textures=self.export_textures_cb.isChecked(),
+                    include_colors=self.export_colors_cb.isChecked(),
+                )
+                if not result.get('success'):
+                    QMessageBox.critical(self, "Error",
+                                         f"Failed to save mesh: {result.get('error', 'Unknown error')}")
+                    return
+                self.operation_label.setText(f"Saved to {os.path.basename(file_path)}")
+                self.add_to_history(f"Save ({os.path.splitext(file_path)[1] or '.obj'})")
                 QMessageBox.information(self, "Success", f"Mesh saved to:\n{file_path}")
-                
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save mesh: {str(e)}")
 
@@ -1613,7 +1588,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_closed_small")
         
         def worker_func(processor, path, out_path, size, **kwargs):
-            result = processor.repair(path, out_path, method='close_holes', max_hole_size=size)
+            result = processor.repair(path, out_path, operation='fill_holes', max_hole_size=size)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, max_size)
@@ -1629,7 +1604,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_manifold_edges")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='remove_non_manifold_edges')
+            result = processor.repair(path, out_path, operation='repair_non_manifold_edges')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1645,7 +1620,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_manifold_verts")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='remove_non_manifold_vertices')
+            result = processor.repair(path, out_path, operation='repair_non_manifold_vertices')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1662,7 +1637,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_dedup")
         
         def worker_func(processor, path, out_path, thresh, **kwargs):
-            result = processor.repair(path, out_path, method='remove_duplicates', threshold=thresh)
+            result = processor.repair(path, out_path, operation='remove_duplicates', threshold=thresh)
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, threshold)
@@ -1678,7 +1653,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_no_degen")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='remove_degenerate_faces')
+            result = processor.repair(path, out_path, operation='remove_degenerate')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1694,7 +1669,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_clean_verts")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='remove_unreferenced_vertices')
+            result = processor.repair(path, out_path, operation='remove_unreferenced')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1710,7 +1685,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_fixed_normals")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='fix_normals')
+            result = processor.repair(path, out_path, operation='fix_normals')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1726,7 +1701,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         output_path = self.get_output_path(self.current_model_path, "_inverted")
         
         def worker_func(processor, path, out_path, **kwargs):
-            result = processor.repair(path, out_path, method='invert_normals')
+            result = processor.repair(path, out_path, operation='invert_normals')
             return result
             
         self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path)
@@ -1738,15 +1713,17 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
             return
             
         angle = self.planar_angle_spin.value()
+        target_faces = self.planar_target_faces_spin.value()
         self.operation_label.setText("Planar simplification...")
         
         output_path = self.get_output_path(self.current_model_path, "_planar")
         
-        def worker_func(processor, path, out_path, ang, **kwargs):
-            result = processor.simplify(path, out_path, method='planar', angle=ang)
+        def worker_func(processor, path, out_path, ang, faces, **kwargs):
+            result = processor.simplify(path, out_path, method='planar', angle=ang, target_faces=faces)
             return result
             
-        self.execute_async(worker_func, self.mesh_processor, self.current_model_path, output_path, angle)
+        self.execute_async(worker_func, self.mesh_processor, self.current_model_path,
+                           output_path, angle, target_faces)
 
     def apply_transform(self):
         """Apply translation, rotation, and scale."""
@@ -1891,7 +1868,9 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
             self.history_list.addItem(f"{i+1}. {op}")
 
     def execute_async(self, func, *args, **kwargs):
-        """Execute a function asynchronously using QThreadPool."""
+        """Execute a function asynchronously, remembering its input for undo."""
+        self._pending_source = self.current_model_path
+        self._pending_label = self.operation_label.text().rstrip(".") or "Mesh operation"
         worker = Worker(func, *args, **kwargs)
         worker.signals.result.connect(self.on_operation_completed)
         worker.signals.error.connect(self.on_operation_error)
@@ -1902,11 +1881,92 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         """Handle async operation completion."""
         if isinstance(result, dict):
             if result.get('success'):
-                self.operation_label.setText("Operation completed successfully")
-                if 'output_path' in result:
-                    self.load_mesh_file(result['output_path'])
+                output_path = result.get('output_path')
+                if output_path:
+                    self.operation_label.setText(
+                        f"{self._pending_label}: {os.path.basename(output_path)}")
+                    self.undo_steps.append((self._pending_source, self._pending_label))
+                    self.add_to_history(f"{self._pending_label} -> {os.path.basename(output_path)}")
+                    self.load_mesh_file(output_path, notify=False)
+                else:
+                    self.operation_label.setText("Operation completed successfully")
             else:
                 self.operation_label.setText(f"Error: {result.get('error', 'Unknown error')}")
+
+    def undo_last(self):
+        """Reload the mesh as it was before the last completed operation."""
+        if not self.undo_steps:
+            QMessageBox.information(self, "Undo", "There is nothing to undo.")
+            return
+
+        source, label = self.undo_steps.pop()
+        if self.processing_history:
+            self.processing_history.pop()
+            self.update_operation_history()
+
+        if source and os.path.exists(source):
+            self.load_mesh_file(source, notify=False)
+            self.operation_label.setText(f"Undo {label}: {os.path.basename(source)}")
+        else:
+            self.operation_label.setText(f"Undo failed for {label}: file no longer exists")
+
+    def clear_history(self):
+        """Drop the recorded operations and the undo trail with them."""
+        self.processing_history.clear()
+        self.undo_steps.clear()
+        self.history_list.clear()
+        self.operation_label.setText("History cleared")
+
+    def export_to_format(self, extension):
+        """Write the current mesh in one format, honouring the export options."""
+        if not self.current_model_path:
+            QMessageBox.warning(self, "No Mesh", "Please load a mesh first")
+            return
+
+        suggested = os.path.splitext(self.current_model_path)[0] + extension
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, f"Export {extension.upper()}", suggested,
+            f"{extension.upper()} files (*{extension})")
+        if not file_path:
+            return
+        if not file_path.lower().endswith(extension):
+            file_path += extension
+
+        result = self.mesh_processor.export(
+            self.current_model_path, file_path,
+            include_normals=self.export_normals_cb.isChecked(),
+            include_textures=self.export_textures_cb.isChecked(),
+            include_colors=self.export_colors_cb.isChecked())
+        if result.get('success'):
+            self.add_to_history(f"Exported {os.path.basename(file_path)}")
+            self.operation_label.setText(f"Exported {os.path.basename(file_path)}")
+            QMessageBox.information(self, "Success", f"Exported to:\n{file_path}")
+        else:
+            QMessageBox.critical(self, "Error", f"Export failed: {result.get('error')}")
+
+    def reset_view(self):
+        """Re-render the preview from the default camera."""
+        self.viewer.reset_view()
+        self.operation_label.setText("View reset")
+
+    def take_screenshot(self):
+        """Save the preview image that is currently on screen."""
+        pixmap = self.viewer.image_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            QMessageBox.information(self, "Screenshot", "There is no preview image to save yet.")
+            return
+
+        base = os.path.splitext(self.current_model_path or "renderfox_preview")[0] + "_preview.png"
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Preview", base, "PNG (*.png)")
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".png"):
+            file_path += ".png"
+
+        if pixmap.save(file_path, "PNG"):
+            self.operation_label.setText(f"Preview saved to {os.path.basename(file_path)}")
+        else:
+            QMessageBox.critical(self, "Error", "Could not write the image file.")
         
     def on_operation_error(self, error_msg):
         """Handle async operation error."""

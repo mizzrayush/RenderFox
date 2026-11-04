@@ -53,3 +53,9 @@ tests/scope.txt
 tests/test_output.txt
 tests/test_log.txt
 tests/verify_output*.txt
+
+# artefacts written by the test suites
+*.mtl
+tests/test_data/repaired.obj
+tests/test_data/simplified.obj
+output/library.db

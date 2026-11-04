@@ -50,6 +50,12 @@ SUITES = [
         "description": "Validates hole filling, duplicate vertex removal, topology scoring, and format conversion"
     },
     {
+        "id": "mesh_tools_contract",
+        "name": "Mesh Tools UI-to-Backend Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_mesh_tools_contract.py")],
+        "description": "Clicks every Mesh Tools control and requires a written mesh, a report, an undo step or an export from it"
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
