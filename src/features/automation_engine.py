@@ -92,43 +92,45 @@ class ActionRegistry:
         }
     
     @classmethod
-    def execute(cls, action_id: str, **kwargs) -> Dict[str, Any]:
-        """Execute an action by ID."""
+    def validate(cls, action_id: str, params: Dict[str, Any]) -> List[str]:
+        """Every way this parameter set fails this action, each one a sentence.
+
+        The registry is the only place that knows what an action takes, so the task pane,
+        the workflow builder and `execute` itself all read their complaints from here
+        instead of each keeping a private copy of the rules.
+        """
         if action_id not in cls._actions:
-            return {'success': False, 'error': f'Action {action_id} not found'}
-            
+            return [f"nothing is registered as '{action_id}', so there is no step that can run it"]
+        spec = cls._param_specs.get(action_id) or {}
+        checks = {'str': str, 'int': int, 'float': (int, float), 'bool': bool}
+        params = params or {}
+        complaints = []
+        for name, rule in spec.items():
+            if rule.get('required') and name not in params:
+                complaints.append(f"{action_id} needs a value for '{name}'")
+            elif name in params:
+                expected = checks.get(rule.get('type'))
+                if expected and not isinstance(params[name], expected):
+                    complaints.append(f"'{name}' must be {rule.get('type')}, "
+                                      f"not {type(params[name]).__name__}")
+        unknown = sorted(key for key in params if key not in spec)
+        if unknown:
+            complaints.append(f"{action_id} has no parameter named: " + ', '.join(unknown))
+        return complaints
+
+    @classmethod
+    def execute(cls, action_id: str, **kwargs) -> Dict[str, Any]:
+        """Run an action, or report the first reason it would not run."""
+        complaints = cls.validate(action_id, kwargs)
+        if complaints:
+            return {'success': False, 'error': complaints[0]}
         try:
-            func = cls._actions[action_id]
-            specs = cls._param_specs.get(action_id, {})
-            
-            # Validate parameters
-            for param_name, spec in specs.items():
-                if spec.get('required', False) and param_name not in kwargs:
-                    return {'success': False, 'error': f'Missing required parameter: {param_name}'}
-                
-                if param_name in kwargs:
-                    value = kwargs[param_name]
-                    param_type = spec.get('type')
-                    if param_type:
-                        if param_type == 'str' and not isinstance(value, str):
-                             return {'success': False, 'error': f'Parameter {param_name} must be a string'}
-                        elif param_type == 'int' and not isinstance(value, int):
-                             return {'success': False, 'error': f'Parameter {param_name} must be an integer'}
-                        elif param_type == 'float' and not isinstance(value, (int, float)):
-                             return {'success': False, 'error': f'Parameter {param_name} must be a number'}
-                        elif param_type == 'bool' and not isinstance(value, bool):
-                             return {'success': False, 'error': f'Parameter {param_name} must be a boolean'}
-            
-            result = func(**kwargs)
-            
-            # Ensure result is a dict with success flag
-            if isinstance(result, dict) and 'success' in result:
-                return result
-            
-            return {'success': True, 'result': result}
-            
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+            result = cls._actions[action_id](**kwargs)
+        except Exception as error:
+            return {'success': False, 'error': str(error)}
+        if isinstance(result, dict) and 'success' in result:
+            return result
+        return {'success': True, 'result': result}
 
     @classmethod
     def register_default_actions(cls):
@@ -143,6 +145,9 @@ class ActionRegistry:
         def copy_file(source: str, destination: str):
             if not os.path.isfile(source):
                 raise FileNotFoundError(f"there is no file to copy at {source}")
+            folder = os.path.dirname(destination)
+            if folder and not os.path.isdir(folder):
+                os.makedirs(folder, exist_ok=True)  # a pipeline stages into a folder it creates
             size = os.path.getsize(source)
             shutil.copy2(source, destination)
             if not os.path.isfile(destination) or os.path.getsize(destination) != size:
@@ -157,6 +162,9 @@ class ActionRegistry:
         def move_file(source: str, destination: str):
             if not os.path.isfile(source):
                 raise FileNotFoundError(f"there is no file to move at {source}")
+            folder = os.path.dirname(destination)
+            if folder and not os.path.isdir(folder):
+                os.makedirs(folder, exist_ok=True)  # a pipeline stages into a folder it creates
             shutil.move(source, destination)
             if os.path.exists(source) or not os.path.isfile(destination):
                 raise RuntimeError(f"{source} is still where it was and {destination} is not a file")
@@ -258,46 +266,47 @@ class ActionRegistry:
 
 
 class WorkflowStep:
-    """Represents a single step in a workflow."""
-    
+    """One step: a registry action, the parameters for it, and what to do if it fails."""
+
+    ON_ERROR = ('stop', 'continue', 'retry')
+
     def __init__(self, name: str, action: str, parameters: Dict = None,
-                 condition: str = "always", on_error: str = "stop"):
+                 on_error: str = "stop", max_retries: int = 3):
         self.step_id = str(uuid.uuid4())
         self.name = name
-        self.action = action  # Action to perform
+        self.action = action  # an id ActionRegistry resolves
         self.parameters = parameters or {}
-        self.condition = condition  # Condition to execute this step
-        self.on_error = on_error  # "stop", "continue", "retry"
-        self.retry_count = 0
-        self.max_retries = 3
+        self.on_error = on_error if on_error in self.ON_ERROR else 'stop'
+        try:
+            self.max_retries = max(0, int(max_retries))
+        except (TypeError, ValueError):
+            self.max_retries = 3
         self.status = TaskStatus.PENDING
         self.result = None
         self.error = None
-    
+
     def to_dict(self) -> Dict:
-        """Convert step to dictionary."""
+        """Store what a step *is*; a step's run-time status belongs to the run, not the file."""
         return {
             'step_id': self.step_id,
             'name': self.name,
             'action': self.action,
             'parameters': self.parameters,
-            'condition': self.condition,
             'on_error': self.on_error,
             'max_retries': self.max_retries
         }
-    
+
     @staticmethod
     def from_dict(data: Dict) -> 'WorkflowStep':
-        """Create step from dictionary."""
+        data = data or {}
         step = WorkflowStep(
-            name=data['name'],
-            action=data['action'],
-            parameters=data.get('parameters', {}),
-            condition=data.get('condition', 'always'),
-            on_error=data.get('on_error', 'stop')
+            name=data.get('name') or data.get('action') or 'Step',
+            action=data.get('action') or '',
+            parameters=data.get('parameters') or {},
+            on_error=data.get('on_error', 'stop'),
+            max_retries=data.get('max_retries', 3)
         )
-        step.step_id = data.get('step_id', str(uuid.uuid4()))
-        step.max_retries = data.get('max_retries', 3)
+        step.step_id = data.get('step_id') or str(uuid.uuid4())
         return step
 
 
@@ -357,8 +366,8 @@ class AutomationTask:
 
 
 class Workflow:
-    """Represents a workflow with multiple steps."""
-    
+    """A named list of steps, plus the verdict of the last run."""
+
     def __init__(self, name: str, description: str = ""):
         self.workflow_id = str(uuid.uuid4())
         self.name = name
@@ -368,20 +377,19 @@ class Workflow:
         self.modified_at = datetime.now()
         self.status = TaskStatus.PENDING
         self.current_step = 0
-        self.variables = {}  # Workflow-level variables
-    
+        self.error = None
+
     def add_step(self, step: WorkflowStep):
-        """Add a step to the workflow."""
+        """Append a step and note the edit."""
         self.steps.append(step)
         self.modified_at = datetime.now()
-    
+
     def remove_step(self, step_id: str):
-        """Remove a step from the workflow."""
+        """Drop the step carrying this id."""
         self.steps = [s for s in self.steps if s.step_id != step_id]
         self.modified_at = datetime.now()
-    
+
     def to_dict(self) -> Dict:
-        """Convert workflow to dictionary."""
         return {
             'workflow_id': self.workflow_id,
             'name': self.name,
@@ -389,23 +397,30 @@ class Workflow:
             'steps': [step.to_dict() for step in self.steps],
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'modified_at': self.modified_at.isoformat() if self.modified_at else None,
-            'variables': self.variables
+            'status': self.status.value,
+            'current_step': self.current_step,
+            'error': self.error
         }
-    
+
     @staticmethod
     def from_dict(data: Dict) -> 'Workflow':
-        """Create workflow from dictionary."""
+        data = data or {}
         workflow = Workflow(
-            name=data['name'],
-            description=data.get('description', '')
+            name=data.get('name') or 'Untitled workflow',
+            description=data.get('description') or ''
         )
-        workflow.workflow_id = data['workflow_id']
-        workflow.variables = data.get('variables', {})
-        
+        workflow.workflow_id = data.get('workflow_id') or str(uuid.uuid4())
         for step_data in data.get('steps', []):
-            step = WorkflowStep.from_dict(step_data)
-            workflow.add_step(step)
-        
+            workflow.add_step(WorkflowStep.from_dict(step_data))
+        workflow.status = TaskStatus(data.get('status', 'pending'))
+        workflow.current_step = data.get('current_step', 0)
+        workflow.error = data.get('error')
+        saved = data.get('modified_at')
+        if saved:
+            try:
+                workflow.modified_at = datetime.fromisoformat(saved)
+            except (TypeError, ValueError):
+                pass
         return workflow
 
 
@@ -690,7 +705,7 @@ class FileWatcher(QObject):
 
         info = self.watched_directories.get(path)
         if info is None:
-            info = {'callbacks': [], 'last_modified': {}}
+            info = {'callbacks': [], 'last_modified': {}, 'pending_gone': {}}
             self.watched_directories[path] = info
         info['file_pattern'] = _glob_list(file_pattern)
         info['exclude_patterns'] = _glob_list(exclude_patterns)
@@ -699,6 +714,7 @@ class FileWatcher(QObject):
         # Record the baseline here rather than on the thread's first pass: a file that
         # lands between this call and that pass is an event, not part of what was
         # already there. Re-registering a folder re-baselines it with its new filters.
+        info['pending_gone'] = {}
         info['last_modified'] = self._snapshot(path, info)
 
         if callback is not None:
@@ -760,30 +776,50 @@ class FileWatcher(QObject):
     def _diff(self, info: Dict[str, Any], current: Dict[str, tuple]) -> List[tuple]:
         """What changed since the last pass, as (event, path, other_path) tuples.
 
-        A file that left one path and appeared at another in the same pass with the same
-        mtime and size is reported as moved rather than deleted plus created; that is the
-        only way a polling watcher can tell the two apart, and it is what the tab's
-        "File Moved" checkbox asks for.
+        A file that left one path and appeared at another with the same mtime and size is
+        reported as moved rather than deleted plus created; that is the only way a polling
+        watcher can tell the two apart, and it is what the tab's "File Moved" checkbox
+        asks for.
 
-        The folder's baseline was recorded when it was registered, so what was already
-        on disk when watching started is never announced as created.
+        A vanishing is held for one pass before it is called a deletion. os.listdir can
+        catch a rename halfway through, with the old name already gone and the new one not
+        yet visible, and without the hold that single rename is announced twice, as a
+        deletion now and a creation one poll later. The price is that a real deletion
+        reaches the log one poll late; the alternative is a log that lies about renames.
+
+        The folder's baseline was recorded when it was registered, so what was already on
+        disk when watching started is never announced as created.
         """
         known = info['last_modified']
+        holds = info['pending_gone']
 
         appeared = [p for p in current if p not in known]
         vanished = [p for p in known if p not in current]
 
         events: List[tuple] = []
-        for old in list(vanished):
-            match = next((new for new in appeared if current[new] == known[old]), None)
+        # Last pass's open questions are answered first: a held path whose exact bytes have
+        # surfaced elsewhere was a rename, never a deletion.
+        for old in list(holds):
+            match = next((p for p in appeared
+                          if p != old and current[p] == holds[old]), None)
             if match is None:
+                events.append(('deleted', old, None))
+            else:
+                appeared.remove(match)
+                events.append(('moved', match, old))
+            holds.pop(old)
+
+        # A vanishing in this pass has one pass to produce a twin before it is called a loss.
+        for old in list(vanished):
+            match = next((p for p in appeared if current[p] == known[old]), None)
+            if match is None:
+                holds[old] = known[old]
+                vanished.remove(old)
                 continue
             appeared.remove(match)
             vanished.remove(old)
             events.append(('moved', match, old))
 
-        for old in vanished:
-            events.append(('deleted', old, None))
         for new in appeared:
             events.append(('created', new, None))
         for path in current:
@@ -834,64 +870,83 @@ class FileWatcher(QObject):
                 print(f"Watch callback failed for {file_path}: {error}")
 
 class WorkflowExecutor:
-    """Execute workflow steps sequentially."""
-    
+    """Run a workflow's steps in order, honouring each step's own error policy."""
+
     def __init__(self, task_executor=None):
         self.task_executor = task_executor
-        
-    def execute_workflow(self, workflow: Workflow, callback: Optional[Callable] = None) -> bool:
-        """Execute workflow steps."""
-        results = []
-        
-        for step_idx, step in enumerate(workflow.steps):
-            step_name = step.get('name', f'Step {step_idx + 1}')
-            task_type = step.get('task_type')
-            parameters = step.get('parameters', {})
-            
-            print(f"Executing workflow step: {step_name}")
-            
-            # Execute step
-            result = self._execute_step(task_type, parameters)
-            
-            if not result.get('success', False):
-                # Step failed
-                if callback:
-                    callback(False, {
-                        'workflow': workflow.name,
-                        'failed_step': step_name,
-                        'error': result.get('error', 'Unknown error')
-                    })
-                return False
-            
-            results.append(result)
-            
-            # Check if there's a delay before next step
-            delay = step.get('delay', 0)
-            if delay > 0:
-                time.sleep(delay)
-        
-        # All steps completed
+
+    def execute_workflow(self, workflow: Workflow, callback: Optional[Callable] = None,
+                         progress: Optional[Callable] = None,
+                         should_stop: Optional[Callable] = None) -> bool:
+        """Every step in order, then one honest verdict.
+
+        The loop used to call `step.get('name')` on `WorkflowStep` objects, so the first
+        step raised AttributeError inside the worker thread and no workflow could ever
+        finish - and because the engine emitted `workflow_completed` with three arguments
+        into a two-argument signal, nothing reached the pane either way.
+        """
+        total = len(workflow.steps)
+        if total == 0:
+            return self._finish(workflow, callback, False,
+                                {'workflow': workflow.name,
+                                 'error': 'this workflow has no steps to run'})
+
+        completed = 0
+        tolerated = []
+        for index, step in enumerate(workflow.steps):
+            if should_stop and should_stop():
+                step.status = TaskStatus.CANCELLED
+                return self._finish(workflow, callback, False, {
+                    'workflow': workflow.name, 'stopped': True,
+                    'error': f"stopped before '{step.name}' (step {index + 1} of {total})",
+                    'steps_completed': completed}, status=TaskStatus.CANCELLED)
+
+            if progress:
+                progress(index + 1, total, step.name)
+            workflow.current_step = index + 1
+            step.error = None
+            step.result = None
+            step.status = TaskStatus.RUNNING
+
+            attempts = 0
+            while True:
+                outcome = ActionRegistry.execute(step.action, **step.parameters)
+                step.result = outcome
+                if outcome.get('success'):
+                    step.status = TaskStatus.COMPLETED
+                    completed += 1
+                    break
+                attempts += 1
+                step.error = str(outcome.get('error') or 'the action gave no reason')
+                step.status = TaskStatus.FAILED
+                if step.on_error == 'retry' and attempts <= step.max_retries:
+                    continue
+                break
+
+            if step.status == TaskStatus.COMPLETED:
+                continue
+            if step.on_error == 'continue':
+                tolerated.append(f"{step.name}: {step.error}")
+                continue
+            return self._finish(workflow, callback, False, {
+                'workflow': workflow.name, 'failed_step': step.name,
+                'error': step.error, 'steps_completed': completed,
+                'tolerated_failures': list(tolerated)})
+
+        return self._finish(workflow, callback, True, {
+            'workflow': workflow.name, 'steps_completed': completed,
+            'total_steps': total, 'tolerated_failures': tolerated})
+
+    @staticmethod
+    def _finish(workflow: Workflow, callback, success: bool, result: Dict,
+                status=None) -> bool:
+        """Record the verdict on the workflow, then hand it to whoever asked."""
+        result = dict(result, success=success)
+        workflow.status = status or (TaskStatus.COMPLETED if success else TaskStatus.FAILED)
+        workflow.error = None if success else result.get('error')
         if callback:
-            callback(True, {
-                'workflow': workflow.name,
-                'steps_completed': len(results),
-                'results': results
-            })
-        
-        return True
-    
-    def _execute_step(self, task_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a single workflow step."""
-        # Use ActionRegistry to execute the action
-        # In workflow steps, 'action' field usually maps to 'task_type' here
-        # But wait, WorkflowStep has 'action' field, while Task has 'task_type'.
-        # The execute_workflow method extracts 'task_type' from step.get('task_type').
-        # Let's assume 'task_type' is the action ID in the registry.
-        
-        if not task_type:
-            return {'success': False, 'error': 'No task type/action specified'}
-            
-        return ActionRegistry.execute(task_type, **parameters)
+            callback(success, result)
+        return success
 
 
 class BatchProcessor(QObject):
@@ -1021,6 +1076,10 @@ class AutomationEngine(QObject):
         self.tasks: Dict[str, AutomationTask] = {}
         self.workflows: Dict[str, Workflow] = {}
         self.triggers: Dict[str, Dict[str, Any]] = {}
+
+        # Workflows the user asked to stop; the worker checks this before
+        # each step, because a python thread cannot be killed from outside.
+        self._stopped: set = set()
         
         # Load saved workflows and tasks
         ActionRegistry.register_default_actions()
@@ -1209,42 +1268,129 @@ class AutomationEngine(QObject):
         return self.scheduler.next_run(task_id)
 
 
-    def create_workflow(self, name: str, description: str, steps: List[Dict[str, Any]]) -> str:
-        """Create a new workflow."""
-        workflow_id = f"workflow_{int(time.time() * 1000)}"
-        
-        workflow = Workflow(
-            workflow_id=workflow_id,
-            name=name,
-            description=description,
-            steps=steps
-        )
-        
-        self.workflows[workflow_id] = workflow
+    def create_workflow(self, name: str, description: str,
+                       steps: List[Dict[str, Any]]) -> str:
+        """Store a workflow built from step records, and return the id it owns."""
+        workflow = Workflow(name=name, description=description or '')
+        self._apply_steps(workflow, steps)
+        self.workflows[workflow.workflow_id] = workflow
         self._save_workflows()
-        
-        return workflow_id
-    
-    def execute_workflow(self, workflow_id: str) -> bool:
-        """Execute a workflow."""
+        return workflow.workflow_id
+
+    def update_workflow(self, workflow_id: str, name: str = None, description: str = None,
+                        steps: List[Dict[str, Any]] = None) -> bool:
+        """Change the parts that were given; leave the rest of the workflow alone."""
+        workflow = self.workflows.get(workflow_id)
+        if workflow is None:
+            return False
+        if name is not None:
+            workflow.name = name
+        if description is not None:
+            workflow.description = description
+        if steps is not None:
+            self._apply_steps(workflow, steps)
+        workflow.modified_at = datetime.now()
+        self._save_workflows()
+        return True
+
+    @staticmethod
+    def _apply_steps(workflow: Workflow, steps: List[Dict[str, Any]]):
+        workflow.steps = []
+        for record in steps or []:
+            workflow.add_step(WorkflowStep.from_dict(record)
+                              if isinstance(record, dict) else record)
+
+    def delete_workflow(self, workflow_id: str) -> bool:
+        """Take a workflow out of the list and the file."""
         if workflow_id not in self.workflows:
             return False
-        
-        workflow = self.workflows[workflow_id]
-        
+        self.stop_workflow(workflow_id)
+        del self.workflows[workflow_id]
+        self._save_workflows()
+        return True
+
+    def duplicate_workflow(self, workflow_id: str) -> Optional[str]:
+        """Copy a workflow, steps and all, under a fresh id."""
+        source = self.workflows.get(workflow_id)
+        if source is None:
+            return None
+        copy = Workflow.from_dict(source.to_dict())
+        copy.workflow_id = str(uuid.uuid4())
+        copy.name = f"{source.name} copy"
+        copy.status = TaskStatus.PENDING
+        copy.error = None
+        copy.current_step = 0
+        for step in copy.steps:
+            step.step_id = str(uuid.uuid4())
+        self.workflows[copy.workflow_id] = copy
+        self._save_workflows()
+        return copy.workflow_id
+
+    @staticmethod
+    def workflow_problems(name: str, steps: List[Dict[str, Any]]) -> List[str]:
+        """Every reason this workflow could not run, said before any of it runs."""
+        complaints = []
+        if not (name or '').strip():
+            complaints.append('a workflow needs a name')
+        if not steps:
+            complaints.append('a workflow needs at least one step to run')
+        for index, record in enumerate(steps or [], start=1):
+            action = (record.get('action') or '').strip()
+            label = (record.get('name') or '').strip() or f"step {index}"
+            if not action:
+                complaints.append(f"'{label}' names no action")
+                continue
+            for one in ActionRegistry.validate(action, record.get('parameters') or {}):
+                complaints.append(f"'{label}': {one}")
+            if (record.get('on_error') or 'stop') not in WorkflowStep.ON_ERROR:
+                complaints.append(f"'{label}' has on_error "
+                                  f"'{record.get('on_error')}', which is not one of "
+                                  f"{', '.join(WorkflowStep.ON_ERROR)}")
+        return complaints
+
+    def execute_workflow(self, workflow_id: str) -> bool:
+        """Run a stored workflow on its own thread; the signals carry the verdict."""
+        workflow = self.workflows.get(workflow_id)
+        if workflow is None:
+            return False
+        if not workflow.steps:
+            self.workflow_failed.emit(workflow_id, 'this workflow has no steps to run')
+            return False
+
+        self._stopped.discard(workflow_id)
+        workflow.status = TaskStatus.RUNNING
+        workflow.error = None
+        workflow.current_step = 0
         self.workflow_started.emit(workflow_id)
-        
-        def completion_callback(success, result):
-            self.workflow_completed.emit(workflow_id, success, result)
-        
-        # Execute in thread to avoid blocking
+
+        def progress(current, total, step_name):
+            self.workflow_progress.emit(workflow_id, current, total, step_name)
+
+        def completion(success, result):
+            self._save_workflows()
+            if success:
+                self.workflow_completed.emit(workflow_id, result)
+            else:
+                reason = result.get('error') or 'the workflow failed'
+                if result.get('stopped'):
+                    self.workflow_completed.emit(workflow_id, result)
+                else:
+                    self.workflow_failed.emit(workflow_id, reason)
+
         thread = threading.Thread(
             target=self.workflow_executor.execute_workflow,
-            args=(workflow, completion_callback),
+            args=(workflow, completion, progress,
+                  lambda: workflow_id in self._stopped),
             daemon=True
         )
         thread.start()
-        
+        return True
+
+    def stop_workflow(self, workflow_id: str) -> bool:
+        """Ask a running workflow to stop at the next step boundary."""
+        if workflow_id not in self.workflows:
+            return False
+        self._stopped.add(workflow_id)
         return True
     
     def create_trigger(self, name: str, trigger_type: TriggerType, 

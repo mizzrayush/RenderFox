@@ -110,6 +110,12 @@ SUITES = [
         "description": "Schedules a real task, waits for the polling thread to fire it and requires the run, the saved record, the next-run time, the exit code of a real command and every scheduler button to be true rather than a printed claim"
     },
     {
+        "id": "automation_workflows_contract",
+        "name": "Automation Workflow Builder Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_automation_workflows_contract.py")],
+        "description": "Runs a workflow end to end, requires the copy on disk, the retry count, the tolerated failure, the stop between steps and every builder button - Save, Load, Duplicate, Delete, Move, Test, Stop - to reach the engine or name why not"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

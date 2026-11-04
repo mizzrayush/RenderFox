@@ -17,65 +17,23 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
                              QListWidget, QTreeWidget, QTreeWidgetItem, QPlainTextEdit,
                              QFileDialog, QMessageBox, QTimeEdit, QDateEdit)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QTime, QDate
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QTime, QDate
 from PyQt6.QtGui import QFont, QColor, QIcon
 from .icon_provider import get_icon
 
 # Import automation engine
 from ..features.automation_engine import (
-    AutomationEngine, FileWatcher, WorkflowExecutor,
-    Workflow, WorkflowStep, BatchProcessor, ActionRegistry
+    AutomationEngine, FileWatcher, WorkflowStep, BatchProcessor, ActionRegistry
 )
 
 
 BACKUP_SUBFOLDER = ".renderfox_backups"
 
 
-class WorkflowExecutionThread(QThread):
-    """Thread for executing automation workflows."""
-    
-    progress_updated = pyqtSignal(int, str)
-    workflow_completed = pyqtSignal(bool, str)
-    
-    def __init__(self, workflow_data):
-        super().__init__()
-        self.workflow_data = workflow_data
-        
-    def run(self):
-        """Execute the workflow."""
-        try:
-            steps = self.workflow_data.get('steps', [])
-            total_steps = len(steps)
-            
-            for i, step in enumerate(steps):
-                step_name = step.get('name', f'Step {i+1}')
-                self.progress_updated.emit(int((i / total_steps) * 100), f"Executing: {step_name}")
-                
-                # Real execution
-                action_id = step.get('action') or step.get('task_type')
-                params = step.get('parameters', {})
-                
-                if action_id:
-                    result = ActionRegistry.execute(action_id, **params)
-                    if not result.get('success', False):
-                        raise Exception(result.get('error', 'Unknown error'))
-                else:
-                    # Simulation fallback
-                    self.msleep(500)
-                
-            self.progress_updated.emit(100, "Workflow completed")
-            self.workflow_completed.emit(True, "Workflow completed successfully")
-            
-        except Exception as e:
-            self.workflow_completed.emit(False, f"Workflow failed: {str(e)}")
-
 class AutomationTab(QWidget):
     """Automation and workflow management interface."""
     
-    workflow_started = pyqtSignal(str)
     auto_actions_finished = pyqtSignal(str, list)
-    workflow_completed = pyqtSignal(str, bool)
-    task_scheduled = pyqtSignal(str, dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,7 +41,7 @@ class AutomationTab(QWidget):
         # Initialize automation engine
         self.automation_engine = AutomationEngine()
         self.file_watcher = FileWatcher()
-        self.workflow_executor = WorkflowExecutor()
+        # The engine runs workflows on its own executor; the pane only tracks what it started.
         self.batch_processor = BatchProcessor()
         
         # Connect engine signals
@@ -109,9 +67,13 @@ class AutomationTab(QWidget):
         self._library = None
         self._task_rows = []
         self.current_task_id = None
+        self._rebuilding_list = False
+        self.current_workflow_id = None
+        self._workflow_rows = []
+        self._running_workflow = None
         self.init_ui()
         self.setup_connections()
-        self.load_sample_data()
+        self.refresh_workflow_list()
         self.refresh_task_table()
         self._update_schedule_controls()
 
@@ -179,7 +141,7 @@ class AutomationTab(QWidget):
         toolbar_row1.setSpacing(6)
         self.new_workflow_btn = QPushButton("New")
         self.new_workflow_btn.setIcon(get_icon("add"))
-        self.new_workflow_btn.setToolTip("Create new workflow")
+        self.new_workflow_btn.setToolTip("Clear the editor and start a workflow")
         
         self.duplicate_workflow_btn = QPushButton("Duplicate")
         self.duplicate_workflow_btn.setIcon(get_icon("models"))
@@ -198,11 +160,11 @@ class AutomationTab(QWidget):
         toolbar_row2.setSpacing(6)
         self.load_workflow_btn = QPushButton("Load")
         self.load_workflow_btn.setIcon(get_icon("folder"))
-        self.load_workflow_btn.setToolTip("Load workflow from file")
+        self.load_workflow_btn.setToolTip("Read a workflow file into the app")
         
         self.save_workflow_btn = QPushButton("Save")
         self.save_workflow_btn.setIcon(get_icon("backup"))
-        self.save_workflow_btn.setToolTip("Save workflow to file")
+        self.save_workflow_btn.setToolTip("Store this workflow in the app")
         
         toolbar_row2.addWidget(self.load_workflow_btn)
         toolbar_row2.addWidget(self.save_workflow_btn)
@@ -211,13 +173,6 @@ class AutomationTab(QWidget):
         # Workflows list (expanding to fill left column)
         self.workflows_list = QListWidget()
         self.workflows_list.setAlternatingRowColors(True)
-        self.workflows_list.addItems([
-            "Model Conversion Pipeline",
-            "Batch LOD Generation",
-            "Texture Optimization",
-            "Quality Assurance Check",
-            "Daily Report Generation"
-        ])
         workflows_layout.addWidget(self.workflows_list)
         
         left_layout.addWidget(workflows_group)
@@ -261,8 +216,9 @@ class AutomationTab(QWidget):
         
         # Steps Table (Expanding vertical height for plenty of visible rows!)
         self.steps_table = QTableWidget()
-        self.steps_table.setColumnCount(4)
-        self.steps_table.setHorizontalHeaderLabels(["#", "Action", "Parameters", "Condition"])
+        self.steps_table.setColumnCount(5)
+        self.steps_table.setHorizontalHeaderLabels(["#", "Step", "Action", "Parameters",
+                                                    "On error"])
         self.steps_table.setMinimumHeight(240)
         self.steps_table.setAlternatingRowColors(True)
         self.steps_table.verticalHeader().setDefaultSectionSize(34)
@@ -270,10 +226,12 @@ class AutomationTab(QWidget):
         self.steps_table.horizontalHeader().setStretchLastSection(False)
         self.steps_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.steps_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.steps_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.steps_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.steps_table.setColumnWidth(1, 180)
-        self.steps_table.setColumnWidth(3, 140)
+        self.steps_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.steps_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.steps_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.steps_table.setColumnWidth(1, 150)
+        self.steps_table.setColumnWidth(2, 230)
+        self.steps_table.setColumnWidth(4, 110)
         details_layout.addWidget(self.steps_table)
         
         # Bottom controls toolbar
@@ -302,10 +260,13 @@ class AutomationTab(QWidget):
         
         self.run_workflow_btn = QPushButton("Run Workflow")
         self.run_workflow_btn.setIcon(get_icon("rendering"))
+        self.run_workflow_btn.setToolTip("Save this workflow and run it")
+        self.test_workflow_btn.setToolTip("Check every step without running any of it")
         self.run_workflow_btn.setProperty("primary", "true")
         
         self.stop_workflow_btn = QPushButton("Stop")
         self.stop_workflow_btn.setIcon(get_icon("delete"))
+        self.stop_workflow_btn.setToolTip("Stop after the step now running")
         self.stop_workflow_btn.setEnabled(False)
         
         bottom_toolbar.addWidget(self.test_workflow_btn)
@@ -1049,8 +1010,17 @@ class AutomationTab(QWidget):
         # Workflow builder
         self.workflows_list.itemSelectionChanged.connect(self.load_workflow_details)
         self.new_workflow_btn.clicked.connect(self.new_workflow)
+        self.save_workflow_btn.clicked.connect(self.save_workflow)
+        self.load_workflow_btn.clicked.connect(self.load_workflow_file)
+        self.duplicate_workflow_btn.clicked.connect(self.duplicate_selected_workflow)
+        self.delete_workflow_btn.clicked.connect(self.delete_selected_workflow)
         self.run_workflow_btn.clicked.connect(self.run_workflow)
-        self.add_step_btn.clicked.connect(self.add_workflow_step)
+        self.test_workflow_btn.clicked.connect(self.test_workflow)
+        self.stop_workflow_btn.clicked.connect(self.stop_workflow_run)
+        self.add_step_btn.clicked.connect(lambda checked=False: self.add_workflow_step())
+        self.remove_step_btn.clicked.connect(self.remove_workflow_step)
+        self.move_up_btn.clicked.connect(lambda checked=False: self.move_workflow_step(True))
+        self.move_down_btn.clicked.connect(lambda checked=False: self.move_workflow_step(False))
         
         # Batch operations
         self.operation_combo.currentTextChanged.connect(self.update_operation_params)
@@ -1077,106 +1047,377 @@ class AutomationTab(QWidget):
         self.stop_watching_btn.clicked.connect(self.stop_file_watching)
         self.remove_watch_btn.clicked.connect(self.remove_watch_folder)
         
-    def load_sample_data(self):
-        """Load sample workflow data."""
-        # Sample workflow steps
-        self.steps_table.setRowCount(4)
-        
-        steps = [
-            ("1", "Load Models", "source_folder='./input'", "Always"),
-            ("2", "Validate", "check_geometry=True", "If valid"),
-            ("3", "Convert Format", "target='gltf'", "Always"),
-            ("4", "Save Results", "output_folder='./output'", "Always")
-        ]
-        
-        for row, (step, action, params, condition) in enumerate(steps):
-            self.steps_table.setItem(row, 0, QTableWidgetItem(step))
-            self.steps_table.setItem(row, 1, QTableWidgetItem(action))
-            self.steps_table.setItem(row, 2, QTableWidgetItem(params))
-            self.steps_table.setItem(row, 3, QTableWidgetItem(condition))
-            
-    def load_workflow_details(self):
-        """Load details for selected workflow."""
-        current_item = self.workflows_list.currentItem()
-        if current_item:
-            workflow_name = current_item.text()
-            # Remove emoji prefix for name
-            clean_name = workflow_name.split(' ', 1)[1] if ' ' in workflow_name else workflow_name
-            self.workflow_name_edit.setText(clean_name)
-            self.workflow_description_edit.setPlainText(f"Description for {clean_name}")
-            
-    def new_workflow(self):
-        """Create a new workflow."""
-        self.workflow_name_edit.clear()
-        self.workflow_description_edit.clear()
-        self.steps_table.setRowCount(0)
-        
-    def run_workflow(self):
-        """Run the selected workflow."""
-        workflow_name = self.workflow_name_edit.text()
-        if not workflow_name:
-            QMessageBox.warning(self, "Warning", "Please select or create a workflow first!")
-            return
-        
-        # Create workflow from UI data
-        workflow = Workflow(
-            name=workflow_name,
-            description=self.workflow_description_edit.toPlainText()
-        )
-        
-        # Add steps from table
+    # --- Workflow Builder ------------------------------------------------------
+    def refresh_workflow_list(self):
+        """Rebuild the list from the engine, which is where workflows live.
+
+        The pane used to open on names no object anywhere described, so it could show a
+        workflow nothing could run while hiding every one the user had saved. Rebuilding
+        is also silent: clearing the list leaves a stale current row, and a handler that
+        read it would put the editor back on a workflow the user had just left.
+        """
+        wanted = self.current_workflow_id
+        self._rebuilding_list = True
+        try:
+            self._workflow_rows = [workflow.workflow_id for workflow in
+                                   sorted(self.automation_engine.workflows.values(),
+                                          key=lambda item: item.created_at)]
+            self.workflows_list.clear()
+            for workflow_id in self._workflow_rows:
+                workflow = self.automation_engine.workflows[workflow_id]
+                self.workflows_list.addItem(f"{workflow.name} [{workflow.status.value}]")
+        finally:
+            self._rebuilding_list = False
+        if wanted in self._workflow_rows:
+            self.workflows_list.setCurrentRow(self._workflow_rows.index(wanted))
+        self.update_dashboard_metrics()
+
+    def _step_action_combo(self, action_id=''):
+        """A step's Action cell: only ids the registry can actually run."""
+        combo = QComboBox()
+        for one_id, label in self._task_action_choices():
+            combo.addItem(label, one_id)
+        index = combo.findData(action_id)
+        if index < 0 and action_id:
+            combo.insertItem(0, action_id, action_id)
+            index = 0
+        combo.setCurrentIndex(index)
+        return combo
+
+    def _step_error_combo(self, on_error='stop'):
+        """A step's On error cell: the three policies the executor really honours."""
+        combo = QComboBox()
+        for policy in WorkflowStep.ON_ERROR:
+            combo.addItem(policy, policy)
+        index = combo.findData(on_error)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        return combo
+
+    def add_workflow_step(self, name='', action_id='file.copy', parameters='{}',
+                          on_error='stop'):
+        """Append one step row: a name, a known action, its parameters, its policy."""
+        row = self.steps_table.rowCount()
+        self.steps_table.insertRow(row)
+        self.steps_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+        self.steps_table.setItem(row, 1, QTableWidgetItem(name))
+        self.steps_table.setCellWidget(row, 2, self._step_action_combo(action_id))
+        self.steps_table.setItem(row, 3, QTableWidgetItem(parameters))
+        self.steps_table.setCellWidget(row, 4, self._step_error_combo(on_error))
+
+    def _renumber_steps(self):
+        """Keep the row numbers the table claims, after a removal or a move."""
         for row in range(self.steps_table.rowCount()):
-            step_name = self.steps_table.item(row, 1).text() if self.steps_table.item(row, 1) else "Step"
-            step_params = self.steps_table.item(row, 2).text() if self.steps_table.item(row, 2) else "{}"
-            
-            params, problem = self._parse_parameters(step_params)
+            item = self.steps_table.item(row, 0)
+            if item is None:
+                self.steps_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+            else:
+                item.setText(str(row + 1))
+
+    def _step_record(self, row):
+        """One row as the engine stores it, plus the first reason it cannot run."""
+        name_item = self.steps_table.item(row, 1)
+        action_combo = self.steps_table.cellWidget(row, 2)
+        params_item = self.steps_table.item(row, 3)
+        error_combo = self.steps_table.cellWidget(row, 4)
+        name = (name_item.text().strip() if name_item else '') or f"step {row + 1}"
+        action = action_combo.currentData() if action_combo is not None else ''
+        params, problem = self._parse_parameters(params_item.text() if params_item else '')
+        if problem:
+            return None, f"'{name}': {problem}"
+        return ({'name': name, 'action': action, 'parameters': params,
+                 'on_error': error_combo.currentData() if error_combo else 'stop'}, None)
+
+    def _workflow_records(self):
+        """The whole table as engine records, or the first row that is not one."""
+        records = []
+        for row in range(self.steps_table.rowCount()):
+            record, problem = self._step_record(row)
             if problem:
-                QMessageBox.warning(self, "Warning", f"Step '{step_name}': {problem}")
-                return
-            step = WorkflowStep(
-                name=step_name,
-                action=step_name.lower().replace(' ', '_'),
-                parameters=params
-            )
-            workflow.add_step(step)
-        
-        # Execute workflow using automation engine
-        self.run_workflow_btn.setEnabled(False)
-        self.stop_workflow_btn.setEnabled(True)
-        
-        self.automation_engine.execute_workflow(workflow)
-        
+                return None, problem
+            records.append(record)
+        return records, None
+
+    def _fill_steps(self, records):
+        """Rebuild the table from records - the only way to reorder rows of combo boxes."""
+        self.steps_table.setRowCount(0)
+        for record in records:
+            self.add_workflow_step(record.get('name') or '', record.get('action') or '',
+                                   json.dumps(record.get('parameters') or {}),
+                                   record.get('on_error') or 'stop')
+
+    def load_workflow_details(self):
+        """Put the selected stored workflow in the editor, read from the engine."""
+        if self._rebuilding_list:
+            return
+        row = self.workflows_list.currentRow()
+        if not 0 <= row < len(self._workflow_rows):
+            return
+        workflow = self.automation_engine.workflows.get(self._workflow_rows[row])
+        if workflow is None:
+            return
+        self.current_workflow_id = workflow.workflow_id
+        self.workflow_name_edit.setText(workflow.name)
+        self.workflow_description_edit.setPlainText(workflow.description or '')
+        self._fill_steps([step.to_dict() for step in workflow.steps])
+
+    def new_workflow(self):
+        """Clear the editor and detach it from any workflow that is stored."""
+        self._rebuilding_list = True
+        try:
+            self.current_workflow_id = None
+            self.workflow_name_edit.clear()
+            self.workflow_description_edit.clear()
+            self.steps_table.setRowCount(0)
+            self.workflows_list.clearSelection()
+        finally:
+            self._rebuilding_list = False
+        self.workflow_name_edit.setFocus()
+
+    def store_workflow(self):
+        """Write the editor into the engine, and the engine into its own file.
+
+        Returns the id it is stored under, or None once the reason has been said. Every
+        reason comes from `workflow_problems`, so the pane and the engine refuse the same
+        set of workflows.
+        """
+        name = self.workflow_name_edit.text().strip()
+        description = self.workflow_description_edit.toPlainText().strip()
+        records, problem = self._workflow_records()
+        if problem is None:
+            complaints = self.automation_engine.workflow_problems(name, records)
+            problem = '\n'.join(complaints) if complaints else None
+        if problem:
+            QMessageBox.warning(self, "This workflow cannot run", problem)
+            return None
+        workflow_id = self.current_workflow_id
+        if workflow_id in self.automation_engine.workflows:
+            self.automation_engine.update_workflow(workflow_id, name=name,
+                                                   description=description, steps=records)
+        else:
+            workflow_id = self.automation_engine.create_workflow(name, description, records)
+            self.current_workflow_id = workflow_id
+        self.refresh_workflow_list()
+        return workflow_id
+
+    def save_workflow(self):
+        """The Save button: store the editor, then say what was stored."""
+        workflow_id = self.store_workflow()
+        if workflow_id:
+            self._log_activity(f"Saved workflow "
+                               f"'{self.workflow_name_edit.text().strip()}' with "
+                               f"{self.steps_table.rowCount()} step(s)")
+
+    def run_workflow(self):
+        """Store what is on screen, then have the engine run that id.
+
+        Running the *stored* workflow is the point: it is the same record the file holds
+        and the same id the engine reports its verdict under. The path this replaced
+        built a workflow object here and handed it to a method that wants an id, while a
+        separate worker-thread class - built by nobody - slept 500 ms per step and
+        reported success.
+        """
+        workflow_id = self.store_workflow()
+        if workflow_id is None:
+            return
+        if not self.automation_engine.execute_workflow(workflow_id):
+            self._log_activity(f"Workflow '{self._workflow_name(workflow_id)}' "
+                               "was not started")
+
+    def test_workflow(self):
+        """Say what would happen, without running any of it."""
+        records, problem = self._workflow_records()
+        name = self.workflow_name_edit.text().strip()
+        complaints = [] if problem else self.automation_engine.workflow_problems(name, records)
+        if problem or complaints:
+            QMessageBox.warning(self, "This workflow cannot run",
+                                problem or '\n'.join(complaints))
+            return
+        order = '; '.join(f"{index}. {record['name']} runs {record['action']} "
+                          f"(on error: {record['on_error']})"
+                          for index, record in enumerate(records, 1))
+        QMessageBox.information(self, "Test passed",
+                                f"'{name}' would run {len(records)} step(s) in this order:\n"
+                                + order)
+
+    def stop_workflow_run(self):
+        """Ask the running workflow to leave the steps it has not reached alone."""
+        workflow_id = self._running_workflow
+        if workflow_id is None:
+            QMessageBox.warning(self, "Nothing is running",
+                                "This pane has no workflow running that could be stopped.")
+            return
+        name = self._workflow_name(workflow_id)
+        if self.automation_engine.stop_workflow(workflow_id):
+            self._log_activity(f"Asking workflow '{name}' to stop at its next step")
+        else:
+            self._log_activity(f"Workflow '{name}' is no longer in the engine; "
+                               "forgetting it here")
+            self._finish_run(workflow_id)
+
+    def duplicate_selected_workflow(self):
+        """Copy the stored workflow the pane is on; the copy gets its own id."""
+        workflow_id = self.current_workflow_id
+        copy_id = self.automation_engine.duplicate_workflow(workflow_id) if workflow_id else None
+        if copy_id is None:
+            QMessageBox.warning(self, "Nothing to duplicate",
+                                "Save a workflow first - there is nothing stored to copy.")
+            return
+        self.current_workflow_id = copy_id
+        self.refresh_workflow_list()
+        self._log_activity(f"Duplicated to "
+                           f"'{self.automation_engine.workflows[copy_id].name}'")
+
+    def delete_selected_workflow(self):
+        """Take the stored workflow out of the list, the engine and the file."""
+        workflow_id = self.current_workflow_id
+        if workflow_id is None:
+            QMessageBox.warning(self, "Nothing to delete",
+                                "Select a saved workflow, or Save this one first.")
+            return
+        name = self._workflow_name(workflow_id)
+        answer = QMessageBox.question(self, "Delete workflow",
+                                      f"Delete '{name}'? It leaves the app and its file too.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self.automation_engine.delete_workflow(workflow_id):
+            self._log_activity(f"Deleted workflow '{name}'")
+        else:
+            self._log_activity(f"'{name}' was already not in the engine")
+        self.new_workflow()
+        self.refresh_workflow_list()
+
+    def remove_workflow_step(self):
+        """Drop the chosen step row and renumber what is left."""
+        row = self.steps_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "No step chosen", "Pick the step row to remove.")
+            return
+        self.steps_table.removeRow(row)
+        self._renumber_steps()
+
+    def move_workflow_step(self, up):
+        """Swap the chosen step with its neighbour, in the order the engine will run."""
+        row = self.steps_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "No step chosen", "Pick the step row to move.")
+            return
+        target = row - 1 if up else row + 1
+        if target < 0 or target >= self.steps_table.rowCount():
+            QMessageBox.warning(self, "Nowhere to move",
+                                f"Step {row + 1} is already at the "
+                                f"{'top' if up else 'bottom'} of the run.")
+            return
+        records, problem = self._workflow_records()
+        if problem:
+            QMessageBox.warning(self, "This workflow cannot run", problem)
+            return
+        records[row], records[target] = records[target], records[row]
+        self._fill_steps(records)
+        self.steps_table.setCurrentCell(target, 1)
+
+    @staticmethod
+    def _workflow_file_records(data):
+        """Every importable workflow in a file, whichever shape it arrived in."""
+        if isinstance(data, dict):
+            if 'steps' in data:
+                return [data]
+            return [one for one in data.values()
+                    if isinstance(one, dict) and 'steps' in one]
+        if isinstance(data, list):
+            return [one for one in data if isinstance(one, dict) and 'steps' in one]
+        return []
+
+    def load_workflow_file(self):
+        """Read a workflow file into the app; anything that cannot run is refused by name."""
+        path, _ = QFileDialog.getOpenFileName(self, "Load a workflow file", "",
+                                              "Workflow JSON (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Cannot read that file",
+                                f"{os.path.basename(path)}: {error}")
+            return
+        records = self._workflow_file_records(data)
+        if not records:
+            QMessageBox.warning(self, "No workflow in that file",
+                                f"{os.path.basename(path)} holds no record with a list "
+                                "of steps.")
+            return
+        loaded = []
+        refused = []
+        for record in records:
+            name = record.get('name') or ''
+            steps = record.get('steps') or []
+            complaints = self.automation_engine.workflow_problems(name, steps)
+            if complaints:
+                refused.append(f"'{name or 'unnamed'}': " + '; '.join(complaints))
+                continue
+            loaded.append(self.automation_engine.create_workflow(
+                name, record.get('description') or '', steps))
+        if loaded:
+            self.current_workflow_id = loaded[0]
+            self.refresh_workflow_list()
+            self._log_activity(f"Loaded {len(loaded)} workflow(s) from "
+                               f"{os.path.basename(path)}")
+        if refused:
+            QMessageBox.warning(self, "Refused by the registry", '\n'.join(refused))
+
+    def _workflow_name(self, workflow_id, result=None):
+        workflow = self.automation_engine.workflows.get(workflow_id)
+        if workflow is not None:
+            return workflow.name
+        return (result or {}).get('workflow') or workflow_id
+
     def on_workflow_started(self, workflow_id):
-        """Handle workflow started signal from engine."""
-        self.batch_log.appendPlainText(f"Workflow {workflow_id} started...")
-        if hasattr(self, 'activity_list'):
-             timestamp = datetime.now().strftime("%H:%M:%S")
-             self.activity_list.addItem(f"[{timestamp}] Workflow {workflow_id} started")
-        
-    def on_workflow_completed_engine(self, workflow_id, results):
-        """Handle workflow completion from engine."""
-        self.run_workflow_btn.setEnabled(True)
-        self.stop_workflow_btn.setEnabled(False)
-        if hasattr(self, 'activity_list'):
-             timestamp = datetime.now().strftime("%H:%M:%S")
-             self.activity_list.addItem(f"[{timestamp}] Workflow {workflow_id} completed")
-        QMessageBox.information(self, "Success", f"Workflow completed!\nResults: {results}")
-        
+        """The engine's worker has begun; note it and hand Stop to the user."""
+        self._running_workflow = workflow_id
+        name = self._workflow_name(workflow_id)
+        self.active_workflows[workflow_id] = name
+        self._log_activity(f"Workflow '{name}' started")
+        self.run_workflow_btn.setEnabled(False)
+        self.save_workflow_btn.setEnabled(False)
+        self.stop_workflow_btn.setEnabled(True)
+        self.update_dashboard_metrics()
+
+    def on_workflow_progress(self, workflow_id, current, total, step_name):
+        """Which step the worker is on, in the log this pane owns."""
+        self._log_activity(f"'{self._workflow_name(workflow_id)}' "
+                           f"step {current}/{total}: {step_name}")
+
+    def on_workflow_completed_engine(self, workflow_id, result):
+        """The verdict as the run really found it: no modal, just what happened."""
+        self._finish_run(workflow_id)
+        name = self._workflow_name(workflow_id, result)
+        done = result.get('steps_completed', 0)
+        if result.get('stopped'):
+            self._log_activity(f"Workflow '{name}' stopped after {done} step(s)")
+        else:
+            tolerated = result.get('tolerated_failures') or []
+            line = (f"Workflow '{name}' completed {done}/"
+                    f"{result.get('total_steps', done)} step(s)")
+            if tolerated:
+                line += f", tolerating {len(tolerated)} failure(s): " + '; '.join(tolerated)
+            self._log_activity(line)
+        self.refresh_workflow_list()
+
     def on_workflow_failed(self, workflow_id, error):
-        """Handle workflow failure from engine."""
+        self._finish_run(workflow_id)
+        self._log_activity(f"Workflow '{self._workflow_name(workflow_id)}' "
+                           f"FAILED: {error or 'no reason given'}")
+        self.refresh_workflow_list()
+
+    def _finish_run(self, workflow_id):
+        """Give the controls back once a run is over, however it ended."""
+        self.active_workflows.pop(workflow_id, None)
+        self._running_workflow = None
         self.run_workflow_btn.setEnabled(True)
+        self.save_workflow_btn.setEnabled(True)
         self.stop_workflow_btn.setEnabled(False)
-        if hasattr(self, 'activity_list'):
-             timestamp = datetime.now().strftime("%H:%M:%S")
-             self.activity_list.addItem(f"[{timestamp}] Workflow {workflow_id} failed: {error}")
-        QMessageBox.critical(self, "Error", f"Workflow failed: {error}")
-        
-    def on_workflow_progress(self, workflow_id, step_index, total_steps, step_name):
-        """Handle workflow progress from engine."""
-        progress = int((step_index / total_steps) * 100)
-        self.batch_progress.setValue(progress)
-        self.batch_status_label.setText(f"Step {step_index}/{total_steps}: {step_name}")
-        
+        self.update_dashboard_metrics()
+
     def on_task_started(self, task_id):
         """Note that a run began; the verdict arrives on task_completed."""
         task = self.automation_engine.tasks.get(task_id)
@@ -1378,16 +1619,6 @@ class AutomationTab(QWidget):
         self.batch_log.appendPlainText(f"Completed: {results}")
         
 
-    def add_workflow_step(self):
-        """Add a new workflow step."""
-        row = self.steps_table.rowCount()
-        self.steps_table.setRowCount(row + 1)
-        
-        self.steps_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-        self.steps_table.setItem(row, 1, QTableWidgetItem("New Action"))
-        self.steps_table.setItem(row, 2, QTableWidgetItem("parameters"))
-        self.steps_table.setItem(row, 3, QTableWidgetItem("Always"))
-        
     def update_operation_params(self):
         """Update operation parameters based on selected operation."""
         operation = self.operation_combo.currentText()
@@ -1463,21 +1694,7 @@ class AutomationTab(QWidget):
 
     def _validate_parameters(self, action_id, params):
         """What the registry would refuse, said before it gets the chance."""
-        spec = (ActionRegistry.get_all_actions().get(action_id) or {}).get('parameters') or {}
-        checks = {'str': str, 'int': int, 'float': (int, float), 'bool': bool}
-        complaints = []
-        for name, rule in spec.items():
-            if rule.get('required') and name not in params:
-                complaints.append(f"{action_id} needs a value for '{name}'")
-            elif name in params:
-                expected = checks.get(rule.get('type'))
-                if expected and not isinstance(params[name], expected):
-                    complaints.append(f"'{name}' must be {rule.get('type')}, "
-                                      f"not {type(params[name]).__name__}")
-        unknown = sorted(key for key in params if key not in spec)
-        if unknown:
-            complaints.append(f"{action_id} has no parameter named: " + ', '.join(unknown))
-        return complaints
+        return ActionRegistry.validate(action_id, params)
 
     def _task_schedule_spec(self):
         """Compose the schedule string the engine reads, or say why there is not one."""

@@ -73,9 +73,13 @@ class WatcherEngineCase(unittest.TestCase):
             ('moved', os.path.basename(a), os.path.basename(b))))
         return watcher, path
 
-    def drive(self, watcher, path):
+    def drive(self, watcher, path, current=None):
+        """One polling pass. `current` overrides what the folder is said to hold, which is
+        the only way to reproduce a listing taken mid-rename."""
         info = watcher.watched_directories[path]
-        for event, target, other in watcher._diff(info, watcher._snapshot(path, info)):
+        if current is None:
+            current = watcher._snapshot(path, info)
+        for event, target, other in watcher._diff(info, current):
             watcher._report(target, event, other)
 
     def touch(self, name, text=None):
@@ -149,10 +153,13 @@ class WatcherEngineCase(unittest.TestCase):
         self.assertEqual(self.seen, [('moved', 'before.obj', 'after.obj')])
 
     def test_08_removal_is_deleted(self):
+        """A loss is confirmed on the pass after it is seen, never on the first hint."""
         self.touch('doomed.obj')
         watcher, path = self.manual(event_type='any')
         self.drive(watcher, path)
         os.remove(os.path.join(self.work, 'doomed.obj'))
+        self.drive(watcher, path)
+        self.assertEqual(self.seen, [], 'the first pass only holds the vanishing')
         self.drive(watcher, path)
         self.assertEqual(self.seen, [('deleted', 'doomed.obj')])
 
@@ -163,6 +170,7 @@ class WatcherEngineCase(unittest.TestCase):
         self.drive(watcher, path)
         self.assertEqual(self.seen, [('created', 'one.obj')])
         os.remove(os.path.join(self.work, 'one.obj'))
+        self.drive(watcher, path)
         self.drive(watcher, path)
         self.assertEqual(self.seen, [('created', 'one.obj')], 'deleted was never asked for')
         self.assertEqual(_event_set('created'), {'created'})
@@ -224,6 +232,44 @@ class WatcherEngineCase(unittest.TestCase):
         watcher.stop_watching()
         self.assertFalse(watcher.is_watching)
         self.assertIsNone(watcher._watcher_thread)
+
+    def test_15_a_rename_split_across_two_passes_is_still_one_move(self):
+        """os.listdir can catch a rename with the old name gone and the new one missing.
+
+        Before the hold that was one rename logged twice: 'File deleted: from.obj', then
+        a poll later 'File created: to.obj'. A user reading the log would look for a file
+        that was never lost.
+        """
+        gone = self.touch('from.obj')
+        watcher, path = self.manual(event_type='any')
+        self.drive(watcher, path)
+        stamp = dict(watcher.watched_directories[path]['last_modified'])[gone]
+        arrived = os.path.join(self.work, 'to.obj')
+
+        self.drive(watcher, path, {})
+        self.assertEqual(self.seen, [], 'one half of a rename is not a deletion')
+        self.drive(watcher, path, {arrived: stamp})
+        self.assertEqual(self.seen, [('moved', 'from.obj', 'to.obj')])
+
+    def test_16_re_registering_a_folder_forgets_its_open_holds(self):
+        """A folder re-added with new filters starts from what is on disk now."""
+        held = os.path.join(self.work, 'gone.obj')
+        self.touch('gone.obj')
+        watcher, path = self.manual(event_type='any')
+        self.drive(watcher, path)
+        os.remove(held)
+        self.drive(watcher, path)
+        self.assertEqual(list(watcher.watched_directories[path]['pending_gone']), [held])
+
+        watcher.is_watching = True
+        try:
+            watcher.watch_directory(path, event_type='any')
+        finally:
+            watcher.is_watching = False
+        self.assertEqual(watcher.watched_directories[path]['pending_gone'], {},
+                         'a re-baselined folder must not carry stale losses')
+        self.drive(watcher, path)
+        self.assertEqual(self.seen, [], 'the re-baseline owns the truth now')
 
 
 class AutomationTabCase(unittest.TestCase):
@@ -556,7 +602,7 @@ class AutomationTabCase(unittest.TestCase):
         self.tab.on_file_created(os.path.join(self.watched, 'cube.obj'))
         lines = self.activity() + self.log().splitlines()
         for needle in ("Task 'task_1' started", "Task 'task_2' FAILED: boom",
-                       'Workflow wf_1 started', 'File created'):
+                       "Workflow 'wf_1' started", 'File created'):
             matched = [line for line in lines if needle in line]
             self.assertTrue(matched, f'{needle} never logged: {lines}')
             self.assertRegex(matched[0], r'^\[\d\d:\d\d:\d\d\]', 'no timestamp on the line')
