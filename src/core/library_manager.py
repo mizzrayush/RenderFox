@@ -309,14 +309,15 @@ class LibraryManager(QObject):
 
     # ---------------------- Import/Scan ----------------------
     def import_files(self, file_paths: Sequence[str]) -> Tuple[int, int]:
+        """Returns (newly indexed, already known) - see _add_or_update_model."""
         added, updated = 0, 0
         for fp in file_paths:
-            ok, was_update = self._add_or_update_model(fp)
+            ok, is_new = self._add_or_update_model(fp)
             if ok:
-                if was_update:
-                    updated += 1
-                else:
+                if is_new:
                     added += 1
+                else:
+                    updated += 1
         if added or updated:
             self.library_changed.emit()
         return added, updated
@@ -349,12 +350,12 @@ class LibraryManager(QObject):
         for i, fp in enumerate(all_files):
             pct = int((i + 1) * 100 / max(1, total))
             self.scan_progress.emit(pct, f"Scanning {os.path.basename(fp)} ({i+1}/{total})")
-            ok, was_update = self._add_or_update_model(fp)
+            ok, is_new = self._add_or_update_model(fp)
             if ok:
-                if was_update:
-                    updated += 1
-                else:
+                if is_new:
                     added += 1
+                else:
+                    updated += 1
         if total == 0:
             self.scan_progress.emit(100, "No model files found in library folders")
         self.conn.commit()
@@ -367,6 +368,7 @@ class LibraryManager(QObject):
         return ext in SUPPORTED_MODEL_EXTS
 
     def _add_or_update_model(self, file_path: str) -> Tuple[bool, bool]:
+        """Index one file as (recorded, row_was_new); re-importing a known file is (True, False)."""
         try:
             if not file_path:
                 return False, False
@@ -425,10 +427,9 @@ class LibraryManager(QObject):
                 cur.execute("UPDATE models SET thumbnail=? WHERE id=?", (thumb, model_id))
                 self.thumbnail_ready.emit(path, thumb)
                 self.conn.commit()
-                return True, False
+                return True, True
             else:
                 model_id = row["id"]
-                was_update = row["file_hash"] != file_hash
                 cur.execute(
                     """
                     UPDATE models SET
@@ -464,7 +465,7 @@ class LibraryManager(QObject):
                     cur.execute("UPDATE models SET thumbnail=? WHERE id=?", (thumb, model_id))
                     self.thumbnail_ready.emit(path, thumb)
                 self.conn.commit()
-                return True, was_update
+                return True, False
         except Exception as e:
             self.error_occurred.emit(f"_add_or_update_model failed for {file_path}: {e}")
             return False, False
@@ -992,6 +993,10 @@ class LibraryManager(QObject):
         except Exception as e:
             self.error_occurred.emit(f"thumbnail creation failed: {e}")
             return ""
+
+    def refresh_thumbnail(self, model_path: str) -> str:
+        """Rebuild one model's thumbnail and return its path ('' if nothing was written)."""
+        return self._ensure_thumbnail_placeholder(model_path, force=True)
 
     def rebuild_all_thumbnails(self) -> int:
         """Rebuild all model thumbnails."""

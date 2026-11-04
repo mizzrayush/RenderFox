@@ -6,6 +6,7 @@ Provides task scheduling, workflow automation, batch processing, and trigger-bas
 import os
 import time
 import json
+import fnmatch
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field
@@ -441,95 +442,247 @@ class TaskScheduler(QObject):
             time.sleep(1)
 
 
+WATCH_EVENTS = ('created', 'modified', 'deleted', 'moved')
+
+
+def _glob_list(patterns) -> List[str]:
+    """Turn one filter field into a list of globs.
+
+    The Automation tab's filters are typed by hand, so "*.obj, *.fbx", "obj fbx" and
+    ".obj" are three ways of asking for the same files. A bare extension gets the star
+    and the dot it needs; "*" and "*.*" mean "everything" and drop out of the list.
+    """
+    if patterns is None:
+        return []
+    if isinstance(patterns, str):
+        pieces = patterns.replace(';', ',').replace('|', ',').split(',')
+    else:
+        pieces = [str(p) for p in patterns]
+
+    globs = []
+    for piece in pieces:
+        for token in piece.split():
+            token = token.strip().strip('"').strip("'")
+            if not token or token in ('*', '*.*'):
+                continue
+            if '*' in token or '?' in token or '[' in token:
+                globs.append(token)
+            elif token.startswith('.'):
+                globs.append('*' + token)
+            else:
+                globs.append('*.' + token)
+    return globs
+
+
+def _name_matches(filename: str, globs: List[str]) -> bool:
+    """An empty glob list is "no filter", which matches every file."""
+    if not globs:
+        return True
+    return any(fnmatch.fnmatch(filename, pattern) for pattern in globs)
+
+
+def _is_excluded(filename: str, globs: List[str]) -> bool:
+    """The exclude field asks the opposite question: no patterns means exclude nothing."""
+    if not globs:
+        return False
+    return any(fnmatch.fnmatch(filename, pattern) for pattern in globs)
+
+
+def _event_set(event_type) -> set:
+    """Which of the four events one watched directory should report."""
+    if event_type is None:
+        return {'created'}
+    if isinstance(event_type, str):
+        if event_type in ('any', 'all'):
+            return set(WATCH_EVENTS)
+        return {event_type}
+    events = set()
+    for item in event_type:
+        if item in ('any', 'all'):
+            return set(WATCH_EVENTS)
+        if item in WATCH_EVENTS:
+            events.add(item)
+    return events
+
+
 class FileWatcher(QObject):
     """Watch directories for file changes."""
-    
+
     file_created = pyqtSignal(str)  # file_path
     file_modified = pyqtSignal(str)  # file_path
     file_deleted = pyqtSignal(str)  # file_path
-    
-    def __init__(self):
+    file_moved = pyqtSignal(str, str)  # old_path, new_path
+
+    def __init__(self, poll_seconds: float = 2.0):
         super().__init__()
         self.watched_directories: Dict[str, Dict[str, Any]] = {}
         self.is_watching = False
+        self.poll_seconds = poll_seconds
         self._watcher_thread = None
-        
-    def watch_directory(self, directory: str, callback: Callable, 
-                       file_pattern: str = "*", event_type: str = "created"):
-        """Watch directory for file events."""
-        if directory not in self.watched_directories:
-            self.watched_directories[directory] = {
-                'callbacks': [],
-                'last_modified': {},
-                'file_pattern': file_pattern,
-                'event_type': event_type
-            }
-        
-        self.watched_directories[directory]['callbacks'].append(callback)
-        
+        self._path_signals = {
+            'created': self.file_created,
+            'modified': self.file_modified,
+            'deleted': self.file_deleted,
+        }
+
+    def watch_directory(self, directory: str, callback: Callable = None,
+                        file_pattern: str = "*", event_type: Any = "created",
+                        exclude_patterns: Any = "", min_size_kb: float = 0) -> str:
+        """Watch one directory for file events and return its normalised path.
+
+        callback is optional: the four signals are the API the Automation tab uses, and
+        a tab that only wants the log should not have to invent a no-op function.
+        """
+        if not directory:
+            raise ValueError("No directory given to watch")
+        path = os.path.abspath(directory)
+        if not os.path.isdir(path):
+            raise ValueError(f"Cannot watch {path}: not a directory")
+
+        info = self.watched_directories.get(path)
+        if info is None:
+            info = {'callbacks': [], 'last_modified': {}}
+            self.watched_directories[path] = info
+        info['file_pattern'] = _glob_list(file_pattern)
+        info['exclude_patterns'] = _glob_list(exclude_patterns)
+        info['min_size_kb'] = float(min_size_kb or 0)
+        info['events'] = _event_set(event_type)
+        # Record the baseline here rather than on the thread's first pass: a file that
+        # lands between this call and that pass is an event, not part of what was
+        # already there. Re-registering a folder re-baselines it with its new filters.
+        info['last_modified'] = self._snapshot(path, info)
+
+        if callback is not None:
+            info['callbacks'].append(callback)
+
         if not self.is_watching:
             self.start_watching()
-    
+        return path
+
+    def is_watched(self, directory: str) -> bool:
+        """Whether this exact directory is already in the watch list."""
+        if not directory:
+            return False
+        return os.path.abspath(directory) in self.watched_directories
+
     def unwatch_directory(self, directory: str):
         """Stop watching directory."""
-        if directory in self.watched_directories:
-            del self.watched_directories[directory]
-    
+        if not directory:
+            return
+        self.watched_directories.pop(os.path.abspath(directory), None)
+
     def start_watching(self):
         """Start file watcher thread."""
         if self.is_watching:
             return
-        
+
         self.is_watching = True
         self._watcher_thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._watcher_thread.start()
-    
+
     def stop_watching(self):
         """Stop file watcher."""
         self.is_watching = False
         if self._watcher_thread:
             self._watcher_thread.join(timeout=2)
-    
-    def _watch_loop(self):
-        """File watching loop."""
-        while self.is_watching:
-            for directory, info in self.watched_directories.items():
-                if not os.path.exists(directory):
+            self._watcher_thread = None
+
+    def _snapshot(self, directory: str, info: Dict[str, Any]) -> Dict[str, tuple]:
+        """Every file in this folder that passes its filters, as path -> (mtime, size)."""
+        found: Dict[str, tuple] = {}
+        smallest = float(info['min_size_kb']) * 1024.0
+        for filename in os.listdir(directory):
+            if not _name_matches(filename, info['file_pattern']):
+                continue
+            if _is_excluded(filename, info['exclude_patterns']):
+                continue
+            filepath = os.path.join(directory, filename)
+            try:
+                if not os.path.isfile(filepath):
                     continue
-                
+                stat = os.stat(filepath)
+            except OSError:
+                continue
+            if stat.st_size < smallest:
+                continue
+            found[filepath] = (stat.st_mtime, stat.st_size)
+        return found
+
+    def _diff(self, info: Dict[str, Any], current: Dict[str, tuple]) -> List[tuple]:
+        """What changed since the last pass, as (event, path, other_path) tuples.
+
+        A file that left one path and appeared at another in the same pass with the same
+        mtime and size is reported as moved rather than deleted plus created; that is the
+        only way a polling watcher can tell the two apart, and it is what the tab's
+        "File Moved" checkbox asks for.
+
+        The folder's baseline was recorded when it was registered, so what was already
+        on disk when watching started is never announced as created.
+        """
+        known = info['last_modified']
+
+        appeared = [p for p in current if p not in known]
+        vanished = [p for p in known if p not in current]
+
+        events: List[tuple] = []
+        for old in list(vanished):
+            match = next((new for new in appeared if current[new] == known[old]), None)
+            if match is None:
+                continue
+            appeared.remove(match)
+            vanished.remove(old)
+            events.append(('moved', match, old))
+
+        for old in vanished:
+            events.append(('deleted', old, None))
+        for new in appeared:
+            events.append(('created', new, None))
+        for path in current:
+            if path in known and current[path][0] > known[path][0]:
+                events.append(('modified', path, None))
+
+        info['last_modified'] = dict(current)
+        return events
+
+    def _watch_loop(self):
+        """Poll every watched folder and report what changed."""
+        while self.is_watching:
+            for directory in list(self.watched_directories):
+                if not os.path.isdir(directory):
+                    continue
                 try:
-                    for filename in os.listdir(directory):
-                        filepath = os.path.join(directory, filename)
-                        
-                        if not os.path.isfile(filepath):
-                            continue
-                        
-                        # Check file pattern
-                        pattern = info['file_pattern']
-                        if pattern != "*" and not filename.endswith(pattern):
-                            continue
-                        
-                        # Check modification time
-                        mtime = os.path.getmtime(filepath)
-                        
-                        if filepath not in info['last_modified']:
-                            # New file
-                            if info['event_type'] in ['created', 'any']:
-                                for callback in info['callbacks']:
-                                    callback(filepath, 'created')
-                            info['last_modified'][filepath] = mtime
-                        elif mtime > info['last_modified'][filepath]:
-                            # Modified file
-                            if info['event_type'] in ['modified', 'any']:
-                                for callback in info['callbacks']:
-                                    callback(filepath, 'modified')
-                            info['last_modified'][filepath] = mtime
-                
+                    info = self.watched_directories.get(directory)
+                    if info is None:
+                        continue
+                    current = self._snapshot(directory, info)
+                    for event, path, other in self._diff(info, current):
+                        self._report(path, event, other)
                 except Exception as e:
                     print(f"Error watching directory {directory}: {e}")
-            
-            time.sleep(2)  # Check every 2 seconds
 
+            time.sleep(self.poll_seconds)
+
+    def _report(self, file_path: str, event: str, other_path: str = None):
+        """Tell both APIs about one change: the Qt signal and the python callback.
+
+        Only the callback used to be reached, so the signals the Automation tab connects
+        to had no emitter anywhere in the class. Events the folder was not asked to
+        report are dropped here rather than at each caller.
+        """
+        info = self.watched_directories.get(os.path.dirname(file_path))
+        if info is None or event not in info['events']:
+            return
+
+        if event == 'moved':
+            self.file_moved.emit(other_path or '', file_path)
+        else:
+            self._path_signals[event].emit(file_path)
+
+        for callback in list(info['callbacks']):
+            try:
+                callback(file_path, event)
+            except Exception as error:
+                print(f"Watch callback failed for {file_path}: {error}")
 
 class WorkflowExecutor:
     """Execute workflow steps sequentially."""
@@ -914,6 +1067,8 @@ class AutomationEngine(QObject):
         
         elif trigger_type == TriggerType.FILE_WATCH:
             directory = config.get('directory')
+            if not directory or not os.path.isdir(directory):
+                raise ValueError(f"File watch trigger '{name}' needs an existing directory")
             file_pattern = config.get('file_pattern', '*')
             event_type = config.get('event_type', 'created')
             

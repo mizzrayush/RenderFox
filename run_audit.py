@@ -98,6 +98,12 @@ SUITES = [
         "description": "Converts every claimed format pair for real and reads the result back, opens the picker to check it only offers what the installed libraries can write, and checks the build recipe ships the FBX writer"
     },
     {
+        "id": "automation_contract",
+        "name": "Automation File-Watcher Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_automation_contract.py")],
+        "description": "Adds a real folder, drops a real file in it and requires the tab's log to name it, checks the filter fields and Watch Events boxes reach the watcher, and makes each Auto Action prove its result on disk or say it failed"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

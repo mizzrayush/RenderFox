@@ -4,7 +4,11 @@ Automation tab for workflow automation, batch processing, and task scheduling.
 
 import os
 import json
-import datetime
+import sys
+import shutil
+import threading
+import subprocess
+from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QPushButton, QComboBox, QLabel, QGroupBox, QFormLayout, 
                              QSpinBox, QDoubleSpinBox, QSlider, QTabWidget, QCheckBox,
@@ -21,6 +25,9 @@ from ..features.automation_engine import (
     AutomationEngine, TaskScheduler, FileWatcher, WorkflowExecutor,
     Task, Workflow, WorkflowStep, BatchProcessor, ActionRegistry
 )
+
+BACKUP_SUBFOLDER = ".renderfox_backups"
+
 
 class WorkflowExecutionThread(QThread):
     """Thread for executing automation workflows."""
@@ -64,6 +71,7 @@ class AutomationTab(QWidget):
     """Automation and workflow management interface."""
     
     workflow_started = pyqtSignal(str)
+    auto_actions_finished = pyqtSignal(str, list)
     workflow_completed = pyqtSignal(str, bool)
     task_scheduled = pyqtSignal(str, dict)
     
@@ -89,11 +97,15 @@ class AutomationTab(QWidget):
         self.file_watcher.file_created.connect(self.on_file_created)
         self.file_watcher.file_modified.connect(self.on_file_modified)
         self.file_watcher.file_deleted.connect(self.on_file_deleted)
+        self.file_watcher.file_moved.connect(self.on_file_moved)
+        self.auto_actions_finished.connect(self.on_auto_actions_finished)
         
         self.batch_processor.progress_updated.connect(self.on_batch_progress)
         self.batch_processor.batch_completed.connect(self.on_batch_completed_engine)
         
         self.active_workflows = {}
+        self.watch_requests = {}
+        self._library = None
         self.scheduled_tasks = []
         self.workflow_templates = {}
         self.init_ui()
@@ -676,8 +688,6 @@ class AutomationTab(QWidget):
             "Folder Path", "File Filter", "Actions", "Status"
         ])
         
-        # Add sample watch folders
-        self.populate_sample_watches()
         
         folders_layout.addWidget(self.watch_folders_table)
         folders_group.setLayout(folders_layout)
@@ -1042,22 +1052,6 @@ class AutomationTab(QWidget):
             self.scheduled_tasks_table.setItem(row, 4, QTableWidgetItem(status))
             self.scheduled_tasks_table.setItem(row, 5, QTableWidgetItem(result))
             
-    def populate_sample_watches(self):
-        """Populate sample file watchers."""
-        self.watch_folders_table.setRowCount(3)
-        
-        watches = [
-            ("D:/Projects/Models/Input", "*.obj,*.fbx", "Auto Import + Validate", "Active"),
-            ("D:/Dropbox/Shared/Models", "*.gltf,*.glb", "Auto Convert to OBJ", "Active"),
-            ("D:/Temp/Downloads", "*", "Auto Cleanup Old Files", "Paused")
-        ]
-        
-        for row, (folder, file_filter, actions, status) in enumerate(watches):
-            self.watch_folders_table.setItem(row, 0, QTableWidgetItem(folder))
-            self.watch_folders_table.setItem(row, 1, QTableWidgetItem(file_filter))
-            self.watch_folders_table.setItem(row, 2, QTableWidgetItem(actions))
-            self.watch_folders_table.setItem(row, 3, QTableWidgetItem(status))
-            
     def setup_connections(self):
         """Setup signal connections."""
         # Workflow builder
@@ -1080,6 +1074,8 @@ class AutomationTab(QWidget):
         # File watcher
         self.add_watch_btn.clicked.connect(self.add_watch_folder)
         self.start_watching_btn.clicked.connect(self.start_file_watching)
+        self.stop_watching_btn.clicked.connect(self.stop_file_watching)
+        self.remove_watch_btn.clicked.connect(self.remove_watch_folder)
         
     def load_sample_data(self):
         """Load sample workflow data."""
@@ -1192,20 +1188,169 @@ class AutomationTab(QWidget):
              self.activity_list.addItem(f"[{timestamp}] Task {task_id} failed: {error}")
         
     def on_file_created(self, file_path):
-        """Handle file created event from watcher."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.file_events_log.appendPlainText(f"[{timestamp}] File created: {file_path}")
-        
+        """One new file in a watched folder: log it, then run the Auto Actions."""
+        self._log_watch_event('created', file_path)
+        self._run_auto_actions(file_path)
+
     def on_file_modified(self, file_path):
-        """Handle file modified event from watcher."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.file_events_log.appendPlainText(f"[{timestamp}] File modified: {file_path}")
-        
+        self._log_watch_event('modified', file_path)
+        self._run_auto_actions(file_path)
+
     def on_file_deleted(self, file_path):
-        """Handle file deleted event from watcher."""
+        self._log_watch_event('deleted', file_path)
+
+    def on_file_moved(self, old_path, new_path):
+        self._log_watch_event('moved', f"{old_path} -> {new_path}")
+        self._run_auto_actions(new_path)
+
+    def _log_watch_event(self, event, detail):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.file_events_log.appendPlainText(f"[{timestamp}] File deleted: {file_path}")
-        
+        self.file_events_log.appendPlainText(f"[{timestamp}] File {event}: {detail}")
+
+    def on_auto_actions_finished(self, file_path, outcomes):
+        """Put a worker's action results in the same log as the events that caused them."""
+        for line in outcomes:
+            self.file_events_log.appendPlainText(f"    {line}")
+
+    def _auto_action_settings(self):
+        """Snapshot the Auto Actions pane here so the worker thread never reads a widget."""
+        return {
+            'import': self.auto_import_cb.isChecked(),
+            'validate': self.auto_validate_cb.isChecked(),
+            'thumbnail': self.auto_thumbnail_cb.isChecked(),
+            'backup': self.auto_backup_cb.isChecked(),
+            'script': self.script_path_edit.text().strip() if self.run_script_cb.isChecked() else '',
+        }
+
+    def _auto_action_summary(self):
+        labels = [(self.auto_import_cb, 'Import'), (self.auto_validate_cb, 'Validate'),
+                  (self.auto_thumbnail_cb, 'Thumbnail'), (self.auto_backup_cb, 'Backup'),
+                  (self.run_script_cb, 'Script')]
+        chosen = [label for box, label in labels if box.isChecked()]
+        return ', '.join(chosen) if chosen else 'None'
+
+    def _run_auto_actions(self, file_path):
+        """Run the checked actions in a worker and report back through a signal.
+
+        Import, validate and thumbnail each load the mesh, which takes seconds on a real
+        model; doing that inside the event slot would freeze the window on every file the
+        watcher finds.
+        """
+        settings = self._auto_action_settings()
+        if not any(settings.values()):
+            return
+        threading.Thread(target=self._emit_auto_actions, args=(file_path, settings),
+                         daemon=True).start()
+
+    def _emit_auto_actions(self, file_path, settings):
+        try:
+            outcomes = self._perform_auto_actions(file_path, settings)
+        except Exception as error:
+            outcomes = [f"auto actions failed: {error}"]
+        self.auto_actions_finished.emit(file_path, outcomes)
+
+    def _perform_auto_actions(self, file_path, settings):
+        """Do every checked action and return one truthful line about each."""
+        outcomes = []
+        if settings['import']:
+            outcomes.append(self._auto_import(file_path))
+        if settings['validate']:
+            outcomes.append(self._auto_validate(file_path))
+        if settings['thumbnail']:
+            outcomes.append(self._auto_thumbnail(file_path))
+        if settings['backup']:
+            outcomes.append(self._auto_backup(file_path))
+        if settings['script']:
+            outcomes.append(self._auto_run_script(file_path, settings['script']))
+        return outcomes
+
+    def _library_instance(self):
+        """The library the auto actions write to, built on first use.
+
+        Assigning `self._library` before the first event hands the actions a different
+        database - which is how the contract tests keep out of the user's real library.
+        """
+        if self._library is None:
+            from ..core.library_manager import LibraryManager
+            self._library = LibraryManager()
+        return self._library
+
+    def _auto_import(self, file_path):
+        """Add the file through the same call the Library tab's own import uses."""
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            from ..core.library_manager import SUPPORTED_MODEL_EXTS
+            manager = self._library_instance()
+        except Exception as error:
+            return f"auto import failed: {error}"
+        if ext not in SUPPORTED_MODEL_EXTS:
+            return f"auto import: skipped, {ext or 'no extension'} is not a model format"
+        try:
+            added, updated = manager.import_files([file_path])
+        except Exception as error:
+            return f"auto import failed: {error}"
+        if added:
+            return "auto import: added to library"
+        if updated:
+            return "auto import: updated in library"
+        return "auto import: nothing added - the library could not read this file"
+
+    def _auto_validate(self, file_path):
+        try:
+            from ..features.quality_analyzer import QualityAnalyzer
+            report = QualityAnalyzer().analyze_quality(file_path)
+        except Exception as error:
+            return f"auto validate failed: {error}"
+        if not isinstance(report, dict) or 'score' not in report:
+            return "auto validate: no report - the analyser could not read this file"
+        issues = report.get('issues') or []
+        return (f"auto validate: {report['score']}/100 grade {report.get('grade', '?')}, "
+                f"{len(issues)} issue(s)")
+
+    def _auto_thumbnail(self, file_path):
+        """Rebuild this model's thumbnail where the Library tab reads it from."""
+        try:
+            path = self._library_instance().refresh_thumbnail(file_path)
+        except Exception as error:
+            return f"auto thumbnail failed: {error}"
+        if path and os.path.isfile(path):
+            return f"auto thumbnail: {os.path.basename(path)} ({os.path.getsize(path)} bytes)"
+        return "auto thumbnail: nothing rendered - this build cannot shade a preview"
+
+    def _auto_backup(self, file_path):
+        folder = os.path.join(os.path.dirname(file_path) or '.', BACKUP_SUBFOLDER)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            target = os.path.join(folder, os.path.basename(file_path))
+            shutil.copy2(file_path, target)
+            if os.path.getsize(target) != os.path.getsize(file_path):
+                return f"auto backup: {os.path.basename(target)} is a different size than the original"
+            return f"auto backup: copied to {folder}"
+        except Exception as error:
+            return f"auto backup failed: {error}"
+
+    def _auto_run_script(self, file_path, script_path):
+        """Run the user's own script with the watched file as its argument."""
+        if not os.path.isfile(script_path):
+            return f"custom script: {script_path} is not a file"
+        python = sys.executable
+        if getattr(sys, 'frozen', False):
+            python = shutil.which('python') or shutil.which('python3') or shutil.which('py')
+            if not python:
+                return "custom script: the packaged app found no Python interpreter to run it"
+        try:
+            done = subprocess.run([python, script_path, file_path], capture_output=True,
+                                  text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return "custom script: timed out after 300s"
+        except Exception as error:
+            return f"custom script failed: {error}"
+        if done.returncode == 0:
+            lines = (done.stdout or '').strip().splitlines()
+            return "custom script: ok" + (f" - {lines[-1]}" if lines else '')
+        lines = (done.stderr or done.stdout or '').strip().splitlines()
+        return f"custom script exited {done.returncode}" + (f": {lines[-1]}" if lines else '')
+
     def on_batch_progress(self, current, total, current_file):
         """Handle batch processing progress."""
         progress = int((current / total) * 100)
@@ -1327,42 +1472,128 @@ class AutomationTab(QWidget):
             self.task_name_edit.setText(task_name)
             
     def add_watch_folder(self):
-        """Add a folder to watch."""
+        """Add a folder to the watch list, with the filter the settings pane shows."""
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Watch")
-        if folder:
+        if not folder:
+            return
+
+        file_filter = self.file_extensions_edit.text().strip() or "*"
+        self.watch_requests[folder] = file_filter
+
+        row = self._watch_row(folder)
+        if row is None:
             row = self.watch_folders_table.rowCount()
-            self.watch_folders_table.setRowCount(row + 1)
-            
+            self.watch_folders_table.insertRow(row)
             self.watch_folders_table.setItem(row, 0, QTableWidgetItem(folder))
-            self.watch_folders_table.setItem(row, 1, QTableWidgetItem("*.*"))
-            self.watch_folders_table.setItem(row, 2, QTableWidgetItem("Auto Import"))
+            self.watch_folders_table.setItem(row, 2, QTableWidgetItem(self._auto_action_summary()))
             self.watch_folders_table.setItem(row, 3, QTableWidgetItem("Ready"))
-            
+
+        self.watch_folders_table.setItem(row, 1, QTableWidgetItem(file_filter))
+        self.watch_folders_table.item(row, 2).setText(self._auto_action_summary())
+
+        if self.file_watcher.is_watching:
+            try:
+                self._register_watch(folder)
+                self.file_events_log.appendPlainText(f"Now watching {folder}.")
+            except ValueError as error:
+                self.watch_folders_table.item(row, 3).setText("Missing folder")
+                self.file_events_log.appendPlainText(f"Not watching {folder}: {error}")
+
+    def _watch_row(self, folder):
+        for row in range(self.watch_folders_table.rowCount()):
+            item = self.watch_folders_table.item(row, 0)
+            if item and item.text() == folder:
+                return row
+        return None
+
+    def remove_watch_folder(self):
+        """Take the selected folder off the watch list and out of the running watcher."""
+        row = self.watch_folders_table.currentRow()
+        if row < 0:
+            self.file_events_log.appendPlainText("Select a folder in the list first.")
+            return
+        folder = self.watch_folders_table.item(row, 0).text()
+        self.watch_folders_table.removeRow(row)
+        self.watch_requests.pop(folder, None)
+        self.file_watcher.unwatch_directory(folder)
+        self.file_events_log.appendPlainText(f"Removed {folder} from the watch list.")
+        self.update_dashboard_metrics()
+
+    def _watch_settings(self):
+        """The Watcher Configuration pane, as the arguments the engine takes."""
+        events = []
+        if self.watch_created_cb.isChecked():
+            events.append('created')
+        if self.watch_modified_cb.isChecked():
+            events.append('modified')
+        if self.watch_deleted_cb.isChecked():
+            events.append('deleted')
+        if self.watch_moved_cb.isChecked():
+            events.append('moved')
+        return {
+            'file_pattern': self.file_extensions_edit.text().strip() or '*',
+            'event_type': events,
+            'exclude_patterns': self.exclude_patterns_edit.text().strip(),
+            'min_size_kb': self.min_file_size_spin.value(),
+        }
+
+    def _register_watch(self, folder):
+        """Give one folder its filters and mark it watched."""
+        settings = self._watch_settings()
+        self.file_watcher.watch_directory(
+            folder, None, settings['file_pattern'], settings['event_type'],
+            settings['exclude_patterns'], settings['min_size_kb'])
+        row = self._watch_row(folder)
+        if row is not None:
+            self.watch_folders_table.item(row, 3).setText("Watching")
+            self.watch_folders_table.item(row, 1).setText(settings['file_pattern'])
+
     def start_file_watching(self):
-        """Start file watching."""
+        """Hand every listed folder to the real watcher, using this pane's settings."""
+        if not self.watch_requests:
+            self.file_events_log.appendPlainText("Nothing to watch - use Add Watch Folder first.")
+            return
+
+        settings = self._watch_settings()
+        if not settings['event_type']:
+            self.file_events_log.appendPlainText(
+                "No watch events selected - tick at least one under Watch Events.")
+            return
+
+        registered = 0
+        for folder in list(self.watch_requests):
+            try:
+                self._register_watch(folder)
+                registered += 1
+            except ValueError as error:
+                row = self._watch_row(folder)
+                if row is not None:
+                    self.watch_folders_table.item(row, 3).setText("Missing folder")
+                self.file_events_log.appendPlainText(f"Not watching {folder}: {error}")
+
+        if registered == 0:
+            return
+
+        self.file_watcher.start_watching()
         self.start_watching_btn.setEnabled(False)
         self.stop_watching_btn.setEnabled(True)
-        
-        self.file_events_log.appendPlainText("File watching started...")
-        
-        # Simulate file events
-        self.file_watch_timer = QTimer()
-        self.file_watch_timer.timeout.connect(self.simulate_file_event)
-        self.file_watch_timer.start(5000)  # Every 5 seconds
-        
-    def simulate_file_event(self):
-        """Simulate a file system event."""
-        import random
-        events = [
-            "File created: new_model.obj",
-            "File modified: existing_model.fbx", 
-            "File deleted: old_model.dae",
-            "File moved: model.gltf -> archive/"
-        ]
-        
-        event = random.choice(events)
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.file_events_log.appendPlainText(f"[{timestamp}] {event}")
+        self.file_events_log.appendPlainText(
+            f"Watching {registered} folder(s) for {', '.join(settings['event_type'])} "
+            f"(filter {settings['file_pattern']}, over {settings['min_size_kb']} KB; "
+            f"auto actions: {self._auto_action_summary().lower()}).")
+        self.update_dashboard_metrics()
+
+    def stop_file_watching(self):
+        """Stop the watcher and say so in the log the events go to."""
+        self.file_watcher.stop_watching()
+        self.start_watching_btn.setEnabled(True)
+        self.stop_watching_btn.setEnabled(False)
+        for folder in self.watch_requests:
+            row = self._watch_row(folder)
+            if row is not None:
+                self.watch_folders_table.item(row, 3).setText("Stopped")
+        self.file_events_log.appendPlainText("File watching stopped.")
+        self.update_dashboard_metrics()
 
     def update_dashboard_metrics(self):
         """Update dashboard status cards with real data."""
