@@ -32,7 +32,6 @@ class TestRenderFoxRectification(unittest.TestCase):
         from src.core.library_manager import LibraryManager
         from src.processing.mesh_processor import MeshProcessor, MeshTransformer
         from src.processing.point_cloud_processor import PointCloudProcessor, PointCloudRegistration
-        from src.features.smart_batch_processor import SmartBatchProcessor
         from src.features.diagnostic_engine import DiagnosticEngine, SystemInfo
         from src.processing.script_engine import ScriptAPI, ModelWrapper
 
@@ -110,22 +109,10 @@ class TestRenderFoxRectification(unittest.TestCase):
         # Verify processor has registration component initialized
         self.assertIsNotNone(proc.registration)
 
-    def test_06_smart_batch_processor_template_persistence(self):
-        """Test SmartBatchProcessor template persistence to JSON."""
-        from src.features.smart_batch_processor import SmartBatchProcessor
-        processor = SmartBatchProcessor()
-        
-        processor.create_template(
-            name="custom_game_template",
-            operation="optimize_mesh",
-            parameters={"merge_vertices": True, "reduction": 0.5},
-            description="Custom template for tests"
-        )
-        self.assertIn("custom_game_template", processor.list_templates())
-        
-        # Verify loaded back
-        loaded = processor._load_templates()
-        self.assertIn("custom_game_template", loaded)
+    # test_06 was `smart_batch_processor_template_persistence`. It passed, and it
+    # proved nothing: the module it tested saved a template name into a JSON file that
+    # no operation ever read, and its "batch" handler marked every task completed
+    # without writing a file. The module and this test both went with it.
 
     def test_07_diagnostics_cpu_info_non_blocking(self):
         """Test that DiagnosticEngine.SystemInfo.get_cpu_info does not block."""

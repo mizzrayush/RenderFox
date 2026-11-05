@@ -20,7 +20,7 @@ from PyQt6.QtGui import (
     QImage, QPainter, QColor, QPolygonF, QPen, QBrush, 
     QRadialGradient, QLinearGradient, QFont
 )
-from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtCore import QPointF, Qt, QCoreApplication
 
 
 def generate_3d_thumbnail(
@@ -29,11 +29,36 @@ def generate_3d_thumbnail(
     size: int = 256,
     bg_color: str = "#181a22",
     accent_color: tuple = (145, 175, 225)
-) -> bool:
+) -> dict:
     """
     Generate a high-contrast, shaded 3D preview thumbnail for a 3D model or point cloud.
+
+    'rendered' says whether the model itself is in the picture. Without it a caller cannot
+    tell a thumbnail of the asset from the fallback wireframe badge, and reporting the
+    badge as the model is exactly the kind of claim this app is meant to stop making.
+    'faces' is how many triangles reached the image, so a dense model that should have been
+    decimated before drawing cannot quietly be drawn whole.
     """
+    render_error = ""
+    faces_drawn = 0
     try:
+        if QCoreApplication.instance() is None:
+            # QImage and QPainter abort the process when there is no application to draw
+            # with, which is a worse answer than saying the picture could not be made.
+            return {'success': False, 'rendered': False,
+                    'error': 'there is no running application to draw the image with'}
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return {'success': False, 'rendered': False,
+                    'error': f'size {size!r} is not a number of pixels'}
+        if not 16 <= size <= 4096:
+            # The floor is not taste: the background grid divides by size // 8, and the
+            # ceiling is what this function is willing to allocate as one ARGB32 image.
+            # A caller that passes a number outside this range gets a verdict, not an
+            # allocation failure inside Qt - a failed QImage aborts the whole process.
+            return {'success': False, 'rendered': False,
+                    'error': f'size {size} is outside the 16..4096 pixels this can draw'}
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         
         img = QImage(size, size, QImage.Format.Format_ARGB32)
@@ -80,12 +105,15 @@ def generate_3d_thumbnail(
                     # Simplify dense meshes for instantaneous thumbnail generation
                     if len(mesh.faces) > 2500:
                         try:
-                            mesh = mesh.simplify_quadric_decimation(2500)
+                            # face_count, not percent: the first positional argument is the
+                            # fraction of faces to keep, and 2500 of those is no simplification.
+                            mesh = mesh.simplify_quadric_decimation(face_count=2500)
                         except Exception:
                             pass
                             
                     verts = np.array(mesh.vertices, dtype=np.float64)
                     faces = np.array(mesh.faces)
+                    faces_drawn = len(faces)
                     
                     # Center and scale to unit cube [-0.5, 0.5]
                     bbox_min = verts.min(axis=0)
@@ -163,10 +191,16 @@ def generate_3d_thumbnail(
                         painter.drawPolygon(poly)
                         
                     mesh_rendered = True
+                else:
+                    render_error = f"{os.path.basename(model_path)} holds no triangle mesh"
                     
             except Exception as e:
                 # Mesh load failed, fall back to isometric wireframe badge
-                pass
+                render_error = f"the model could not be read: {e}"
+        elif not TRIMESH_AVAILABLE:
+            render_error = "Trimesh is not installed, so no model can be read"
+        else:
+            render_error = f"there is no file at {model_path}"
                 
         # If geometry rendering was not possible, draw an elegant isometric 3D wireframe box
         if not mesh_rendered:
@@ -217,8 +251,13 @@ def generate_3d_thumbnail(
         painter.drawText(int(badge_x), int(badge_y), badge_w, badge_h, Qt.AlignmentFlag.AlignCenter, ext)
         
         painter.end()
-        img.save(output_path, "PNG")
-        return True
+        if not img.save(output_path, "PNG"):
+            return {'success': False, 'rendered': mesh_rendered,
+                    'error': f'{output_path} could not be written as a PNG'}
+        return {'success': True,
+                'rendered': mesh_rendered,
+                'faces': faces_drawn if mesh_rendered else 0,
+                'error': '' if mesh_rendered else render_error}
         
     except Exception as e:
-        return False
+        return {'success': False, 'rendered': False, 'error': str(e)}

@@ -16,7 +16,6 @@ from ..processing.model_extractor import ModelExtractor, ExtractedModel
 from ..processing.format_converter import FormatConverter, SupportedFormat, get_format_info
 from .model_viewer import ModelViewerWidget
 from ..processing.texture_baker import TextureBakerThread
-from .smart_batch_processor_ui import SmartBatchProcessorUI
 import os
 
 
@@ -200,11 +199,11 @@ class PreProcessingTab(QWidget):
 
         # Tab 5: Texture Baking
         self.create_baking_tab()
- 
-        # Tab 6: Smart Batch Processor
-        self.batch_processor_tab = SmartBatchProcessorUI()
-        self.operation_tabs.addTab(self.batch_processor_tab, "Batch Processor")
-        
+
+        # There is no sixth tab. A batch pane here stamped every task completed and
+        # wrote no file; Automation's Batch Operations is the one that runs, so
+        # `library_tab` sends a file there instead.
+
         # Wrap left panel in scroll area so small screens never compress UI
         left_scroll = QScrollArea()
         left_scroll.setWidget(left_panel)

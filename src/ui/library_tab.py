@@ -2389,10 +2389,10 @@ class LibraryTab(QWidget):
         pipeline_btn.clicked.connect(lambda: self._open_in_pipeline(model_path, dialog))
         layout.addWidget(pipeline_btn)
         
-        # BATCH PROCESSOR
-        batch_btn = QPushButton("Add to Batch Queue")
+        # BATCH OPERATIONS
+        batch_btn = QPushButton("Use in Batch Operations")
         batch_btn.setIcon(get_icon("batch_render"))
-        batch_btn.clicked.connect(lambda: self._open_in_batch_processor(model_path, dialog))
+        batch_btn.clicked.connect(lambda: self._open_in_batch_operations(model_path, dialog))
         layout.addWidget(batch_btn)
         
         # VIEW IN MODEL TAB (default)
@@ -2732,21 +2732,24 @@ class LibraryTab(QWidget):
         if parent:
             parent.tab_widget.setCurrentWidget(parent.pipeline_tab)
     
-    def _open_in_batch_processor(self, model_path: str, dialog):
-        """Add to batch processor."""
-        dialog.close()
-        # Get main window
-        parent = self.parent()
-        while parent and not hasattr(parent, 'preprocessing_tab'):
-            parent = parent.parent()
-        
-        if parent:
-            parent.tab_widget.setCurrentWidget(parent.preprocessing_tab)
-            # Switch to batch processor sub-tab if it exists
-            if hasattr(parent.preprocessing_tab, 'batch_processor_tab'):
-                parent.preprocessing_tab.tab_widget.setCurrentWidget(
-                    parent.preprocessing_tab.batch_processor_tab
-                )
+    def _open_in_batch_operations(self, model_path: str, dialog):
+        """Hand the file to Automation's Batch Operations pane.
+
+        This jump used to land on a "Batch Processor" sub-tab of Pre-Processing. That
+        pane built its own task list, stamped every task completed and wrote no file,
+        so there was nothing here to add a file to - and switching to it crashed,
+        because it asked Pre-Processing for a `tab_widget` it never had. The batch loop
+        that does run lives in Automation and works from a folder, so this fills that
+        folder in and leaves Preview to list the files.
+        """
+        dialog.accept()
+        main_window = self.window()
+        automation = getattr(main_window, 'automation_tab', None)
+        if not automation or not hasattr(main_window, 'tab_widget'):
+            return
+        main_window.tab_widget.setCurrentWidget(automation)
+        automation.automation_tabs.setCurrentWidget(automation.batch_operations_tab)
+        automation.batch_prepare_for_file(model_path)
     
 #     def _open_in_model_viewer(self, model_path: str, dialog):
 #         """Open in Model tab."""

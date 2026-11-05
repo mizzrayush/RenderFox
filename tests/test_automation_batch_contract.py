@@ -20,17 +20,26 @@ What this suite exists to keep out of the app:
   * `on_batch_progress` divided by `total` with no guard, and there is no pause or stop
     in the old processor at all.
 
+Phase 6f added the operations a batch was actually missing - convert, simplify, repair,
+weld, centre, scale, unwrap and thumbnail - and the rule that names the file each one
+leaves behind. The tests below run them over real meshes on disk and read the answers
+back out of the written files, because an action that reports a face count it asked for
+rather than one it measured is exactly the bug this suite was written to catch.
+
 Run: python -X utf8 tests/test_automation_batch_contract.py
 """
 
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import threading
 import time
 import unittest
+
+import trimesh
 
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -47,8 +56,18 @@ from src.ui.automation_tab import BACKUP_SUBFOLDER, AutomationTab
 
 APP = QApplication.instance() or QApplication([])
 
-BATCH_IDS = ['file.copy', 'file.delete', 'file.move', 'processing.generate_lod',
-             'system.run_command']
+# Every action the registry declares it can repeat over files, sorted as it offers them.
+BATCH_IDS = ['file.copy', 'file.delete', 'file.move', 'file.thumbnail',
+             'processing.center_pivot', 'processing.convert_format',
+             'processing.generate_lod', 'processing.generate_uvs',
+             'processing.normalize_size', 'processing.repair_mesh',
+             'processing.simplify_by_ratio', 'processing.simplify_to_faces',
+             'processing.weld_vertices', 'system.run_command']
+# The 6f additions, which a test below runs one file at a time over real meshes.
+MESH_IDS = ['processing.convert_format', 'processing.simplify_to_faces',
+            'processing.simplify_by_ratio', 'processing.repair_mesh',
+            'processing.weld_vertices', 'processing.center_pivot',
+            'processing.normalize_size', 'processing.generate_uvs', 'file.thumbnail']
 
 
 class FakeLibrary:
@@ -71,6 +90,7 @@ def register_probe(action_id, func, params=None, batch=None, case=None):
     def pop():
         ActionRegistry._actions.pop(action_id, None)
         ActionRegistry._batch_specs.pop(action_id, None)
+        ActionRegistry._batch_extensions.pop(action_id, None)
         ActionRegistry._descriptions.pop(action_id, None)
         ActionRegistry._param_specs.pop(action_id, None)
 
@@ -105,6 +125,30 @@ class DirCase(unittest.TestCase):
     def read(self, path):
         with open(path, encoding='utf-8') as handle:
             return handle.read()
+
+    # --- real meshes, so an action can be measured against what it wrote --------
+    def cube(self, folder, name='hero.obj', translated=None):
+        """A twelve-face box. Small enough to check by hand, real enough to load."""
+        mesh = trimesh.creation.box()
+        if translated is not None:
+            mesh.apply_translation(translated)
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        mesh.export(path)
+        return path
+
+    def sphere(self, folder, name='hero.obj', subdivisions=3, radius=1.0):
+        """A dense mesh - what a simplifier is actually asked to reduce."""
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        trimesh.creation.icosphere(subdivisions=subdivisions,
+                                   radius=radius).export(path)
+        return path
+
+    def count(self, path, what='faces'):
+        """How many faces or vertices the file on disk really has."""
+        loaded = trimesh.load(path, process=False)
+        return len(getattr(loaded, what))
 
 
 class BindingCase(DirCase):
@@ -1088,6 +1132,460 @@ class PaneCase(DirCase):
         self.assertIn('cannot run', log)
         self.assertEqual(self.tab.batch_status_label.text(), 'Preview: nothing can run yet.')
         self.assertEqual(sorted(os.listdir(self.src)), ['a.obj', 'b.obj'], 'preview wrote something')
+
+    # --- a batch of real meshes -------------------------------------------------
+    def test_80_a_conversion_names_the_file_it_will_leave_behind(self):
+        """The destination is renamed at bind time, so Preview speaks of that file.
+
+        Without this the plan promised `hero.obj` while `hero.stl` appeared, and the
+        overwrite switch checked a name nothing ever wrote.
+        """
+        self.cube(self.src, 'hero.obj')
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out, params='"output_format": "stl"', backup=False)
+        plan = self.tab._batch_plan()
+        self.assertEqual(len(plan['ready']), 1, plan)
+        self.assertEqual(plan['ready'][0][1]['destination'],
+                         os.path.join(self.out, 'hero.stl'))
+        self.assertIn('hero.stl', '\n'.join(plan['lines']))
+
+    def test_81_a_thumbnail_destination_is_named_as_a_picture(self):
+        self.cube(self.src, 'hero.obj')
+        self.configure(operation='file.thumbnail', folder=self.src, output=self.out,
+                       backup=False)
+        plan = self.tab._batch_plan()
+        self.assertEqual(plan['ready'][0][1]['destination'],
+                         os.path.join(self.out, 'hero.png'))
+        self.assertIn('.png', self.tab.batch_hint_label.text())
+
+    def test_82_only_an_action_that_takes_a_format_is_offered_one(self):
+        self.configure(operation='file.copy', folder=self.src, output=self.out)
+        self.assertNotIn('output_format', self.tab.batch_hint_label.text())
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out)
+        self.assertIn('output_format', self.tab.batch_hint_label.text())
+
+    def test_83_a_conversion_batch_writes_every_file_and_reports_its_bytes(self):
+        for name in ('a.obj', 'b.obj'):
+            self.cube(self.src, name)
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out, params='"output_format": "stl"', backup=False)
+        self.tab.start_batch_operation()
+        self.settle()
+        self.assertEqual(sorted(os.listdir(self.out)), ['a.stl', 'b.stl'])
+        self.assertEqual(self.tab.batch_status_label.text(),
+                         'Finished 2 file(s): 2 ok, 0 failed')
+        log = self.tab.batch_log.toPlainText()
+        for name in ('a', 'b'):
+            self.assertIn(f'ok - {name}.obj: Converted {name}.obj to {name}.stl', log)
+            self.assertEqual(self.count(os.path.join(self.out, f'{name}.stl')), 12,
+                             'the written file is not the mesh the log says it is')
+
+    def test_84_the_overwrite_switch_reads_the_renamed_destination(self):
+        self.cube(self.src, 'hero.obj')
+        already = os.path.join(self.out, 'hero.stl')
+        with open(already, 'w', encoding='utf-8') as handle:
+            handle.write('mine')
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out, params='"output_format": "stl"',
+                       overwrite=False, backup=False)
+        plan = self.tab._batch_plan()
+        self.assertEqual(plan['ready'], [], plan)
+        self.assertIn('already there', plan['blocked'][0])
+        self.tab.start_batch_operation()
+        self.assertEqual(self.read(already), 'mine', 'a blocked batch overwrote it')
+        self.assertEqual(self.tab.batch_status_label.text(), 'Nothing ran.')
+        self.assertIn('hero.obj: ', self.warnings()[-1])
+        self.assertIn('already there', self.warnings()[-1])
+
+    def test_85_an_action_that_says_no_is_two_failed_files_not_a_completed_run(self):
+        for name in ('a.obj', 'b.obj'):
+            self.cube(self.src, name)
+        self.configure(operation='file.thumbnail', folder=self.src, output=self.out,
+                       params='"size": 4', backup=False)
+        self.tab.start_batch_operation()
+        self.settle()
+        self.assertEqual(self.tab.batch_status_label.text(),
+                         'Finished 2 file(s): 0 ok, 2 failed')
+        log = self.tab.batch_log.toPlainText()
+        self.assertIn('failed - a.obj:', log)
+        self.assertIn('not an image this app will draw', log)
+        self.assertEqual(os.listdir(self.out), [], 'the refused thumbnail wrote a file')
+
+    def test_86_a_file_picked_elsewhere_fills_the_fields_the_batch_reads(self):
+        path = self.cube(os.path.join(self.src, 'deep'), 'hero.obj')
+        self.tab.batch_prepare_for_file(path)
+        self.assertEqual(self.tab.source_type_combo.currentText(), 'Folder')
+        self.assertEqual(self.tab.source_path_edit.text(), os.path.dirname(path))
+        self.assertEqual(self.tab.file_types_edit.text(), '.obj')
+        self.assertFalse(self.tab.recursive_cb.isChecked())
+        self.assertEqual(self.tab.batch_status_label.text(), 'Nothing has run yet.')
+        items, why = self.tab.collect_batch_items()
+        self.assertIsNone(why, why)
+        self.assertEqual([os.path.normpath(one) for one in items],
+                         [os.path.normpath(path)])
+
+    def test_87_the_library_jump_lands_on_the_pane_that_runs(self):
+        """`Use in Batch Operations` used to raise AttributeError on the way.
+
+        It switched Pre-Processing to a sub-tab through a `tab_widget` that pane never
+        had. The jump now walks to Automation's own batch tab, which is the one with the
+        batch loop, the contract suite and the real actions behind it.
+        """
+        from PyQt6.QtWidgets import QLabel, QTabWidget
+        from src.ui.library_tab import LibraryTab
+
+        class Window:
+            pass
+
+        class Jump:
+            def __init__(self, window):
+                self._window = window
+
+            def window(self):
+                return self._window
+
+        class Dialog:
+            accepted = False
+
+            def accept(self):
+                Dialog.accepted = True
+
+        window = Window()
+        window.tab_widget = QTabWidget()
+        window.automation_tab = AutomationTab()
+        away = QLabel('the tab the user was already on')
+        window.tab_widget.addTab(away, 'Library')
+        window.tab_widget.addTab(window.automation_tab, 'Automation')
+        window.tab_widget.setCurrentWidget(away)
+        self.assertIs(window.tab_widget.currentWidget(), away,
+                      'a one-tab window proves nothing: the jump has to move something')
+        path = self.cube(self.src, 'hero.obj')
+
+        LibraryTab._open_in_batch_operations(Jump(window), path, Dialog())
+
+        self.assertTrue(Dialog.accepted)
+        self.assertIs(window.tab_widget.currentWidget(), window.automation_tab)
+        self.assertIs(window.automation_tab.automation_tabs.currentWidget(),
+                      window.automation_tab.batch_operations_tab)
+        self.assertEqual(window.automation_tab.file_types_edit.text(), '.obj')
+
+    def test_88_the_pane_that_claimed_a_batch_is_gone_from_the_app(self):
+        """No second batch implementation is left to disagree with the one that runs."""
+        for path in (os.path.join('src', 'features', 'smart_batch_processor.py'),
+                     os.path.join('src', 'ui', 'smart_batch_processor_ui.py')):
+            self.assertFalse(os.path.exists(os.path.join(ROOT, path)),
+                             f'{path} is still in the app')
+        sources = []
+        for folder, _dirs, names in os.walk(os.path.join(ROOT, 'src')):
+            for name in names:
+                if name.endswith('.py'):
+                    with open(os.path.join(folder, name), encoding='utf-8') as handle:
+                        sources.append((name, handle.read()))
+        for name, text in sources:
+            self.assertNotIn('smart_batch_processor', text, f'{name} still imports it')
+        with open(os.path.join(ROOT, 'src', 'ui', 'preprocessing_tab.py'),
+                  encoding='utf-8') as handle:
+            preprocessing = handle.read()
+        self.assertNotIn('batch_processor_tab', preprocessing)
+        self.assertNotIn('SmartBatchProcessorUI', preprocessing)
+        with open(os.path.join(ROOT, 'src', 'ui', 'library_tab.py'),
+                  encoding='utf-8') as handle:
+            library = handle.read()
+        self.assertNotIn('preprocessing_tab.tab_widget', library)
+        self.assertNotIn('_open_in_batch_processor', library)
+        # Nothing is queued by this app, so nothing may promise a queue.
+        self.assertNotIn('Add to Batch Queue', library)
+
+
+class MeshOperationCase(DirCase):
+    """Each 6f action over one real file, with every number read back from the result.
+
+    A batch is only as honest as the call it repeats, and the failure mode this guards
+    against is the one the deleted batch pane had: reporting the settings it was asked
+    for as if they were the file it produced. So each test below opens the written file
+    and compares what is in it to what the action claimed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        ActionRegistry.register_default_actions()
+
+    def setUp(self):
+        self.work = tempfile.mkdtemp(prefix='renderfox_6f_mesh_')
+        self.addCleanup(shutil.rmtree, self.work, True)
+        self.out = os.path.join(self.work, 'out')
+        os.makedirs(self.out)
+
+    def run_action(self, action_id, source, destination, **params):
+        return ActionRegistry.execute(action_id, input_file=source,
+                                      destination=destination, **params)
+
+    def test_89_every_offered_action_takes_the_file_as_input_file(self):
+        for action_id in MESH_IDS:
+            self.assertEqual(ActionRegistry.batch_binding(action_id),
+                             ('input_file', 'destination'), action_id)
+
+    def test_90_convert_writes_the_format_the_destination_names(self):
+        source = self.cube(self.work, 'hero.obj')
+        destination = os.path.join(self.out, 'hero.stl')
+        outcome = self.run_action('processing.convert_format', source, destination)
+        self.assertTrue(outcome['success'], outcome)
+        self.assertIn(str(os.path.getsize(destination)), outcome['result'])
+        self.assertEqual(self.count(destination), 12, outcome['result'])
+        self.assertEqual(outcome['output_path'], destination)
+
+    def test_91_a_conversion_to_the_format_it_already_is_is_refused_by_name(self):
+        source = self.cube(self.work, 'hero.obj')
+        destination = os.path.join(self.out, 'hero.obj')
+        outcome = self.run_action('processing.convert_format', source, destination)
+        self.assertFalse(outcome['success'])
+        self.assertIn('output_format', outcome['error'])
+        self.assertFalse(os.path.exists(destination), 'a refusal still wrote the file')
+
+    def test_92_a_format_parameter_renames_the_destination(self):
+        source = self.cube(self.work, 'hero.obj')
+        kwargs, why = ActionRegistry.bind_batch_params(
+            'processing.convert_format', source, self.out, {'output_format': 'glb'})
+        self.assertIsNone(why, why)
+        self.assertEqual(kwargs['destination'], os.path.join(self.out, 'hero.glb'))
+        # Nothing asked for a format, so the name is kept - and the action then says no
+        # to the file that name describes, rather than quietly rewriting it in place.
+        kwargs, _why = ActionRegistry.bind_batch_params(
+            'processing.convert_format', source, self.out, {})
+        self.assertEqual(kwargs['destination'], os.path.join(self.out, 'hero.obj'))
+        refused = ActionRegistry.execute('processing.convert_format', **kwargs)
+        self.assertFalse(refused['success'], refused)
+
+    def test_93_a_thumbnail_is_named_and_drawn_as_a_png(self):
+        self.assertEqual(ActionRegistry.batch_extension('file.thumbnail'), 'png')
+        source = self.cube(self.work, 'hero.obj')
+        kwargs, why = ActionRegistry.bind_batch_params(
+            'file.thumbnail', source, self.out, {})
+        self.assertIsNone(why, why)
+        self.assertEqual(kwargs['destination'], os.path.join(self.out, 'hero.png'))
+        self.assertNotIn('output_format', ActionRegistry.parameter_names('file.thumbnail'))
+
+        outcome = self.run_action('file.thumbnail', source, kwargs['destination'], size=64)
+        self.assertTrue(outcome['success'], outcome)
+        with open(kwargs['destination'], 'rb') as handle:
+            drawn = handle.read()
+        self.assertEqual(drawn[:8], b'\x89PNG\r\n\x1a\n', 'not a PNG at all')
+        self.assertEqual(struct.unpack('>II', drawn[16:24]), (64, 64),
+                         'the image is not the size the action reported')
+
+    def test_94_a_thumbnail_says_no_when_the_file_has_no_mesh_in_it(self):
+        source = self.make(self.work, 'empty.obj', '# nothing but a comment\n')
+        outcome = self.run_action('file.thumbnail', source,
+                           os.path.join(self.out, 'empty.png'), size=64)
+        self.assertFalse(outcome['success'])
+        self.assertIn('no triangles', outcome['error'])
+
+    def test_95_a_thumbnail_refuses_a_name_or_a_size_it_cannot_draw(self):
+        source = self.cube(self.work, 'hero.obj')
+        wrong_name = os.path.join(self.out, 'hero.jpg')
+        outcome = self.run_action('file.thumbnail', source, wrong_name, size=64)
+        self.assertFalse(outcome['success'])
+        self.assertIn('.png', outcome['error'])
+        self.assertFalse(os.path.exists(wrong_name))
+        for size in (4, 9000):
+            refused = self.run_action('file.thumbnail', source,
+                               os.path.join(self.out, 'hero.png'), size=size)
+            self.assertFalse(refused['success'], size)
+            self.assertIn('16 and 4096', refused['error'])
+            self.assertFalse(os.path.exists(os.path.join(self.out, 'hero.png')), size)
+
+    def test_96_simplify_reports_the_faces_the_written_file_has(self):
+        source = self.sphere(self.work, 'ball.obj', subdivisions=3)
+        destination = os.path.join(self.out, 'ball.obj')
+        original = self.count(source)
+        # 197 and not 200: the filter lands on 196 for this mesh, which is the only reason
+        # this test can tell "the number the file has" from "the number it was asked for".
+        outcome = self.run_action('processing.simplify_to_faces', source, destination,
+                           target_faces=197)
+        self.assertTrue(outcome['success'], outcome)
+        kept = self.count(destination)
+        self.assertNotEqual(kept, 197,
+                            'this build now lands exactly on the target, so the test can no '
+                            'longer separate a measured face count from a requested one')
+        self.assertEqual(outcome['output_faces'], kept, outcome['result'])
+        self.assertEqual(original, 1280, 'the mesh this test authoring made changed')
+        self.assertIn(f'{original} -> {kept}', outcome['result'])
+        self.assertLess(kept, original)
+
+    def test_97_simplify_by_ratio_reports_the_faces_the_written_file_has(self):
+        source = self.sphere(self.work, 'ball.obj', subdivisions=2)
+        destination = os.path.join(self.out, 'ball.obj')
+        original = self.count(source)
+        outcome = self.run_action('processing.simplify_by_ratio', source, destination, ratio=0.5)
+        self.assertTrue(outcome['success'], outcome)
+        kept = self.count(destination)
+        self.assertEqual(outcome['output_faces'], kept, outcome['result'])
+        self.assertIn(str(original), outcome['result'])
+        self.assertLess(kept, original)
+        self.assertGreater(kept, 0)
+
+    def test_98_repair_leaves_a_mesh_and_lists_the_steps_it_ran(self):
+        source = self.sphere(self.work, 'ball.obj', subdivisions=1)
+        destination = os.path.join(self.out, 'ball.obj')
+        outcome = self.run_action('processing.repair_mesh', source, destination)
+        self.assertTrue(outcome['success'], outcome)
+        self.assertIn(str(os.path.getsize(destination)), outcome['result'])
+        self.assertGreater(self.count(destination), 0, 'the repaired file has no mesh in it')
+        for step in outcome['operations']:
+            self.assertIn(step, outcome['result'])
+
+    def test_99_weld_reports_the_vertices_the_written_file_lost(self):
+        vertices = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        source = os.path.join(self.work, 'doubled.obj')
+        trimesh.Trimesh(vertices=vertices, faces=[[0, 2, 3], [1, 2, 3]],
+                       process=False).export(source)
+        destination = os.path.join(self.out, 'doubled.obj')
+        outcome = self.run_action('processing.weld_vertices', source, destination)
+        self.assertTrue(outcome['success'], outcome)
+        before, after = self.count(source, 'vertices'), self.count(destination, 'vertices')
+        self.assertEqual(outcome['removed'], before - after, outcome['result'])
+        self.assertLessEqual(after, before)
+        self.assertIn('exactly equal vertices', outcome['result'])
+        with_threshold = self.run_action('processing.weld_vertices', source,
+                                  os.path.join(self.out, 'loose.obj'), threshold=1.0)
+        self.assertTrue(with_threshold['success'], with_threshold)
+        self.assertIn('within 1.0 of the bounding diagonal', with_threshold['result'])
+
+    def test_100_centering_moves_the_mesh_it_says_it_moved(self):
+        source = self.cube(self.work, 'hero.obj', translated=(10.0, 5.0, -2.0))
+        destination = os.path.join(self.out, 'hero.obj')
+        outcome = self.run_action('processing.center_pivot', source, destination)
+        self.assertTrue(outcome['success'], outcome)
+        centre = trimesh.load(destination, process=False).centroid
+        self.assertTrue(max(abs(value) for value in centre) < 1e-6, centre)
+        self.assertIn('10.000', outcome['result'])
+
+    def test_101_normalizing_makes_the_side_it_names_the_length_it_names(self):
+        source = self.sphere(self.work, 'ball.obj', subdivisions=1, radius=3.0)
+        destination = os.path.join(self.out, 'ball.obj')
+        outcome = self.run_action('processing.normalize_size', source, destination, target_size=2.0)
+        self.assertTrue(outcome['success'], outcome)
+        longest = max(trimesh.load(destination, process=False).bounding_box.extents)
+        self.assertAlmostEqual(longest, 2.0, places=6, msg=outcome['result'])
+        refused = self.run_action('processing.normalize_size', source,
+                           os.path.join(self.out, 'nothing.obj'), target_size=0)
+        self.assertFalse(refused['success'])
+        self.assertIn('target_size', refused['error'])
+        self.assertFalse(os.path.exists(os.path.join(self.out, 'nothing.obj')))
+
+    def test_102_an_unwrap_is_proved_by_the_coordinates_in_the_file(self):
+        source = self.cube(self.work, 'hero.obj')
+        for method in ('trivial', 'flat_plane'):
+            destination = os.path.join(self.out, f'{method}.obj')
+            outcome = self.run_action('processing.generate_uvs', source, destination, method=method)
+            self.assertTrue(outcome['success'], (method, outcome))
+            unwrapped = trimesh.load(destination, process=False)
+            self.assertEqual(len(unwrapped.visual.uv), outcome['uv_points'], outcome['result'])
+            self.assertGreater(outcome['uv_points'], 0)
+            self.assertIn(method, outcome['result'])
+        ply = self.run_action('processing.generate_uvs', source, os.path.join(self.out, 'hero.ply'))
+        self.assertTrue(ply['success'], ply)
+
+    def test_103_an_unwrap_refuses_a_format_that_cannot_hold_texture_coordinates(self):
+        source = self.cube(self.work, 'hero.obj')
+        stl = os.path.join(self.out, 'hero.stl')
+        outcome = self.run_action('processing.generate_uvs', source, stl)
+        self.assertFalse(outcome['success'])
+        self.assertIn('.obj or .ply', outcome['error'])
+        self.assertFalse(os.path.exists(stl), 'a refused unwrap wrote a file')
+
+    def test_104_an_unwrap_names_the_methods_it_offers(self):
+        source = self.cube(self.work, 'hero.obj')
+        outcome = self.run_action('processing.generate_uvs', source,
+                           os.path.join(self.out, 'hero.obj'), method='atlas')
+        self.assertFalse(outcome['success'])
+        self.assertIn("'trivial'", outcome['error'])
+        self.assertIn("'flat_plane'", outcome['error'])
+        self.assertIn("'atlas'", outcome['error'])
+
+    def test_105_a_missing_file_is_named_by_the_action_that_could_not_read_it(self):
+        gone = os.path.join(self.work, 'gone.obj')
+        for action_id in MESH_IDS:
+            outcome = self.run_action(action_id, gone, os.path.join(self.out, 'hero.out'))
+            self.assertFalse(outcome['success'], action_id)
+            self.assertIn('gone.obj', outcome['error'], action_id)
+
+    def test_106_a_parameter_the_action_does_not_take_is_refused_before_it_runs(self):
+        source = self.cube(self.work, 'hero.obj')
+        outcome = ActionRegistry.execute('processing.convert_format', input_file=source,
+                                         destination=os.path.join(self.out, 'hero.stl'),
+                                         target_faces=500)
+        self.assertFalse(outcome['success'])
+        self.assertIn('no parameter named', outcome['error'])
+        self.assertFalse(os.path.exists(os.path.join(self.out, 'hero.stl')))
+
+    def test_107_the_renderer_says_whether_the_model_reached_the_image(self):
+        """The action's verdict is only as good as the renderer's own answer.
+
+        A thumbnail always produces a PNG - the fallback draws a wireframe badge when
+        there is nothing to read - so `rendered` is the only thing that keeps a badge
+        from being reported as the asset.
+        """
+        from src.utils.thumbnail_renderer import generate_3d_thumbnail
+
+        drawn = generate_3d_thumbnail(self.cube(self.work, 'hero.obj'),
+                                      os.path.join(self.out, 'hero.png'), size=64)
+        self.assertTrue(drawn['success'], drawn)
+        self.assertTrue(drawn['rendered'], drawn)
+        self.assertEqual(drawn['error'], '', drawn)
+
+        badge = generate_3d_thumbnail(self.make(self.work, 'empty.obj', '# nothing\n'),
+                                      os.path.join(self.out, 'empty.png'), size=64)
+        self.assertTrue(badge['success'], badge)
+        self.assertFalse(badge['rendered'], badge)
+        self.assertIn('holds no triangle mesh', badge['error'])
+
+    def test_108_a_dense_mesh_still_gives_a_picture_of_itself(self):
+        """The thumbnail pass thins a heavy mesh before drawing it.
+
+        `simplify_quadric_decimation`'s first positional argument is a *percentage*, not
+        a face count, and 2500% is not a thing - so the count has to be passed by name or
+        the densest models are the ones that stop drawing.
+        """
+        from src.utils.thumbnail_renderer import generate_3d_thumbnail
+
+        dense = self.sphere(self.work, 'ball.obj', subdivisions=5)
+        self.assertGreater(self.count(dense), 2500, 'this test lost its dense mesh')
+        outcome = generate_3d_thumbnail(dense, os.path.join(self.out, 'ball.png'), size=128)
+        self.assertTrue(outcome['success'], outcome)
+        self.assertTrue(outcome['rendered'], outcome)
+        self.assertGreater(outcome['faces'], 0,
+                           'the verdict claims a picture with no triangles in it')
+        self.assertLessEqual(outcome['faces'], 2500,
+                             f"the picture was made from {outcome['faces']} triangles, so the "
+                             "dense-mesh pass never ran and the heaviest models are drawn whole")
+        self.assertIn('triangles drawn',
+                      self.run_action('file.thumbnail', dense,
+                                      os.path.join(self.out, 'action.png'),
+                                      size=128)['result'])
+        self.assertEqual(struct.unpack('>II', open(os.path.join(self.out, 'ball.png'),
+                                                   'rb').read()[16:24]), (128, 128))
+
+    def test_109_the_drawing_function_refuses_a_canvas_it_cannot_allocate(self):
+        """The renderer keeps its own size bound, so a bad number cannot kill the app.
+
+        QImage of a size Qt cannot give, followed by a QPainter on it, is a process abort
+        (exit 0xc0000409) rather than a Python error - so the bound that protects the
+        batch's policy sentence is not enough on its own, and this is the test that says
+        the drawing function will not be handed a canvas it has to fail on.
+        """
+        from src.utils.thumbnail_renderer import generate_3d_thumbnail
+
+        source = self.cube(self.work, 'hero.obj')
+        destination = os.path.join(self.out, 'hero.png')
+        for size in (8, 'large'):
+            outcome = generate_3d_thumbnail(source, destination, size=size)
+            self.assertFalse(outcome['success'], size)
+            self.assertFalse(outcome['rendered'], size)
+            self.assertIn(str(size) if isinstance(size, int) else 'number of pixels',
+                          outcome['error'])
+            self.assertFalse(os.path.exists(destination), f'{size} still wrote a file')
 
 
 if __name__ == '__main__':

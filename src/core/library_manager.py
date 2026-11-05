@@ -981,8 +981,8 @@ class LibraryManager(QObject):
             if force or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
                 try:
                     from src.utils.thumbnail_renderer import generate_3d_thumbnail
-                    success = generate_3d_thumbnail(model_path, thumb_path, size=256)
-                    if success:
+                    outcome = generate_3d_thumbnail(model_path, thumb_path, size=256) or {}
+                    if outcome.get('success'):
                         return thumb_path
                 except Exception:
                     pass

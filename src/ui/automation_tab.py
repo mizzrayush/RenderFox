@@ -105,6 +105,7 @@ class AutomationTab(QWidget):
         
         # Batch Operations tab
         batch_tab = self.create_batch_operations_tab()
+        self.batch_operations_tab = batch_tab
         self.automation_tabs.addTab(batch_tab, "Batch Operations")
         
         # Task Scheduler tab
@@ -1739,8 +1740,15 @@ class AutomationTab(QWidget):
             return ("Runs one command once per file. Write {file} where the file's path "
                     "should appear; the command's exit code is the verdict.")
         if folder_param == 'destination':
+            extension = ActionRegistry.batch_extension(action_id)
+            if extension:
+                return (f"Reads each file as {item_param} and writes a .{extension} into the "
+                        f"output folder, named after the file and given as {folder_param}.")
+            rename = (' Set output_format to name a different extension.'
+                      if 'output_format' in ActionRegistry.parameter_names(action_id)
+                      else '')
             return (f"Reads each file as {item_param} and writes it into the output "
-                    f"folder under its own name as {folder_param}.")
+                    f"folder under its own name as {folder_param}." + rename)
         if folder_param:
             return (f"Reads each file as {item_param} and puts whatever it writes in the "
                     f"output folder given as {folder_param}.")
@@ -1897,6 +1905,34 @@ class AutomationTab(QWidget):
         if plan['blocked']:
             note += f", {len(plan['blocked'])} cannot"
         self.batch_status_label.setText(note)
+
+    def batch_prepare_for_file(self, model_path):
+        """Fill the batch pane with the folder and extension of a file picked elsewhere.
+
+        The pane works from a folder plus an extension filter, so this is as close to
+        "batch this file" as it gets: the folder it sits in, subfolders left out, and
+        the filter set to the extension it has. Nothing is queued and nothing runs -
+        the batch loop is the only thing that reads a file, and Preview is what lists
+        the files this choice gives.
+        """
+        path = os.path.abspath(model_path)
+        folder = os.path.dirname(path)
+        extension = os.path.splitext(path)[1].lower()
+        self.source_type_combo.setCurrentText('Folder')
+        self.source_path_edit.setText(folder)
+        # A file with no extension would give a filter that matches nothing, so the
+        # blank - which means every model format - is the honest value.
+        self.file_types_edit.setText(extension if extension else '')
+        self.recursive_cb.setChecked(False)
+        self.batch_log.setPlainText('\n'.join([
+            f'Set up from the library for {os.path.basename(path)}',
+            f'Source: {folder}',
+            f'Files: {self.file_types_edit.text() or "every model format"}',
+            'Subfolders are excluded, so the files offered are the ones beside it.',
+            'Choose an operation and an output folder, then press Preview.',
+            '',
+            'The status line below still describes the last run.',
+        ]))
 
     def _batch_operation(self, action, output_dir, params, switches):
         """The one call every file gets, with the switches read once at the start."""

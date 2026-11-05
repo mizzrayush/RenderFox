@@ -70,15 +70,19 @@ class ActionRegistry:
     # into, the parameter the output folder goes into, or None when it leaves no file of
     # its own) - can be repeated over a list. The rest cannot be, so they are not offered.
     _batch_specs: Dict[str, Any] = {}
+    # The extension a batch gives the file this action writes, when the action's own output
+    # is not the format it was read in (a thumbnail of a .obj is a .png, not a .obj).
+    _batch_extensions: Dict[str, str] = {}
     
     @classmethod
     def register(cls, action_id: str, func: Callable, description: str = "", params: Dict = None,
-                 batch: Any = None):
+                 batch: Any = None, batch_extension: str = ""):
         """Register a new action, and say whether a batch of files can use it."""
         cls._actions[action_id] = func
         cls._descriptions[action_id] = description
         cls._param_specs[action_id] = params or {}
         cls._batch_specs[action_id] = tuple(batch) if batch else None
+        cls._batch_extensions[action_id] = str(batch_extension or '').strip().lstrip('.').lower()
         print(f"Registered action: {action_id}")
         
     @classmethod
@@ -269,6 +273,339 @@ class ActionRegistry:
             "levels": {"type": "int", "required": False}
         }, batch=('input_file', 'output_dir'))
 
+        # --- The mesh operations a batch can run over a folder of models ---
+        #
+        # Each one calls the same backend the single-model panes call, and each one reads
+        # its own numbers back from the file it wrote rather than from what it asked for.
+
+        def landed(path: str):
+            """The size of the file this action was meant to leave behind, or None."""
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return None
+            return size if size else None
+
+        def convert_format(input_file: str, destination: str, output_format: str = ''):
+            from ..processing.format_converter import FormatConverter
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            source_ext = os.path.splitext(input_file)[1].lower()
+            target_ext = os.path.splitext(destination)[1].lower()
+            if not target_ext:
+                raise ValueError(f"{destination} names no extension, so there is no format "
+                                 "to convert to")
+            if target_ext == source_ext:
+                return {'success': False,
+                        'error': f"{os.path.basename(destination)} would be written as "
+                                 f"{target_ext}, the format it already is - set output_format "
+                                 f"(for example \"glb\") to name the format to convert to"}
+            outcome = FormatConverter().convert_file(input_file, destination) or {}
+            if not outcome.get('success'):
+                return {'success': False,
+                        'error': outcome.get('message') or 'the converter gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported converted but is not a file "
+                                 "with bytes in it"}
+            skipped = outcome.get('options_skipped') or []
+            line = (f"Converted {os.path.basename(input_file)} to {os.path.basename(destination)} "
+                    f"({size} bytes) with {outcome.get('method') or 'the first library that worked'}")
+            if skipped:
+                line += f"; {', '.join(skipped)} not applied"
+            return {'success': True, 'result': line, 'output_path': destination}
+
+        cls.register("processing.convert_format", convert_format,
+                     "Convert a model to the format the destination extension names", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "output_format": {"type": "str", "required": False}
+        }, batch=('input_file', 'destination'))
+
+        def simplify_to_faces(input_file: str, destination: str, target_faces: int = 10000,
+                              preserve_boundary: bool = False, preserve_normal: bool = False,
+                              preserve_topology: bool = False, quality_threshold: float = 0.3):
+            from ..processing.mesh_processor import MeshSimplifier
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            outcome = MeshSimplifier.simplify_quadric(
+                input_file, destination, target_faces=int(target_faces),
+                preserve_boundary=bool(preserve_boundary),
+                preserve_normal=bool(preserve_normal),
+                preserve_topology=bool(preserve_topology),
+                quality_threshold=float(quality_threshold)) or {}
+            if not outcome.get('success'):
+                return {'success': False, 'error': outcome.get('error') or 'the simplifier gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported simplified but is not a file "
+                                 "with bytes in it"}
+            return {'success': True,
+                    'result': f"{os.path.basename(input_file)}: {outcome.get('original_faces')} "
+                              f"-> {outcome.get('output_faces')} faces "
+                              f"({outcome.get('reduction', 0):.1f}% off), {size} bytes",
+                    'output_path': destination,
+                    'output_faces': outcome.get('output_faces')}
+
+        cls.register("processing.simplify_to_faces", simplify_to_faces,
+                     "Collapse faces down to a fixed number", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "target_faces": {"type": "int", "required": False},
+            "preserve_boundary": {"type": "bool", "required": False},
+            "preserve_normal": {"type": "bool", "required": False},
+            "preserve_topology": {"type": "bool", "required": False},
+            "quality_threshold": {"type": "float", "required": False}
+        }, batch=('input_file', 'destination'))
+
+        def simplify_by_ratio(input_file: str, destination: str, ratio: float = 0.5):
+            from ..processing.mesh_processor import MeshSimplifier
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            outcome = MeshSimplifier.simplify_ratio(
+                input_file, destination, ratio=float(ratio)) or {}
+            if not outcome.get('success'):
+                return {'success': False, 'error': outcome.get('error') or 'the simplifier gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported simplified but is not a file "
+                                 "with bytes in it"}
+            return {'success': True,
+                    'result': f"{os.path.basename(input_file)}: kept {ratio} of "
+                              f"{outcome.get('original_faces')} faces -> "
+                              f"{outcome.get('output_faces')} ({size} bytes)",
+                    'output_path': destination,
+                    'output_faces': outcome.get('output_faces')}
+
+        cls.register("processing.simplify_by_ratio", simplify_by_ratio,
+                     "Collapse faces down to a fraction of what they were", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "ratio": {"type": "float", "required": False}
+        }, batch=('input_file', 'destination'))
+
+        def repair_mesh(input_file: str, destination: str):
+            from ..processing.mesh_processor import MeshRepairer
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            outcome = MeshRepairer.auto_repair(input_file, destination) or {}
+            if not outcome.get('success'):
+                return {'success': False, 'error': outcome.get('error') or 'the repairer gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported repaired but is not a file "
+                                 "with bytes in it"}
+            done = outcome.get('operations') or []
+            return {'success': True,
+                    'result': f"Repaired {os.path.basename(input_file)} into "
+                              f"{os.path.basename(destination)} ({size} bytes): "
+                              + ('; '.join(done) if done else 'nothing had to be changed'),
+                    'output_path': destination, 'operations': done}
+
+        cls.register("processing.repair_mesh", repair_mesh,
+                     "Run the whole repair pass: weld, drop bad faces, re-orient, close holes", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True}
+        }, batch=('input_file', 'destination'))
+
+        def weld_vertices(input_file: str, destination: str, threshold: float = None):
+            from ..processing.mesh_processor import MeshRepairer
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            outcome = MeshRepairer.remove_duplicate_vertices(
+                input_file, destination,
+                threshold=None if threshold is None else float(threshold)) or {}
+            if not outcome.get('success'):
+                return {'success': False, 'error': outcome.get('error') or 'the welder gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported welded but is not a file "
+                                 "with bytes in it"}
+            removed = outcome.get('removed')
+            how = ('exactly equal vertices' if threshold is None else
+                   f'within {threshold} of the bounding diagonal')
+            return {'success': True,
+                    'result': f"Welded {removed} vertices in {os.path.basename(input_file)} "
+                              f"({how}); {os.path.basename(destination)} is {size} bytes",
+                    'output_path': destination, 'removed': removed}
+
+        cls.register("processing.weld_vertices", weld_vertices,
+                     "Merge the vertices that sit on top of each other", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "threshold": {"type": "float", "required": False}
+        }, batch=('input_file', 'destination'))
+
+        def center_pivot(input_file: str, destination: str):
+            from ..processing.mesh_processor import MeshTransformer
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            outcome = MeshTransformer.center(input_file, destination) or {}
+            if not outcome.get('success'):
+                return {'success': False, 'error': outcome.get('error') or 'the mover gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported centred but is not a file "
+                                 "with bytes in it"}
+            moved = outcome.get('original_center')
+            where = ('(%s)' % ', '.join('%.3f' % value for value in moved)) if moved else 'unknown'
+            return {'success': True,
+                    'result': f"Moved {os.path.basename(input_file)} so its centre sits at the "
+                              f"origin (it was {where}); {os.path.basename(destination)} is "
+                              f"{size} bytes",
+                    'output_path': destination}
+
+        cls.register("processing.center_pivot", center_pivot,
+                     "Put the mesh centre on the origin", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True}
+        }, batch=('input_file', 'destination'))
+
+        def normalize_size(input_file: str, destination: str, target_size: float = 1.0):
+            from ..processing.mesh_processor import MeshTransformer
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            if float(target_size) <= 0:
+                return {'success': False,
+                        'error': f'target_size {target_size} is not a size; give a number '
+                                 'greater than zero'}
+            outcome = MeshTransformer.normalize_scale(
+                input_file, destination, target_size=float(target_size)) or {}
+            if not outcome.get('success'):
+                return {'success': False, 'error': outcome.get('error') or 'the scaler gave no reason'}
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported scaled but is not a file "
+                                 "with bytes in it"}
+            return {'success': True,
+                    'result': f"Scaled {os.path.basename(input_file)} by "
+                              f"{outcome.get('scale_factor'):.5f} so its longest side is "
+                              f"{target_size} units; {os.path.basename(destination)} is "
+                              f"{size} bytes",
+                    'output_path': destination}
+
+        cls.register("processing.normalize_size", normalize_size,
+                     "Scale a model so its longest side is a given length", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "target_size": {"type": "float", "required": False}
+        }, batch=('input_file', 'destination'))
+
+        def generate_uvs(input_file: str, destination: str, method: str = 'trivial'):
+            """Unwrap into real texture coordinates and prove the file kept them.
+
+            PyMeshLab is called with literal filter names because the installed build is
+            the only authority on them; the two below are the ones measured against this
+            build. The Voronoi atlas filter is deliberately not used - it brought the
+            interpreter down on a plain cube, which is not a result to put in a batch.
+            """
+            import trimesh
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            extension = os.path.splitext(destination)[1].lower()
+            if extension not in ('.obj', '.ply'):
+                return {'success': False,
+                        'error': f"{os.path.basename(destination)} is {extension or 'extensionless'}, "
+                                 "which cannot hold UVs - this build writes texture coordinates "
+                                 "into .obj or .ply (PyMeshLab has no glb/gltf writer)"}
+            try:
+                import pymeshlab
+            except ImportError:
+                return {'success': False, 'error': 'PyMeshLab is not installed, so nothing can unwrap'}
+            ms = pymeshlab.MeshSet()
+            try:
+                ms.load_new_mesh(input_file)
+                if method == 'trivial':
+                    ms.apply_filter('compute_texcoord_parametrization_triangle_trivial_per_wedge')
+                elif method == 'flat_plane':
+                    ms.apply_filter('compute_texcoord_parametrization_flat_plane_per_wedge')
+                else:
+                    return {'success': False,
+                            'error': f"generate_uvs offers 'trivial' (one patch per face) and "
+                                     f"'flat_plane' (one projection); '{method}' is neither"}
+                ms.save_current_mesh(destination)
+            except Exception as error:
+                return {'success': False, 'error': f"the unwrap failed on "
+                                                   f"{os.path.basename(input_file)}: {error}"}
+            finally:
+                del ms
+            size = landed(destination)
+            if size is None:
+                return {'success': False,
+                        'error': f"{destination} was reported unwrapped but is not a file "
+                                 "with bytes in it"}
+            try:
+                unwrapped = trimesh.load(destination, process=False)
+                points = getattr(unwrapped.visual, 'uv', None)
+                count = len(points) if points is not None else 0
+            except Exception as error:
+                return {'success': False,
+                        'error': f"{destination} cannot be read back to check its UVs: {error}"}
+            if not count:
+                return {'success': False,
+                        'error': f"{destination} reads back with no texture coordinates, "
+                                 "so the unwrap did not land"}
+            return {'success': True,
+                    'result': f"Unwrapped {os.path.basename(input_file)} ({method} UVs, "
+                              f"{count} coordinates) into {os.path.basename(destination)} "
+                              f"({size} bytes)",
+                    'output_path': destination, 'uv_points': count}
+
+        cls.register("processing.generate_uvs", generate_uvs,
+                     "Generate UVs and read them back from the written file", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "method": {"type": "str", "required": False}
+        }, batch=('input_file', 'destination'))
+
+        def make_thumbnail(input_file: str, destination: str, size: int = 256):
+            from ..utils.thumbnail_renderer import generate_3d_thumbnail
+            if not os.path.isfile(input_file):
+                raise FileNotFoundError(f"there is no model at {input_file}")
+            if os.path.splitext(destination)[1].lower() != '.png':
+                return {'success': False,
+                        'error': f"{os.path.basename(destination)} is not a .png, and the "
+                                 "picture this action writes is always a PNG"}
+            try:
+                size = int(size)
+            except (TypeError, ValueError):
+                return {'success': False, 'error': f"size {size!r} is not a number of pixels"}
+            if not 16 <= size <= 4096:
+                return {'success': False,
+                        'error': f"size {size} is not an image this app will draw; pick "
+                                 "between 16 and 4096 pixels"}
+            outcome = generate_3d_thumbnail(input_file, destination, size=size) or {}
+            bytes_written = landed(destination)
+            if not outcome.get('success') or bytes_written is None:
+                return {'success': False,
+                        'error': outcome.get('error') or
+                                 f"{destination} is not a file with bytes in it"}
+            if not outcome.get('rendered'):
+                return {'success': False,
+                        'error': f"the picture was drawn but {os.path.basename(input_file)} "
+                                 "contributed no triangles to it: "
+                                 f"{outcome.get('error') or 'the mesh could not be read'}"}
+            faces = int(outcome.get('faces') or 0)
+            return {'success': True,
+                    'result': f"Thumbnail of {os.path.basename(input_file)} written to "
+                              f"{os.path.basename(destination)} ({bytes_written} bytes, "
+                              f"{size}x{size}, {faces} triangles drawn)",
+                    'output_path': destination, 'faces_drawn': faces}
+
+        cls.register("file.thumbnail", make_thumbnail,
+                     "Draw a model into a PNG preview image", {
+            "input_file": {"type": "str", "required": True},
+            "destination": {"type": "str", "required": True},
+            "size": {"type": "int", "required": False}
+        }, batch=('input_file', 'destination'), batch_extension='png')
+
 
     @classmethod
     def batch_actions(cls) -> Dict[str, str]:
@@ -280,6 +617,16 @@ class ActionRegistry:
     def batch_binding(cls, action_id: str):
         """How a batch feeds this action one file, or None when it cannot have one."""
         return cls._batch_specs.get(action_id)
+
+    @classmethod
+    def batch_extension(cls, action_id: str) -> str:
+        """The extension a batch gives this action's output, or '' when it keeps the file's own."""
+        return cls._batch_extensions.get(action_id, '')
+
+    @classmethod
+    def parameter_names(cls, action_id: str) -> list:
+        """The parameters this action was registered with, by name."""
+        return sorted(cls._param_specs.get(action_id) or {})
 
     @classmethod
     def bind_batch_params(cls, action_id: str, item: str, output_dir: str = '',
@@ -315,7 +662,16 @@ class ActionRegistry:
                 if not os.path.isdir(folder):
                     return None, (f"the output folder {folder} is not a folder - make it, or "
                                   "choose somewhere that already exists")
-                merged[folder_param] = (os.path.join(folder, os.path.basename(item))
+                name = os.path.basename(item)
+                # A conversion says the format it wants in output_format; an action whose
+                # output is always a different kind of file (a thumbnail) says so when it
+                # registered. Either way the destination is named before the run, so the
+                # overwrite rule and Preview both speak about the file that will exist.
+                extension = (str(merged.get('output_format') or '').strip().lstrip('.').lower()
+                             or cls._batch_extensions.get(action_id, ''))
+                if folder_param == 'destination' and extension:
+                    name = '%s.%s' % (os.path.splitext(name)[0], extension)
+                merged[folder_param] = (os.path.join(folder, name)
                                         if folder_param == 'destination' else folder)
                 if folder_param == 'destination' and (
                         os.path.normcase(merged['destination']) == os.path.normcase(item)):
