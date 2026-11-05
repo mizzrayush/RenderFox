@@ -11,9 +11,13 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QTableWidget, QTableWidgetItem, QHeaderView, QInputDialog,
                              QScrollArea, QFrame)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from ..processing.lod_generator import LODGenerator, LODSettings, is_supported_format
-from ..processing.model_extractor import ModelExtractor, ExtractedModel
+from ..processing.lod_generator import (LODGenerator, LODSettings, is_supported_format,
+                                        get_supported_formats)
+from ..processing.model_extractor import (ModelExtractor, ExtractedModel,
+                                          get_extraction_methods_info)
 from ..processing.format_converter import FormatConverter, SupportedFormat, get_format_info
+from ..processing.scene_optimizer import SceneOptimizer
+from ..processing.texture_optimizer import TextureOptimizer, available_formats
 from .model_viewer import ModelViewerWidget
 from ..processing.texture_baker import TextureBakerThread
 import os
@@ -42,35 +46,84 @@ class LODPreviewThread(QThread):
             self.preview_ready.emit(preview)
         except Exception as e:
             self.error_occurred.emit(str(e))
-class ModelExtractionThread(QThread):
-    """Thread for extracting models from scenes without blocking UI."""
-    
-    extraction_complete = pyqtSignal(list)
+class LodGenerationThread(QThread):
+    """Writes the LOD chain away from the click handler.
+
+    generate_lods() used to run inside the button behind a dialog it never updated: the
+    window froze for the whole chain and the Cancel button was wired to nothing. The
+    dialog's range is the number of levels, its value is the number of files on disk, and
+    a stop returns what got written instead of pretending nothing happened.
+    """
+
+    stage = pyqtSignal(int, int, str)             # written, asked, sentence
+    finished_with = pyqtSignal(list, list, bool)  # files, per-level failures, stopped
     error_occurred = pyqtSignal(str)
-    
-    def __init__(self, file_path, min_faces):
+
+    def __init__(self, file_path, output_dir, settings):
+        super().__init__()
+        self.file_path = file_path
+        self.output_dir = output_dir
+        self.settings = settings
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        try:
+            generator = LODGenerator(self.settings)
+            files = generator.generate_lods(
+                self.file_path, self.output_dir,
+                progress=lambda done, total, text: self.stage.emit(done, total, text),
+                should_cancel=lambda: self._stop_requested)
+            self.finished_with.emit(files, list(generator.errors), bool(self._stop_requested))
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+class ModelExtractionThread(QThread):
+    """Splits a scene into parts away from the click handler.
+
+    The pane used to show a QProgressDialog with no range and a Cancel that did nothing,
+    then print the row count. Progress is now parts done of parts found, and a stop
+    reports what it reached.
+    """
+
+    stage = pyqtSignal(int, int, str)
+    extraction_complete = pyqtSignal(list, dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, file_path, min_faces, method='connected_components'):
         super().__init__()
         self.file_path = file_path
         self.min_faces = min_faces
-    
+        self.method = method
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
     def run(self):
         try:
             extractor = ModelExtractor()
-            models = extractor.extract_from_scene(self.file_path, self.min_faces)
-            self.extraction_complete.emit(models)
+            models = extractor.extract_from_scene(
+                self.file_path, self.min_faces, self.method,
+                progress=lambda done, total, text: self.stage.emit(done, total, text),
+                should_cancel=lambda: self._stop_requested)
+            self.extraction_complete.emit(models, dict(extractor.summary))
         except Exception as e:
             self.error_occurred.emit(str(e))
 
 class FormatConversionThread(QThread):
     """Thread for batch format conversion."""
-    
+
     # (what converted, what did not). One list before: convert_file() answers with a
     # dict, and a dict is truthy even when it says success=False, so every failure was
     # counted and shown as a converted file.
-    conversion_complete = pyqtSignal(list, list)
+    conversion_complete = pyqtSignal(list, list, bool)
     progress_update = pyqtSignal(int, str)
     error_occurred = pyqtSignal(str)
-    
+
     def __init__(self, input_files, output_dir, target_format, options=None, output_mode=0,
                  generate_lods=False):
         super().__init__()
@@ -80,7 +133,12 @@ class FormatConversionThread(QThread):
         self.options = options
         self.output_mode = output_mode
         self.generate_lods = generate_lods
-    
+        self._stop_requested = False
+
+    def request_stop(self):
+        """Ask for a stop between files; the conversion in hand is allowed to finish."""
+        self._stop_requested = True
+
     def _output_dir_for(self, input_file):
         if self.output_dir:
             return self.output_dir
@@ -99,8 +157,18 @@ class FormatConversionThread(QThread):
             converter = FormatConverter()
             converted = []
             failed = []
-            
+            stopped = False
+
             for i, input_file in enumerate(self.input_files):
+                if self._stop_requested:
+                    # The files behind the stop are named as never run, so the results
+                    # dialog adds up to the list the user put in.
+                    for skipped in self.input_files[i:]:
+                        failed.append({'input': skipped, 'output': None,
+                                       'error': 'not run - the batch was stopped'})
+                    stopped = True
+                    break
+
                 self.progress_update.emit(i, f"Converting {os.path.basename(input_file)}...")
                 
                 base_name = os.path.splitext(os.path.basename(input_file))[0]
@@ -132,9 +200,117 @@ class FormatConversionThread(QThread):
                     entry['error'] = result.get('message', 'Conversion failed')
                     failed.append(entry)
             
-            self.conversion_complete.emit(converted, failed)
+            self.conversion_complete.emit(converted, failed, stopped)
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+class _ExportThread(QThread):
+    """Writes the ticked parts so the dialog's Cancel means something.
+
+    A handful of small meshes is quick, but an extracted scene can be hundreds of parts
+    and every one of them is a file write; on the click handler that froze the window and
+    the Cancel button was decoration.
+    """
+
+    stage = pyqtSignal(int, int, str)
+    finished_with = pyqtSignal(dict, bool)
+    error = pyqtSignal(str)
+
+    def __init__(self, models, output_dir, format_ext):
+        super().__init__()
+        self.models = models
+        self.output_dir = output_dir
+        self.format_ext = format_ext
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        try:
+            verdict = ModelExtractor().export_selected_models(
+                self.models, self.output_dir, self.format_ext,
+                progress=lambda done, total, text: self.stage.emit(done, total, text),
+                should_cancel=lambda: self._stop_requested)
+            self.finished_with.emit(verdict, bool(self._stop_requested))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class OptimizationThread(QThread):
+    """Runs the Advanced pane's preview and both optimisers away from the click handler.
+
+    `operation` is 'preview', 'textures' or 'scene'. A preview measures and writes
+    nothing. When both switches are armed the texture run goes first and the scene run
+    takes the model the texture run wrote: two independent copies of one file would
+    leave the user choosing which half of the work survived.
+    """
+
+    stage = pyqtSignal(int, int, str)
+    finished_with = pyqtSignal(str, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, operation, file_path, output_dir, settings):
+        super().__init__()
+        self.operation = operation
+        self.file_path = file_path
+        self.output_dir = output_dir
+        self.settings = settings
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def _preview(self):
+        """One read of the file, counted both ways the pane's switches can act on it."""
+        optimizer = TextureOptimizer()
+        scene, carried = optimizer.converter.read_scene(self.file_path)
+        if scene is None:
+            return {'error': f'cannot read {os.path.basename(self.file_path)}: {carried}'}
+        rows = []
+        for entry in optimizer.find_textures(scene):
+            image = entry['image']
+            rows.append({'name': entry['name'], 'part': entry['part'],
+                         'slot': entry['slot'], 'size': image.size,
+                         'format': image.format or 'PNG', 'shared_by': entry['shared_by'],
+                         'bytes': optimizer.baseline_bytes(image)})
+        payload = {'file': os.path.basename(self.file_path),
+                   'textures': rows, 'read_with': carried,
+                   'scene': SceneOptimizer(optimizer.converter)
+                   .analyze_scene(scene, self.file_path, carried)}
+        if self._stop_requested:
+            payload['stopped'] = True
+        return payload
+
+    def run(self):
+        try:
+            if self.operation == 'preview':
+                self.finished_with.emit('preview', self._preview())
+                return
+            reports = []
+            source = self.file_path
+            if self.settings['textures']:
+                report = TextureOptimizer().optimize(
+                    source, self.output_dir,
+                    quality=self.settings['quality'], target=self.settings['target'],
+                    max_size=self.settings['max_size'],
+                    progress=lambda done, total, text: self.stage.emit(done, total, text),
+                    should_cancel=lambda: self._stop_requested)
+                reports.append(('textures', report))
+                source = report.model_output or source
+            if not self._stop_requested and self.settings['scene']:
+                report = SceneOptimizer().optimize(
+                    source, self.output_dir,
+                    remove_hidden=self.settings['remove_hidden'],
+                    merge_static=self.settings['merge_static'],
+                    simplify_materials=self.settings['simplify_materials'],
+                    progress=lambda done, total, text: self.stage.emit(done, total, text),
+                    should_cancel=lambda: self._stop_requested)
+                reports.append(('scene', report))
+            self.finished_with.emit(self.operation, reports)
+        except Exception as e:
+            self.error.emit(f'{type(e).__name__}: {e}')
+
 
 class PreProcessingTab(QWidget):
     """Enhanced pre-processing tab with model extraction, format conversion, and 3D preview."""
@@ -143,11 +319,36 @@ class PreProcessingTab(QWidget):
         super().__init__()
         self.current_file = None
         self.extracted_models = []
+        self.lod_progress = None
+        self.lod_thread = None
+        self.extraction_progress = None
+        self.extraction_thread = None
+        self.conversion_thread = None
+        self.conversion_progress = None
+        self.optimization_thread = None
+        self.optimization_progress = None
+        self.baking_thread = None
+        self.progress_dialog = None
+        self.bake_message = None
+        self._workers = []
         self.lod_generator = LODGenerator()
         self.model_extractor = ModelExtractor()
         self.format_converter = FormatConverter()
         self.init_ui()
-    
+
+    def _keep_worker(self, thread):
+        """Hold every started worker until it says it is done.
+
+        Reassigning `self.<run>_thread` throws away the previous worker's last Python
+        reference; if that one is still running, Qt answers a destroyed running QThread by
+        terminating the process - so loading a new file while a preview is still running
+        would close the whole app, with no error to read. The list keeps it alive, and its
+        own `finished` signal is what releases it.
+        """
+        self._workers.append(thread)
+        thread.finished.connect(lambda: self._workers.remove(thread))
+        return thread
+
     def init_ui(self):
         """Initialize the enhanced pre-processing UI."""
         layout = QHBoxLayout(self)
@@ -219,17 +420,35 @@ class PreProcessingTab(QWidget):
         splitter.setSizes([550, 550])
     
     def load_model(self, file_path):
-        """Load a model for processing."""
-        if os.path.exists(file_path):
-            self.current_file = file_path
-            if hasattr(self, 'file_path'):
-                self.file_path.setText(file_path)
-            
-            # Load into 3D viewer
-            if hasattr(self, 'model_viewer'):
-                self.model_viewer.load_model(file_path)
-            # Trigger analysis or update UI as needed
-            # self.update_file_info()
+        """Take the model the Library or a browse dialog chose, and mean it everywhere.
+
+        This used to set current_file and stop. A model could arrive from the Library,
+        show in the viewer, and leave Generate LODs greyed out - only this pane's own
+        Browse button enabled it - while the conversion picker kept offering targets that
+        belonged to whichever file was loaded before it.
+        """
+        if not file_path or not os.path.exists(file_path):
+            return
+        self.current_file = file_path
+        self.file_path.setText(file_path)
+        self.model_viewer.load_model(file_path)
+        self.toggle_lod_controls(self.enable_lod.isChecked())
+        self._forget_previous_run()
+        self._refresh_target_availability()
+        self._refresh_optimization_buttons()
+
+    def _forget_previous_run(self):
+        """Drop every report and part that belongs to the file this one replaced.
+
+        They used to survive a load, so the Advanced pane could still be showing the byte
+        counts of the file before it, and Export could write the parts of that earlier file
+        into the folder of this one.
+        """
+        self.extracted_models = []
+        self.models_table.setRowCount(0)
+        self.extraction_summary_label.setText('')
+        self.opt_results.setPlainText('')
+
 
     def create_output_settings(self):
         """Create output settings group."""
@@ -384,10 +603,17 @@ class PreProcessingTab(QWidget):
         self.min_faces_spin.setRange(1, 10000)
         self.min_faces_spin.setValue(100)
         extract_layout.addRow("Min Faces:", self.min_faces_spin)
-        
-        extract_btn = QPushButton("Extract Models")
-        extract_btn.clicked.connect(self.extract_models)
-        extract_layout.addRow(extract_btn)
+
+        # The extractor has always had five methods; the pane used to run the first one
+        # whatever the file was, so three of the module's behaviours were unreachable.
+        self.extraction_method = QComboBox()
+        for method_id, description in get_extraction_methods_info().items():
+            self.extraction_method.addItem(f"{method_id} - {description}", method_id)
+        extract_layout.addRow("Method:", self.extraction_method)
+
+        self.extract_btn = QPushButton("Extract Models")
+        self.extract_btn.clicked.connect(self.extract_models)
+        extract_layout.addRow(self.extract_btn)
         
         layout.addWidget(extract_group)
         
@@ -403,6 +629,12 @@ class PreProcessingTab(QWidget):
         self.models_table.horizontalHeader().setStretchLastSection(True)
         self.models_table.setMinimumHeight(160)
         models_layout.addWidget(self.models_table)
+
+        # What the run counted, in the extractor's own numbers. Left empty until a run
+        # finishes - a pane that opens with "0 parts" would be inventing a result.
+        self.extraction_summary_label = QLabel("")
+        self.extraction_summary_label.setWordWrap(True)
+        models_layout.addWidget(self.extraction_summary_label)
         
         # Model actions
         model_actions = QHBoxLayout()
@@ -529,17 +761,49 @@ class PreProcessingTab(QWidget):
         self.texture_quality = QSlider(Qt.Orientation.Horizontal)
         self.texture_quality.setRange(1, 100)
         self.texture_quality.setValue(80)
-        self.quality_label = QLabel("80%")
+        # The box is the typable twin of the slider and takes numbers the slider has no
+        # notch for; the optimizer applies the nearest setting the encoders accept and
+        # says so in the report. PNG ignores it - it is lossless - which the tooltip says.
+        self.texture_quality_value = QSpinBox()
+        self.texture_quality_value.setRange(1, 1000)
+        self.texture_quality_value.setValue(80)
+        self.texture_quality_value.setSuffix("%")
+        self.texture_quality_value.setToolTip(
+            "Lossy formats only. PNG is lossless, so this changes nothing for it.")
         self.texture_quality.valueChanged.connect(
-            lambda v: self.quality_label.setText(f"{v}%"))
+            lambda v: _sync_quietly(self.texture_quality_value, v))
+        self.texture_quality_value.valueChanged.connect(
+            lambda v: _sync_quietly(self.texture_quality, min(max(v, 1), 100)))
         
         quality_layout = QHBoxLayout()
         quality_layout.addWidget(self.texture_quality)
-        quality_layout.addWidget(self.quality_label)
+        quality_layout.addWidget(self.texture_quality_value)
         texture_layout.addRow("Quality:", quality_layout)
         
+        self.texture_max_size = QSpinBox()
+        self.texture_max_size.setRange(0, 65536)
+        self.texture_max_size.setSingleStep(512)
+        self.texture_max_size.setValue(0)
+        self.texture_max_size.setSuffix(" px")
+        self.texture_max_size.setSpecialValueText("No cap")
+        self.texture_max_size.setToolTip(
+            "Textures wider than this are rescaled to it. 'No cap' leaves every "
+            "texture at the size it came with.")
+        texture_layout.addRow("Max size:", self.texture_max_size)
+        
         self.texture_format = QComboBox()
-        self.texture_format.addItems(["PNG", "JPEG", "WEBP", "Original"])
+        # Asked of the installed Pillow build, so "Convert to: WEBP" is an offer this
+        # machine can keep. A choice it cannot encode is greyed with the reason.
+        for choice in available_formats():
+            self.texture_format.addItem(choice)
+        for index in range(self.texture_format.count()):
+            reason = available_formats()[self.texture_format.itemText(index)]
+            if reason:
+                self.texture_format.model().item(index).setEnabled(False)
+                self.texture_format.setItemData(index, reason, Qt.ItemDataRole.ToolTipRole)
+        first_open = next((i for i in range(self.texture_format.count())
+                           if self.texture_format.model().item(i).isEnabled()), 0)
+        self.texture_format.setCurrentIndex(first_open)
         texture_layout.addRow("Convert to:", self.texture_format)
         
         layout.addWidget(texture_group)
@@ -565,11 +829,32 @@ class PreProcessingTab(QWidget):
         
         layout.addWidget(scene_group)
         
-        # Preview button
-        preview_btn = QPushButton("Preview All Optimizations")
-        preview_btn.clicked.connect(self.preview_optimizations)
-        layout.addWidget(preview_btn)
+        # What the two groups can see, before and after. Like the LOD preview, it stays
+        # empty until asked - a pane that opened with numbers nobody read would be a guess.
+        self.opt_results = QTextEdit()
+        self.opt_results.setMinimumHeight(100)
+        self.opt_results.setMaximumHeight(180)
+        self.opt_results.setReadOnly(True)
+        self.opt_results.setPlaceholderText(
+            "Preview counts the textures and parts a file carries. Apply writes the "
+            "optimized copy and lists what changed.")
+        layout.addWidget(self.opt_results)
         
+        # Actions
+        action_layout = QHBoxLayout()
+        self.opt_preview_btn = QPushButton("Preview All Optimizations")
+        self.opt_preview_btn.clicked.connect(self.preview_optimizations)
+        action_layout.addWidget(self.opt_preview_btn)
+        
+        self.opt_apply_btn = QPushButton("Apply Optimizations")
+        self.opt_apply_btn.clicked.connect(self.apply_optimizations)
+        action_layout.addWidget(self.opt_apply_btn)
+        layout.addLayout(action_layout)
+        
+        # The switches stay set-up-able while off, the same way the LOD pane's do; what
+        # they really gate is Apply, so ticking one changes something you can see.
+        for switch in (self.enable_texture_opt, self.enable_scene_opt):
+            switch.toggled.connect(lambda _: self._refresh_optimization_buttons())
         layout.addStretch()
         
         scroll = QScrollArea()
@@ -638,6 +923,12 @@ class PreProcessingTab(QWidget):
         
         layout.addWidget(settings_group)
         
+        # What the baker landed, in its own words. Empty until a run ends, so the pane
+        # never opens with a result nobody asked for.
+        self.bake_summary_label = QLabel("")
+        self.bake_summary_label.setWordWrap(True)
+        layout.addWidget(self.bake_summary_label)
+        
         # Actions
         action_layout = QHBoxLayout()
         self.bake_btn = QPushButton("Bake Textures")
@@ -654,18 +945,18 @@ class PreProcessingTab(QWidget):
         self.operation_tabs.addTab(scroll, "Texture Baking")
 
     def browse_high_poly(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select High Poly Mesh", "", "3D Models (*.obj *.ply *.stl *.fbx *.glb *.gltf)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select High Poly Mesh", "", self.readable_filter("High Poly Mesh"))
         if path:
             self.high_poly_path.setText(path)
-            if hasattr(self, 'viewer') and self.viewer:
-                self.viewer.load_model(path)
+            self.model_viewer.load_model(path)
 
     def browse_low_poly(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Low Poly Mesh", "", "3D Models (*.obj *.ply *.stl *.fbx *.glb *.gltf)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Low Poly Mesh", "", self.readable_filter("Low Poly Mesh"))
         if path:
             self.low_poly_path.setText(path)
-            if hasattr(self, 'viewer') and self.viewer:
-                self.viewer.load_model(path)
+            self.model_viewer.load_model(path)
 
     def start_baking(self):
         high_poly = self.high_poly_path.text()
@@ -679,7 +970,14 @@ class PreProcessingTab(QWidget):
         if not high_poly or not low_poly:
             QMessageBox.warning(self, "Missing Inputs", "Please select both High Poly and Low Poly meshes.")
             return
-            
+
+        missing = [os.path.basename(p) for p in (high_poly, low_poly) if not os.path.isfile(p)]
+        if missing:
+            sentence = f"Baking did not start - {', '.join(missing)} is not a file on this disk."
+            self.bake_summary_label.setText(sentence)
+            QMessageBox.warning(self, "Baking Did Not Start", sentence)
+            return
+
         output_dir = self.get_output_directory(low_poly)
         resolution = int(self.bake_res.currentText())
         
@@ -689,60 +987,91 @@ class PreProcessingTab(QWidget):
             'ao': self.bake_ao.isChecked()
         }
         
+        self.bake_message = None
+        self.bake_btn.setEnabled(False)
         self.progress_dialog = QProgressDialog("Baking Textures...", "Cancel", 0, 100, self)
+        self.progress_dialog.setMinimumDuration(0)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dialog.show()
-        
-        self.baking_thread = TextureBakerThread(high_poly, low_poly, output_dir, resolution, options)
+
+        self.baking_thread = self._keep_worker(TextureBakerThread(
+            high_poly, low_poly, output_dir, resolution, options))
         self.baking_thread.progress_update.connect(self.update_baking_progress)
         self.baking_thread.baking_complete.connect(self.baking_finished)
         self.baking_thread.error_occurred.connect(self.baking_error)
+        # The button says Cancel, so it has to reach the worker. The map already
+        # rasterising is allowed to finish - stopping a PyMeshLab filter mid-call
+        # leaves the MeshSet in a state this build cannot recover - and the maps
+        # behind it are reported as never run.
+        self.progress_dialog.canceled.connect(self.baking_thread.request_stop)
         self.baking_thread.start()
         
     def update_baking_progress(self, value, message):
-        self.progress_dialog.setValue(value)
-        self.progress_dialog.setLabelText(message)
-        
-    def baking_finished(self, success, results):
-        self.progress_dialog.close()
-        if success:
-            msg = "Baking Successful!\n\nGenerated Maps:\n"
-            for type_, path in results.items():
-                msg += f"- {type_.title()}: {os.path.basename(path)}\n"
-            QMessageBox.information(self, "Baking Complete", msg)
-        else:
-            QMessageBox.warning(self, "Baking Failed", "See error log for details.")
+        self._show_stage(self.progress_dialog, value, 100, message)
 
     def baking_error(self, message):
-        self.progress_dialog.close()
-        QMessageBox.critical(self, "Baking Error", f"An error occurred:\n{message}")
+        """Keep the baker's own sentence; it is the only one that names the cause.
+
+        Every failure path emits this before its verdict, so `baking_finished` stays
+        quiet when a message has already arrived here - two boxes for one failure
+        leave the user guessing which one was the real complaint.
+        """
+        self.bake_message = message
+        self.bake_summary_label.setText(message)
+        progress, self.progress_dialog = self.progress_dialog, None
+        if progress is not None:
+            progress.close()
+        self.bake_btn.setEnabled(True)
+        QMessageBox.warning(self, "Baking Error", message)
+
+    def baking_finished(self, success, results):
+        self.bake_btn.setEnabled(True)
+        progress, self.progress_dialog = self.progress_dialog, None
+        if progress is not None:
+            progress.close()
+        landed = ', '.join(f"{kind.title()}: {os.path.basename(path)}"
+                           for kind, path in results.items())
+        if success:
+            self.bake_summary_label.setText(
+                f"Baked {len(results)} map(s){': ' + landed if landed else ''}")
+            QMessageBox.information(self, "Baking Complete",
+                                    f"Baked {len(results)} map(s).\n\n{landed}")
+            return
+        if self.bake_message:
+            return
+        self.bake_summary_label.setText(
+            f"Baking ended short: {len(results)} map(s) on disk"
+            + (f" ({landed})" if landed else ""))
+        QMessageBox.warning(self, "Baking Failed",
+                           f"Only {len(results)} of the requested maps were written.")
+    def readable_filter(self, label="3D Model Files"):
+        """The browse filter, built from what a reader here can actually open.
+
+        These lists used to be typed out and they drifted: they named extensions no
+        library installed here can read, so a picker let a user choose a file that was
+        always going to fail on open. The extensions are asked of the converter now.
+        """
+        exts = ' '.join(f'*{ext}' for ext in self.format_converter.readable_formats())
+        return f'{label} ({exts});;All Files (*)'
+
     def browse_file(self):
         """Browse for input 3D model file."""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select 3D Model or Scene File",
-            "", "3D Model Files (*.obj *.ply *.stl *.off *.dae *.gltf *.glb *.3mf *.fbx);;All Files (*)")
-        
+            self, "Select 3D Model or Scene File", "", self.readable_filter())
         if file_path:
-            self.file_path.setText(file_path)
-            self.current_file = file_path
-            self.generate_lods_btn.setEnabled(True)
-            
-            # Load in 3D viewer
-            self.model_viewer.load_model(file_path)
-            
-            # Update LOD preview if enabled
-            if self.enable_lod.isChecked():
-                self.update_lod_preview()
-    
+            self.load_model(file_path)
+
     def toggle_lod_controls(self, enabled):
-        """Enable/disable LOD controls based on checkbox state."""
-        # Keep controls enabled for editing
-        self.lod_levels.setEnabled(True)
-        self.lod_preview.setEnabled(True)
-        
-        for spin in self.ratio_inputs:
-            spin.setEnabled(True)
-        
+        """What the switch decides, and what it deliberately leaves alone.
+
+        The level count and the per-level ratios stay editable with the switch off, so a
+        run can be set up before it is armed. What the switch really controls is
+        Generate: it only answers while the switch is on and a file is loaded, so ticking
+        it changes something the user can see instead of being decoration.
+        """
+        for widget in [self.lod_levels, self.lod_preview] + list(self.ratio_inputs):
+            widget.setEnabled(True)
+        self.generate_lods_btn.setEnabled(bool(enabled) and bool(self.current_file))
         if self.current_file:
             self.update_lod_preview()
     
@@ -762,7 +1091,8 @@ class PreProcessingTab(QWidget):
         )
         
         # Start preview thread
-        self.preview_thread = LODPreviewThread(self.current_file, settings)
+        self.preview_thread = self._keep_worker(
+            LODPreviewThread(self.current_file, settings))
         self.preview_thread.preview_ready.connect(self.display_lod_preview)
         self.preview_thread.error_occurred.connect(self.show_preview_error)
         self.preview_thread.start()
@@ -806,54 +1136,96 @@ class PreProcessingTab(QWidget):
         self.lod_preview.setPlainText(f"Preview Error: {error_message}")
     
     def generate_lods(self):
-        """Generate LOD files from the current input."""
+        """Write the LOD chain for the loaded model, off the click handler."""
         if not self.current_file:
             QMessageBox.information(self, "No File Selected",
                                    "Please select a 3D model file first.")
             return
-        
+
         if not self.enable_lod.isChecked():
             QMessageBox.information(self, "LOD Generation Disabled",
                                    "Please enable LOD generation first.")
             return
-        
-        # Get output directory
+
+        if not is_supported_format(self.current_file):
+            QMessageBox.warning(self, "Cannot read this file",
+                                f"{os.path.basename(self.current_file)} is not a format any "
+                                f"library here can open. Convert it to one of "
+                                f"{', '.join(get_supported_formats())} first.")
+            return
+
         output_dir = self.get_output_directory(self.current_file)
-        
-        # Collect ratios from dynamic inputs
         ratios = [spin.value() for spin in self.ratio_inputs]
-        
-        # Create settings from UI
-        settings = LODSettings(
-            levels=self.lod_levels.value(),
-            custom_ratios=ratios
-        )
-        
-        # Show progress dialog
-        progress = QProgressDialog("Generating LOD files...", "Cancel", 0, 0, self)
+        settings = LODSettings(levels=self.lod_levels.value(), custom_ratios=ratios)
+
+        progress = QProgressDialog("Generating LOD files...", "Cancel",
+                                   0, settings.levels, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
         progress.show()
-        
-        try:
-            # Generate LODs
-            generator = LODGenerator(settings)
-            generated_files = generator.generate_lods(self.current_file, output_dir)
-            
+
+        self.lod_progress = progress
+        self.lod_thread = self._keep_worker(
+            LodGenerationThread(self.current_file, output_dir, settings))
+        self.lod_thread.stage.connect(self.lod_stage)
+        self.lod_thread.finished_with.connect(self.lods_written)
+        self.lod_thread.error_occurred.connect(self.lod_generation_failed)
+        progress.canceled.connect(self.lod_thread.request_stop)
+        self.generate_lods_btn.setEnabled(False)
+        self.lod_thread.start()
+
+    def _show_stage(self, progress, done, max_total, sentence):
+        """Move a dialog that the pump inside `setValue` may already have finished.
+
+        `QProgressDialog.setValue` runs an event loop, so a worker's terminal signal can be
+        delivered - and the handler that nulls the dialog attribute run - between two lines
+        of a stage handler. Each handler therefore works from the reference it was handed,
+        never from the attribute the pump can have set to None underneath it.
+        """
+        if progress is None:
+            return
+        progress.setMaximum(max(max_total, 1))
+        progress.setValue(done)
+        progress.setLabelText(sentence)
+
+    def lod_stage(self, written, asked, sentence):
+        """The number shown is files on disk, not a guess about how far along it feels."""
+        self._show_stage(self.lod_progress, written, asked, sentence)
+
+    def lods_written(self, files, errors, stopped):
+        self.generate_lods_btn.setEnabled(True)
+        progress, self.lod_progress = self.lod_progress, None
+        if progress is not None:
             progress.close()
-            
-            # Show success message
-            if generated_files:
-                files_list = "\n".join([os.path.basename(f) for f in generated_files])
-                QMessageBox.information(self, "LOD Generation Complete",
-                                       f"Successfully generated {len(generated_files)} LOD files:\n\n{files_list}")
-            else:
-                QMessageBox.warning(self, "LOD Generation Failed",
-                                   "No LOD files were generated. Check the console for errors.")
-                
-        except Exception as e:
+        names = "\n".join(os.path.basename(f) for f in files) or "nothing"
+        tail = ""
+        if errors:
+            tail = "\n\nLevels that failed:\n" + "\n".join(f"- {e}" for e in errors)
+
+        if stopped:
+            QMessageBox.warning(self, "LOD generation stopped",
+                                f"Stopped after {len(files)} of the levels asked for."
+                                f"\n\nFiles written:\n{names}{tail}")
+        elif files and not errors:
+            QMessageBox.information(self, "LOD Generation Complete",
+                                   f"Successfully generated {len(files)} LOD files:\n\n{names}")
+        elif files:
+            QMessageBox.warning(self, "LOD generation incomplete",
+                                f"Wrote {len(files)} level(s).\n\nFiles:\n{names}{tail}")
+        else:
+            QMessageBox.warning(self, "LOD Generation Failed",
+                                f"No LOD files were written.{tail}")
+
+    def lod_generation_failed(self, message):
+        self.generate_lods_btn.setEnabled(True)
+        progress, self.lod_progress = self.lod_progress, None
+        if progress is not None:
             progress.close()
-            QMessageBox.critical(self, "LOD Generation Error",
-                               f"Failed to generate LODs: {str(e)}")
+        QMessageBox.critical(self, "LOD Generation Error",
+                           f"Failed to generate LODs: {message}")
+
+
     
     def apply_lod_preset(self, preset_name: str):
         """Apply predefined LOD preset configurations."""
@@ -889,56 +1261,78 @@ class PreProcessingTab(QWidget):
                 self.update_lod_preview()
     
     def extract_models(self):
-        """Extract individual models from the current scene."""
+        """Split the loaded scene into parts, off the click handler."""
         if not self.current_file:
             QMessageBox.information(self, "No File Selected",
                                    "Please select a scene file first.")
             return
-        
-        min_faces = self.min_faces_spin.value()
-        
-        # Show progress dialog
-        progress = QProgressDialog("Extracting models from scene...", "Cancel", 0, 0, self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.show()
-        
-        # Start extraction thread
-        self.extraction_thread = ModelExtractionThread(self.current_file, min_faces)
+
+        self.extraction_progress = QProgressDialog("Extracting models from scene...",
+                                                   "Cancel", 0, 1, self)
+        self.extraction_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.extraction_progress.setMinimumDuration(0)
+        self.extraction_progress.show()
+
+        self.extraction_thread = self._keep_worker(ModelExtractionThread(
+            self.current_file, self.min_faces_spin.value(),
+            self.extraction_method.currentData()))
+        self.extraction_thread.stage.connect(self.extraction_stage)
         self.extraction_thread.extraction_complete.connect(self.display_extracted_models)
         self.extraction_thread.error_occurred.connect(self.show_extraction_error)
-        self.extraction_thread.finished.connect(progress.close)
+        self.extraction_progress.canceled.connect(self.extraction_thread.request_stop)
+        self.extract_btn.setEnabled(False)
         self.extraction_thread.start()
-    
-    def display_extracted_models(self, models: list):
-        """Display the extracted models in the table."""
+
+    def extraction_stage(self, done, total, sentence):
+        """Parts looked at, not a percentage guessed at."""
+        self._show_stage(self.extraction_progress, done, total, sentence)
+
+    def display_extracted_models(self, models: list, summary: dict):
+        """Fill the table and say what the run counted.
+
+        The row count alone used to be the whole report, so a scene of 40 parts and a
+        minimum of 100 faces showed 3 rows with no hint that 37 were dropped by the
+        filter the user set.
+        """
         self.extracted_models = models
         self.models_table.setRowCount(len(models))
-        
+
         for row, model in enumerate(models):
             # Name
             self.models_table.setItem(row, 0, QTableWidgetItem(model.name))
-            
+
             # Faces
             self.models_table.setItem(row, 1, QTableWidgetItem(f"{model.face_count:,}"))
-            
+
             # Vertices
             self.models_table.setItem(row, 2, QTableWidgetItem(f"{model.vertex_count:,}"))
-            
+
             # Volume
             volume_text = f"{model.volume:.2f}" if model.volume > 0 else "N/A"
             self.models_table.setItem(row, 3, QTableWidgetItem(volume_text))
-            
+
             # Selected checkbox
             checkbox = QCheckBox()
             checkbox.setChecked(True)
             self.models_table.setCellWidget(row, 4, checkbox)
-        
+
         # Auto-resize columns
         self.models_table.resizeColumnsToContents()
-    
+
+        progress, self.extraction_progress = self.extraction_progress, None
+        if progress is not None:
+            progress.close()
+        self.extract_btn.setEnabled(True)
+        self.extraction_summary_label.setText(_extraction_sentence(models, summary))
+
     def show_extraction_error(self, error_message: str):
-        """Show extraction error message."""
-        QMessageBox.warning(self, "Model Extraction Error", 
+        """Report a failed extraction and leave the table as it was."""
+        self.extract_btn.setEnabled(True)
+        progress, self.extraction_progress = self.extraction_progress, None
+        if progress is not None:
+            progress.close()
+        self.extraction_summary_label.setText(f"Extraction failed: {error_message}")
+        QMessageBox.warning(self, "Model Extraction Error",
                            f"Failed to extract models: {error_message}")
     
     def select_all_models(self):
@@ -956,46 +1350,88 @@ class PreProcessingTab(QWidget):
                 checkbox.setChecked(False)
     
     def export_selected_models(self):
-        """Export the selected models."""
+        """Write the ticked parts and report each verdict the writer gave."""
         selected_models = []
         for row in range(self.models_table.rowCount()):
             checkbox = self.models_table.cellWidget(row, 4)
             if checkbox and checkbox.isChecked():
                 selected_models.append(self.extracted_models[row])
-        
+
         if not selected_models:
             QMessageBox.information(self, "No Models Selected",
                                    "Please select at least one model to export.")
             return
-        
-        # Get output directory
+        if not self.current_file:
+            QMessageBox.information(self, "No File Selected",
+                                   "Load a model first - the parts go in its output folder.")
+            return
+
         output_dir = self.get_output_directory(self.current_file)
-        
-        # Get export format
+
+        # Only the formats a trimesh object in memory can be saved as. The list used to
+        # be every SupportedFormat, so .dae and .fbx were offered here and every click
+        # died inside trimesh with 'fbx exporter not available'.
+        writable = self.format_converter.mesh_write_formats()
+        if not writable:
+            QMessageBox.warning(self, "No writer installed",
+                                "trimesh is not available, so nothing can be exported.")
+            return
+
+        labels = {ext.upper().lstrip('.'): ext for ext in writable}
         format_choice, ok = QInputDialog.getItem(
-            self, "Export Format", "Choose export format:",
-            [fmt.value.upper() for fmt in SupportedFormat], 0, False)
-        
+            self, "Export Format", "Choose export format:", sorted(labels), 0, False)
+
         if not ok:
             return
-        
-        format_ext = f".{format_choice.lower()}"
-        
-        try:
-            exported_files = self.model_extractor.export_selected_models(
-                selected_models, output_dir, format_ext)
-            
-            QMessageBox.information(self, "Export Complete",
-                                   f"Successfully exported {len(exported_files)} models.")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error",
-                               f"Failed to export models: {str(e)}")
+
+        format_ext = labels[format_choice]
+        progress = QProgressDialog("Exporting parts...", "Cancel", 0,
+                                   len(selected_models), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = self._keep_worker(_ExportThread(selected_models, output_dir, format_ext))
+        self._export_thread = worker
+        worker.stage.connect(lambda done, total, text: (
+            progress.setMaximum(max(total, 1)), progress.setValue(done),
+            progress.setLabelText(text)))
+        progress.canceled.connect(worker.request_stop)
+        worker.finished_with.connect(
+            lambda verdict, stopped: self._export_reported(verdict, stopped, progress))
+        worker.error.connect(lambda message: self._export_failed(message, progress))
+        worker.start()
+
+    def _export_reported(self, verdict, stopped, progress):
+        progress.close()
+        self.extraction_summary_label.setText(
+            _export_sentence(verdict, stopped, len(verdict['exported']) + len(verdict['failed'])))
+        written = verdict['exported']
+        refused = verdict['failed']
+        if not written and refused:
+            QMessageBox.warning(self, "Nothing was written",
+                                "\n".join(f"{name}: {why}" for name, why in refused[:8]))
+        elif refused or stopped:
+            QMessageBox.warning(
+                self, "Export finished with problems",
+                f"{len(written)} file(s) written to {verdict['output_dir']}"
+                + (" - the run was stopped early" if stopped else "")
+                + "\n\n" + "\n".join(f"{name}: {why}" for name, why in refused[:8]))
+        else:
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Successfully exported {len(written)} models to "
+                f"{verdict['output_dir']}")
+
+    def _export_failed(self, message, progress):
+        progress.close()
+        self.extraction_summary_label.setText(f"Export failed: {message}")
+        QMessageBox.critical(self, "Export Error", f"Failed to export models: {message}")
     
     def add_conversion_files(self):
         """Add files to the batch conversion list."""
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Files for Batch Conversion",
-            "", "3D Model Files (*.obj *.ply *.stl *.off *.dae *.gltf *.glb *.3mf *.fbx);;All Files (*)")
+            self, "Select Files for Batch Conversion", "", self.readable_filter())
 
         for file_path in files:
             if self.format_converter.is_format_supported(file_path):
@@ -1067,54 +1503,66 @@ class PreProcessingTab(QWidget):
         # Show progress dialog
         progress = QProgressDialog("Converting files...", "Cancel", 0, len(input_files), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
         progress.show()
-        
+
         # Start conversion thread
         output_mode = self.output_folder_combo.currentIndex()
-        self.conversion_thread = FormatConversionThread(
+        self.conversion_progress = progress
+        self.conversion_thread = self._keep_worker(FormatConversionThread(
             input_files, output_dir, target_format, options, output_mode,
-            generate_lods=self.convert_with_lod.isChecked())
+            generate_lods=self.convert_with_lod.isChecked()))
+        progress.canceled.connect(self.conversion_thread.request_stop)
         self.conversion_thread.conversion_complete.connect(
-            lambda converted, failed: self.show_conversion_complete(converted, failed, progress))
+            lambda converted, failed, stopped: self.show_conversion_complete(
+                converted, failed, stopped, progress))
         self.conversion_thread.progress_update.connect(
             lambda i, msg: self.update_conversion_progress(progress, i, msg))
         self.conversion_thread.error_occurred.connect(
             lambda error: self.show_conversion_error(error, progress))
+        self.convert_batch_btn.setEnabled(False)
         self.conversion_thread.start()
-    
+
     def update_conversion_progress(self, progress_dialog, current, message):
         """Update conversion progress."""
         progress_dialog.setValue(current)
         progress_dialog.setLabelText(message)
-    
-    def show_conversion_complete(self, converted_files, failed_files, progress_dialog):
+
+    def show_conversion_complete(self, converted_files, failed_files, stopped,
+                                 progress_dialog):
         """Show the results the conversion actually reported."""
+        self.convert_batch_btn.setEnabled(True)
         progress_dialog.close()
-        
+
         # The old version zipped the successes against the whole input list, so a row
         # only lined up when nothing failed, and 'method' was the literal
         # 'format_converter' rather than the library that did the work.
         errors = [f"{entry['input']}: {entry.get('error', 'Conversion failed')}"
                   for entry in failed_files]
+        if stopped:
+            errors.insert(0, f"The run was stopped after {len(converted_files)} file(s); "
+                             f"the files listed as 'not run' were never attempted.")
         for entry in converted_files:
             if entry.get('options_skipped'):
                 errors.append(f"{entry['input']}: written without "
                               f"{', '.join(entry['options_skipped'])} "
                               f"- the {entry.get('method', 'library')} used cannot apply them")
-        
+
         results = {
             'total_files': len(converted_files) + len(failed_files),
             'successful': converted_files,
             'failed': failed_files,
+            'stopped': stopped,
             'errors': errors
         }
-        
+
         # Show the new results dialog
         from src.ui.conversion_results_dialog import show_conversion_results
         show_conversion_results(results, self)
 
     def show_conversion_error(self, error_message, progress_dialog):
         """Show conversion error message."""
+        self.convert_batch_btn.setEnabled(True)
         progress_dialog.close()
         
         # Get the actual input files from the list widget
@@ -1135,39 +1583,198 @@ class PreProcessingTab(QWidget):
         from src.ui.conversion_results_dialog import show_conversion_results
         show_conversion_results(results, self)
     
+    def _advanced_settings(self):
+        """The pane's controls as the two backends are called, with no invented values."""
+        return {
+            'textures': self.enable_texture_opt.isChecked(),
+            'quality': self.texture_quality_value.value(),
+            'target': self.texture_format.currentText(),
+            'max_size': self.texture_max_size.value() or None,
+            'scene': self.enable_scene_opt.isChecked(),
+            'remove_hidden': self.remove_hidden.isChecked(),
+            'merge_static': self.merge_static.isChecked(),
+            'simplify_materials': self.simplify_materials.isChecked(),
+        }
+
+    def _refresh_optimization_buttons(self):
+        """Apply answers only when a switch is armed and a file is loaded.
+
+        The settings themselves stay editable with both switches off, the way the LOD
+        pane's are, so a run can be set up before it is armed.
+        """
+        armed = self.enable_texture_opt.isChecked() or self.enable_scene_opt.isChecked()
+        self.opt_apply_btn.setEnabled(bool(armed and self.current_file))
+        self.opt_preview_btn.setEnabled(bool(self.current_file))
+
     def preview_optimizations(self):
-        """Preview all optimizations that will be applied."""
+        """Count what the two groups could act on, and write nothing."""
         if not self.current_file:
             QMessageBox.information(self, "No File Selected",
                                    "Please select a 3D model file first.")
             return
-        
-        # Analyze the current file
-        try:
-            analysis = self.lod_generator.analyze_mesh_quality(self.current_file)
-            
-            if "error" in analysis:
-                QMessageBox.warning(self, "Analysis Error", analysis["error"])
-                return
-            
-            # Show analysis results
-            info_text = f"""Mesh Analysis for: {os.path.basename(self.current_file)}
+        self._run_optimization('preview', self._advanced_settings())
 
-Original Mesh Statistics:
-• Vertices: {analysis['vertices']:,}
-• Faces: {analysis['faces']:,}
-• Edges: {analysis['edges']:,}
-• Surface Area: {analysis['surface_area']:.2f}
-• Is Watertight: {analysis['is_watertight']}
-• Winding Consistent: {analysis['is_winding_consistent']}
+    def apply_optimizations(self):
+        """Run the armed groups and list what each one measured before and after."""
+        if not self.current_file:
+            QMessageBox.information(self, "No File Selected",
+                                   "Please select a 3D model file first.")
+            return
+        settings = self._advanced_settings()
+        if not settings['textures'] and not settings['scene']:
+            QMessageBox.information(self, "Nothing armed",
+                                   "Neither 'Optimize Textures' nor 'Optimize Scene' is "
+                                   "ticked, so there is nothing to apply.")
+            return
+        operation = ('both' if settings['textures'] and settings['scene']
+                     else 'textures' if settings['textures'] else 'scene')
+        self._run_optimization(operation, settings)
 
-Optimizations Enabled:
-• LOD Generation: {'Yes' if self.enable_lod.isChecked() else 'No'}
-• Texture Optimization: {'Yes' if self.enable_texture_opt.isChecked() else 'No'}
-• Scene Optimization: {'Yes' if self.enable_scene_opt.isChecked() else 'No'}
-"""
-            
-            QMessageBox.information(self, "Optimization Preview", info_text)
-            
-        except Exception as e:
-            QMessageBox.warning(self, "Preview Error", f"Failed to analyze mesh: {str(e)}")
+    def _run_optimization(self, operation, settings):
+        progress = QProgressDialog(
+            "Measuring the file..." if operation == 'preview' else "Applying optimizations...",
+            "Cancel", 0, 1, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        self.optimization_progress = progress
+        self.optimization_thread = self._keep_worker(OptimizationThread(
+            operation, self.current_file,
+            self.get_output_directory(self.current_file), settings))
+        self.optimization_thread.stage.connect(self._optimization_stage)
+        self.optimization_thread.finished_with.connect(self._optimization_reported)
+        self.optimization_thread.error.connect(self._optimization_failed)
+        progress.canceled.connect(self.optimization_thread.request_stop)
+        self.opt_preview_btn.setEnabled(False)
+        self.opt_apply_btn.setEnabled(False)
+        self.optimization_thread.start()
+
+    def _optimization_stage(self, done, total, sentence):
+        self._show_stage(self.optimization_progress, done, total, sentence)
+
+    def _optimization_reported(self, operation, payload):
+        self._end_optimization_run()
+        if operation == 'preview':
+            text = _preview_text(payload)
+            self.opt_results.setPlainText(text)
+            if 'error' in payload:
+                QMessageBox.warning(self, "Preview Error", payload['error'])
+            return
+        stopped = any(report.stopped for _, report in payload)
+        text = _optimization_text(payload, stopped)
+        self.opt_results.setPlainText(text)
+        if not any(report.results for _, report in payload):
+            QMessageBox.warning(self, "Optimization wrote nothing", text)
+
+    def _optimization_failed(self, message):
+        self._end_optimization_run()
+        self.opt_results.setPlainText(f"The run stopped: {message}")
+        QMessageBox.critical(self, "Optimization Error", message)
+
+    def _end_optimization_run(self):
+        progress, self.optimization_progress = self.optimization_progress, None
+        if progress is not None:
+            progress.close()
+        self._refresh_optimization_buttons()
+
+
+def _sync_quietly(target, value):
+    """Move one half of a paired control without the other half echoing the move back.
+
+    A slider and its typable box are each connected to the other, so a plain `setValue` on
+    the echo path overwrites what was just typed - 500 in the box came back as the slider's
+    own 100 - and the echo is the only reason to block its signals here.
+    """
+    was_open = target.blockSignals(True)
+    target.setValue(value)
+    target.blockSignals(was_open)
+
+
+def _preview_text(payload) -> str:
+    """The preview thread's counts, in the order the pane's two groups ask about them."""
+    name = payload.get('file', 'this file')
+    if 'error' in payload:
+        return f"Preview of {name} failed: {payload['error']}"
+    textures, scene = payload['textures'], payload['scene']
+
+    lines = [f"Preview of {name} - read with {payload['read_with'] or 'unknown'}"]
+    if textures:
+        total = sum(row['bytes'] for row in textures)
+        lines.append(f"Textures: {len(textures)} distinct image(s), {total:,} bytes as "
+                     f"this Pillow build encodes them")
+        for row in textures:
+            shared = (f", on {row['shared_by']} part(s)" if row['shared_by'] > 1 else '')
+            lines.append(f"  {row['part']} / {row['slot']}: {row['size'][0]}x{row['size'][1]} "
+                         f"{row['format']}, {row['bytes']:,} bytes{shared}")
+    else:
+        lines.append("Textures: no material in this file references an image, so the "
+                     "texture group has nothing to encode")
+
+    lines.append(f"Scene: {scene['parts']} placed part(s), {scene['faces']:,} faces, "
+                 f"{scene['distinct_materials']} distinct look(s)")
+    if scene['batches']:
+        lines.append(f"  merge static meshes: {scene['parts_in_batches']} part(s) in "
+                     f"{scene['batches']} batch(es) would leave {scene['parts_after_merge']}")
+    else:
+        lines.append("  merge static meshes: no two parts share a material and a "
+                     "transform, so nothing would batch")
+    if scene['hidden_flagged']:
+        lines.append(f"  remove hidden: {scene['hidden_flagged']} flagged ({scene['hidden_source']}), "
+                     f"{scene['hidden_matching_parts']} of them match a part here")
+    else:
+        lines.append("  remove hidden: nothing in this file is flagged hidden")
+    if scene['nothing_to_render']:
+        lines.append(f"  {scene['nothing_to_render']} part(s) carry no geometry to draw")
+    if scene['material_names'] != scene['distinct_materials']:
+        lines.append(f"  simplify materials: {scene['material_names']} name(s) over "
+                     f"{scene['distinct_materials']} look(s) would collapse to one label each")
+    return "\n".join(lines)
+
+
+def _optimization_text(reports, stopped) -> str:
+    """Each run's own lines, under a heading that says which group wrote them."""
+    headers = {'textures': 'Texture optimization', 'scene': 'Scene optimization'}
+    blocks = []
+    for kind, report in reports:
+        body = report.lines()
+        head = headers[kind]
+        if kind == 'textures' and report.results:
+            head += (f" - {report.bytes_from:,} -> {report.bytes_to:,} bytes "
+                     f"({report.bytes_to - report.bytes_from:+,})")
+        blocks.append(f"{head}:\n" + "\n".join(f"  {line}" for line in body))
+    text = "\n\n".join(blocks)
+    if stopped:
+        text += ("\n\nStopped by Cancel. Everything listed above was written before the "
+                 "stop; the rest was never attempted.")
+    return text
+
+def _extraction_sentence(models, summary) -> str:
+    """One line in the extractor's own numbers, or the reason there are none."""
+    if not summary:
+        return f"{len(models)} part(s) ready to export."
+    kept = summary.get('kept', len(models))
+    dropped = summary.get('dropped', 0)
+    parts = summary.get('parts', 0)
+    text = (f"{summary.get('method', 'connected_components')}: {parts} piece(s) produced, "
+            f"{kept} kept, {dropped} below the {summary.get('min_faces', '?')}-face minimum"
+            f" - read with {summary.get('read_with', 'unknown')}")
+    if summary.get('stopped'):
+        text += "; stopped by Cancel, the parts behind it were not looked at"
+    for note in summary.get('notes') or []:
+        # A method that could not run on this build says which one did, so the pane never
+        # prints "geometric_analysis" over what was really a connectivity split.
+        text += f"; {note}"
+    return text
+
+
+def _export_sentence(verdict, stopped, attempted) -> str:
+    """What the export actually wrote, and what it refused."""
+    written = len(verdict['exported'])
+    refused = len(verdict['failed'])
+    text = f"{written} of {attempted} part(s) written to {verdict['output_dir']}"
+    if refused:
+        text += f"; {refused} refused ({verdict['failed'][0][0]}: {verdict['failed'][0][1]})"
+    if stopped:
+        text += "; stopped by Cancel before the rest"
+    return text

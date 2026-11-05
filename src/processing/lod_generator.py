@@ -10,7 +10,7 @@ try:
     PYMESHLAB_AVAILABLE = True
 except ImportError:
     PYMESHLAB_AVAILABLE = False
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Callable
 from dataclasses import dataclass
 
 @dataclass
@@ -35,34 +35,22 @@ class LODGenerator:
         self.settings = settings or LODSettings()
     
     def _load_mesh_safe(self, file_path: str) -> trimesh.Trimesh:
-        """
-        Load a mesh safely, handling Scenes (GLB/GLTF) by concatenating geometry.
-        """
-        try:
-            mesh = trimesh.load(file_path)
-            
-            if isinstance(mesh, trimesh.Scene):
-                # Concatenate all geometries in the scene
-                if len(mesh.geometry) == 0:
-                    raise ValueError("Scene is empty")
-                
-                # Extract all geometries
-                geometries = list(mesh.geometry.values())
-                if len(geometries) == 1:
-                    return geometries[0]
-                else:
-                    # Concatenate
-                    return trimesh.util.concatenate(geometries)
-            
-            elif isinstance(mesh, trimesh.Trimesh):
-                return mesh
-            else:
-                raise ValueError(f"Unsupported mesh type: {type(mesh)}")
-                
-        except Exception as e:
-            raise ValueError(f"Failed to load mesh: {str(e)}")
+        """The file as one mesh, asked of the converter's reader.
 
-    def generate_lods(self, input_file: str, output_dir: str) -> List[str]:
+        Delegated on purpose. This used to be a second loader that only trimesh could
+        serve, while the format list below promised .fbx and .dae - neither of which
+        trimesh can open - so every FBX job died here with "file_type 'fbx' not
+        supported". One reader, one answer.
+        """
+        from .format_converter import FormatConverter
+        mesh, carried = FormatConverter().read_mesh(file_path)
+        if mesh is None:
+            raise ValueError(f"Failed to load mesh: {carried}")
+        return mesh
+
+    def generate_lods(self, input_file: str, output_dir: str,
+                      progress: Optional[Callable[[int, int, str], None]] = None,
+                      should_cancel: Optional[Callable[[], bool]] = None) -> List[str]:
         """
         Generate LOD meshes from an input 3D file using multiple optimization algorithms.
         
@@ -75,6 +63,11 @@ class LODGenerator:
         Args:
             input_file: Path to the input 3D model file
             output_dir: Directory to save LOD files
+            progress: called as (levels_done, levels_total, sentence) after each level is
+                on disk, so a caller can show a number that means files written
+            should_cancel: asked before each level. Returning True stops the chain and
+                the levels already written are still returned - a stopped run is a
+                partial run, not a failure, and the caller can say how far it got.
             
         Returns:
             List of generated LOD file paths
@@ -86,6 +79,7 @@ class LODGenerator:
             raise ValueError(f"Failed to load mesh: {str(e)}")
         
         os.makedirs(output_dir, exist_ok=True)
+        self.errors = []
         
         # Get base filename without extension
         base_name = os.path.splitext(os.path.basename(input_file))[0]
@@ -101,6 +95,9 @@ class LODGenerator:
         
         for i, ratio in enumerate(lod_ratios):
             try:
+                if should_cancel is not None and should_cancel():
+                    break
+
                 # Calculate target face count
                 target_faces = int(original_face_count * ratio)
                 
@@ -132,8 +129,14 @@ class LODGenerator:
                 
                 print(f"Generated LOD{i}: {len(lod_mesh.vertices)} vertices ({vertex_reduction:.1f}% reduction), "
                       f"{len(lod_mesh.faces)} faces ({face_reduction:.1f}% reduction)")
+
+                if progress is not None:
+                    progress(len(generated_files), len(lod_ratios),
+                             f"LOD{i} written - {len(lod_mesh.faces):,} faces "
+                             f"({face_reduction:.1f}% off)")
                 
             except Exception as e:
+                self.errors.append(f"LOD{i} (ratio {ratio:.2f}): {e}")
                 print(f"Warning: Failed to generate LOD{i}: {str(e)}")
         
         return generated_files
@@ -461,19 +464,6 @@ class LODGenerator:
                     "recommended_use": self._get_lod_recommendation(ratio)
                 })
             
-            preview_data.append({
-                "level": i,
-                "name": f"LOD{i}",
-                "ratio": ratio,
-                "original_faces": original_faces,
-                "target_faces": target_faces,
-                "original_vertices": original_vertices,
-                "estimated_vertices": target_vertices,
-                "face_reduction_percentage": (1 - ratio) * 100,
-                "estimated_file_size_mb": self._estimate_file_size(target_faces, target_vertices),
-                "recommended_use": self._get_lod_recommendation(ratio)
-            })
-            
             return preview_data
             
         except Exception as e:
@@ -499,8 +489,14 @@ class LODGenerator:
 
 # Enhanced utility functions
 def get_supported_formats() -> List[str]:
-    """Get list of supported 3D file formats for LOD generation."""
-    return ['.obj', '.ply', '.stl', '.off', '.dae', '.gltf', '.glb', '.3mf', '.x3d']
+    """Formats a model here could be read from - asked of the converter, not hand-typed.
+
+    The list used to name .dae, .x3d and .fbx beside the seven trimesh reads. Nothing
+    could open those three through this module, so a picker built from it offered files
+    that were always going to fail, and .x3d is not readable by any library here at all.
+    """
+    from .format_converter import FormatConverter
+    return FormatConverter().readable_formats()
 
 def is_supported_format(file_path: str) -> bool:
     """Check if a file format is supported for LOD generation."""

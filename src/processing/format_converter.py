@@ -269,6 +269,27 @@ class FormatConverter(QObject):
     def get_supported_formats(self) -> List[str]:
         """Get list of supported file formats."""
         return [fmt.value for fmt in SupportedFormat]
+
+    def readable_formats(self) -> List[str]:
+        """Extensions a library installed *here* can open - the honest input list.
+
+        Anything that reads a model asks this instead of keeping its own list, which is
+        how LOD generation came to advertise .dae, .x3d and .fbx while only trimesh's
+        seven formats could ever reach it.
+        """
+        readable = set()
+        for name, capability in self._CAPABILITIES.items():
+            if self.libraries_status.get(name):
+                readable |= capability['read']
+        return sorted(f'.{fmt}' for fmt in readable)
+
+    def writable_formats(self) -> List[str]:
+        """Extensions a library installed *here* can save - the honest output list."""
+        writable = set()
+        for name, capability in self._CAPABILITIES.items():
+            if self.libraries_status.get(name):
+                writable |= capability['write']
+        return sorted(f'.{fmt}' for fmt in writable)
     
     def get_supported_targets(self, source_format: str) -> List[str]:
         """Target formats the libraries installed *here* can write from this source."""
@@ -335,9 +356,15 @@ class FormatConverter(QObject):
         return bool(self.conversion_libraries(source_format, target_format))
     
     def is_format_supported(self, file_path: str) -> bool:
-        """Check if a file format is supported."""
+        """Whether a reader installed here can open this path.
+
+        Asked of readable_formats() rather than the SupportedFormat enum: the enum is a
+        list of names this app knows how to spell, and used to answer yes to formats no
+        installed library could read. Pickers and the batch list gate on this, so the
+        files a user can add are the files that can be read.
+        """
         ext = os.path.splitext(file_path)[1].lower()
-        return ext in self.get_supported_formats()
+        return ext in self.readable_formats()
     
     def detect_format(self, file_path: str) -> Optional[SupportedFormat]:
         """Detect the format of a file."""
@@ -617,7 +644,7 @@ class FormatConverter(QObject):
         try:
             # Load the mesh - through the same readers the preview uses, so an LOD
             # chain can be cut from a .fbx or .dae as well as from an .obj.
-            mesh, _note = self._read_as_trimesh(input_file)
+            mesh, _note = self.read_mesh(input_file)
             
             if mesh is None:
                 return []
@@ -715,12 +742,21 @@ class FormatConverter(QObject):
         
         return processed_mesh
     
-    def _read_as_trimesh(self, input_file: str) -> Tuple[Optional['trimesh.Trimesh'], str]:
+    def read_mesh(self, input_file: str) -> Tuple[Optional['trimesh.Trimesh'], str]:
         """The file as one mesh, from the first library here that can open it.
+
+        This is the app's only mesh reader: LOD generation, baking and the converter all
+        come through it, so a format either opens here or it opens nowhere.
 
         Returns (mesh, what carried it) or (None, what was tried). trimesh has no reader
         for .dae or .fbx, so asking it directly was what made the two formats this tab
         advertises come back "Could not load mesh".
+
+        A mesh here means faces. Every caller - the LOD chain, the converter, extraction -
+        decimates or re-writes triangles, and a vertex list is a point cloud, which
+        `point_cloud_processor` and Open3D own. PyMeshLab will happily read a text file as
+        a point list and hand back one vertex and no faces; calling that a successful mesh
+        read is how a junk file used to reach the pipeline and produce an empty output.
         """
         if not TRIMESH_AVAILABLE:
             return None, 'trimesh is not installed'
@@ -733,9 +769,9 @@ class FormatConverter(QObject):
 
         try:
             mesh = _as_trimesh(trimesh.load(input_file))
-            if mesh is not None and len(mesh.vertices):
+            if mesh is not None and len(mesh.faces):
                 return mesh, 'trimesh'
-            tried.append('trimesh: no mesh')
+            tried.append('trimesh: no faces')
         except CONVERSION_ERRORS as error:
             tried.append(f'trimesh: {str(error)[:60]}')
 
@@ -745,12 +781,12 @@ class FormatConverter(QObject):
                 mesh_set.load_new_mesh(input_file)
                 if mesh_set.mesh_number():
                     current = mesh_set.current_mesh()
-                    if current.vertex_number():
+                    if current.face_number():
                         return trimesh.Trimesh(
                             vertices=np.asarray(current.vertex_matrix(), dtype=np.float64),
                             faces=np.asarray(current.face_matrix(), dtype=np.int64),
                             process=False), 'pymeshlab'
-                tried.append('pymeshlab: no mesh')
+                tried.append('pymeshlab: no faces')
             except Exception as error:
                 tried.append(f'pymeshlab: {str(error)[:60]}')
 
@@ -762,18 +798,140 @@ class FormatConverter(QObject):
                                              process=False)
                              for loaded in (scene.meshes or [])]
                 mesh = trimesh.util.concatenate(parts) if parts else None
-                if mesh is not None and len(mesh.vertices):
+                if mesh is not None and len(mesh.faces):
                     return mesh, 'assimp'
-                tried.append('assimp: no mesh')
+                tried.append('assimp: no faces')
             except CONVERSION_ERRORS as error:
                 tried.append(f'assimp: {str(error)[:60]}')
 
         return None, '; '.join(tried) or 'no library could open the file'
 
+    def read_scene(self, input_file: str) -> Tuple[Optional['trimesh.Scene'], str]:
+        """The file with its parts and their materials kept apart.
+
+        read_mesh() flattens everything into one mesh, which is what LOD generation wants
+        and what a texture or scene optimization cannot work on - by the time it returns
+        the parts, the node transforms and the textures are gone. trimesh is the only
+        reader here that carries materials, so it is the only one tried, and the reason
+        comes back in words when even it cannot open the file.
+        """
+        if not TRIMESH_AVAILABLE:
+            return None, ('trimesh is not installed - it is the only reader here that '
+                          'keeps parts and materials apart')
+
+        blocked = self._source_blocker(input_file)
+        if blocked:
+            return None, blocked
+
+        try:
+            loaded = trimesh.load(input_file)
+        except CONVERSION_ERRORS as error:
+            return None, f'trimesh: {str(error)[:120]}'
+
+        if isinstance(loaded, trimesh.Trimesh):
+            loaded = trimesh.Scene([loaded])
+        if not isinstance(loaded, trimesh.Scene):
+            return None, (f'trimesh read a {type(loaded).__name__}, which has no parts '
+                          f'to optimise' if loaded is not None else 'trimesh read nothing')
+        if not len(loaded.geometry):
+            return None, 'trimesh opened the file but it contains no geometry'
+        return loaded, 'trimesh'
+
+    def mesh_write_formats(self) -> List[str]:
+        """Extensions a trimesh object sitting in memory can be saved as.
+
+        Narrower than `writable_formats()` on purpose: .dae and .fbx are writable here,
+        but only by a library that works on a *file*, so a caller offering an export list
+        for an in-memory mesh must not promise those two without the intermediate step
+        `write_scene()` takes.
+        """
+        if not self.libraries_status.get('trimesh'):
+            return []
+        return sorted(f'.{fmt}' for fmt in self._CAPABILITIES['trimesh']['write'])
+
+    def write_scene(self, scene, output_file: str) -> Tuple[bool, str]:
+        """Save parts and materials as a model file, naming what cannot take them.
+
+        A trimesh scene goes out through trimesh when it can. When the target needs
+        another library - .fbx has exactly one writer here, assimp - the scene is written
+        to a .glb beside the destination and `convert_file()` does the last step, because
+        `scene.export('x.fbx')` raises "fbx exporter not available" and the app *can*
+        produce that file. The note says which route was taken; nothing is claimed that
+        the written bytes do not support.
+        """
+        target = _extension(Path(output_file).suffix)
+        writable = self.writable_formats()
+        if target.lstrip('.') not in {fmt.lstrip('.') for fmt in writable}:
+            return False, (f'no library here can write .{target} '
+                           f'(writable: {", ".join(writable)})')
+
+        if target.lstrip('.') in {fmt.lstrip('.') for fmt in self.mesh_write_formats()}:
+            try:
+                _prepare_output_dir(output_file)
+                # An .obj names its material file 'material.mtl' unless told otherwise, so
+                # two exports into one folder silently share - and the second overwrites -
+                # a sidecar neither of them asked for. Naming it after the model keeps each
+                # .obj pointed at its own materials.
+                if target == 'obj':
+                    scene.export(output_file, mtl_name=f'{Path(output_file).stem}.mtl')
+                else:
+                    scene.export(output_file)
+            except CONVERSION_ERRORS as error:
+                return False, f'{type(error).__name__}: {str(error)[:160]}'
+        else:
+            ok, message = self._export_via_intermediate(scene, output_file, target)
+            if not ok:
+                return False, message
+        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+            return False, f'{os.path.basename(output_file)} was not created or is empty'
+        return True, output_file
+
+    def _export_via_intermediate(self, scene, output_file: str, target: str) -> Tuple[bool, str]:
+        """trimesh writes a .glb, then the converter carries it to the real target."""
+        staging = f'{output_file}.staging.glb'
+        try:
+            _prepare_output_dir(staging)
+            scene.export(staging)
+            result = self.convert_file(staging, output_file)
+        except CONVERSION_ERRORS as error:
+            return False, f'.{target} needs a file-level writer: {type(error).__name__}: ' \
+                          f'{str(error)[:140]}'
+        finally:
+            if os.path.exists(staging):
+                os.remove(staging)
+        if not result.get('success'):
+            return False, (f'.{target} has no in-memory writer here, and the file-level '
+                           f'route failed: {result.get("message", "no reason given")}')
+        return True, f'{os.path.basename(output_file)} written via a .glb staging file by ' \
+                     f'{result.get("method", "a library here")}'
+
+    def write_mesh(self, mesh, output_file: str) -> Tuple[bool, str]:
+        """One mesh in memory as a model file, through the same writer a scene uses."""
+        if TRIMESH_AVAILABLE and isinstance(mesh, trimesh.Trimesh):
+            return self.write_scene(trimesh.Scene([mesh]), output_file)
+        return self.write_scene(mesh, output_file)
+
+    def optimized_target(self, input_file: str, output_dir: str,
+                         suffix: str = 'optimized') -> Tuple[str, str]:
+        """Where an optimised copy of this file goes, and what the move cost.
+
+        The source extension is kept when a library here can write it. When it cannot -
+        a .dae opens through trimesh, which has no Collada writer - the copy is written
+        as .glb and the note says so, because silently changing an asset's format is
+        worse than admitting it. Texture and scene optimisation share this one rule.
+        """
+        source = _extension(Path(input_file).suffix)
+        writable = {fmt.lstrip('.') for fmt in self.writable_formats()}
+        target = source if source in writable else 'glb'
+        stem = os.path.splitext(os.path.basename(input_file))[0]
+        path = os.path.join(output_dir, f'{stem}_{suffix}.{target}')
+        note = '' if target == source else f'(source .{source} cannot be written here)'
+        return path, note
+
     def get_conversion_preview(self, input_file: str) -> Dict:
         """Preview information about a file for conversion."""
         try:
-            mesh, opened_with = self._read_as_trimesh(input_file)
+            mesh, opened_with = self.read_mesh(input_file)
             if mesh is None:
                 return {"error": f"Could not load mesh ({opened_with})"}
 

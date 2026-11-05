@@ -98,6 +98,12 @@ SUITES = [
         "description": "Converts every claimed format pair for real and reads the result back, opens the picker to check it only offers what the installed libraries can write, and checks the build recipe ships the FBX writer"
     },
     {
+        "id": "preprocessing_contract",
+        "name": "Pre-Processing Pane Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_preprocessing_contract.py")],
+        "description": "Clicks every Pre-Processing control and requires the extraction to keep every face it was given, each method to name the split it actually ran, Preview to measure without writing, Apply to write an optimized file it can read back, and every Cancel to reach a live worker - with no worker startable outside the registry that keeps a running thread alive"
+    },
+    {
         "id": "automation_contract",
         "name": "Automation File-Watcher Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_automation_contract.py")],

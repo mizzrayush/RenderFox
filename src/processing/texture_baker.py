@@ -23,7 +23,7 @@ each was measured against the library rather than assumed:
 
 import os
 import logging
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 from PIL import Image
 
@@ -34,6 +34,10 @@ except ImportError:
     PYMESHLAB_AVAILABLE = False
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
+
+
+class _Stopped(Exception):
+    """The user asked for a stop between maps - not a failure of the rasteriser."""
 
 # MeshLab ramp whose perceived luminance rises monotonically with the scalar, so
 # desaturating it cannot fold two different occlusion values into one grey.
@@ -66,9 +70,10 @@ class TextureBaker(QObject):
     def source_mesh(self):
         return 1
 
-    def bake(self, high_poly_path: str, low_poly_path: str, output_dir: str, 
-             resolution: int = 1024, bake_normals: bool = True, 
-             bake_diffuse: bool = True, bake_ao: bool = True) -> Dict[str, str]:
+    def bake(self, high_poly_path: str, low_poly_path: str, output_dir: str,
+             resolution: int = 1024, bake_normals: bool = True,
+             bake_diffuse: bool = True, bake_ao: bool = True,
+             should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, str]:
         """
         Perform baking operations.
         
@@ -80,6 +85,10 @@ class TextureBaker(QObject):
             bake_normals: Whether to bake normal map
             bake_diffuse: Whether to bake diffuse/color map
             bake_ao: Whether to bake Ambient Occlusion
+            should_cancel: asked before each map. A map already rasterising is allowed to
+                finish, because stopping a PyMeshLab filter mid-call leaves the MeshSet in
+                a state this build does not recover from; the maps behind it are named in
+                the error as never run.
             
         Returns:
             Dict containing paths to generated textures. Only maps verified to
@@ -88,6 +97,7 @@ class TextureBaker(QObject):
         """
         if not PYMESHLAB_AVAILABLE:
             self.error_occurred.emit("PyMeshLab is not installed.")
+            self.baking_complete.emit(False, {})
             return {}
 
         resolution = max(8, int(resolution))
@@ -101,6 +111,7 @@ class TextureBaker(QObject):
             requested.append('ao')
         if not requested:
             self.error_occurred.emit("Nothing to bake: all three maps were turned off.")
+            self.baking_complete.emit(False, {})
             return {}
 
         results = {}
@@ -126,6 +137,10 @@ class TextureBaker(QObject):
             self.progress_update.emit(30, "Starting Bake...")
 
             for index, kind in enumerate(requested):
+                if should_cancel is not None and should_cancel():
+                    not_run = ', '.join(k.title() for k in requested[index:])
+                    raise _Stopped(f"stopped before {not_run} "
+                                   f"({len(results)} map(s) already on disk)")
                 path = os.path.join(output_dir, f"{base_name}_{kind}.png")
                 self.progress_update.emit(40 + index * 20, f"Baking {kind.title()} Map...")
                 try:
@@ -147,6 +162,13 @@ class TextureBaker(QObject):
             self.baking_complete.emit(True, results)
             return results
 
+        except _Stopped as stopped:
+            # Not a failure of the rasteriser: the user asked it to stop. The maps that
+            # landed stay on disk and are reported, and the sentence names what did not.
+            self.progress_update.emit(100, "Baking stopped")
+            self.error_occurred.emit(str(stopped))
+            self.baking_complete.emit(False, results)
+            return results
         except Exception as e:
             logging.error(f"Baking failed: {e}")
             self.error_occurred.emit(str(e))
@@ -248,19 +270,25 @@ class TextureBakerThread(QThread):
         self.resolution = resolution
         self.options = options
         self.baker = TextureBaker()
+        self._stop_requested = False
         
         # Forward signals
         self.baker.progress_update.connect(self.progress_update)
         self.baker.baking_complete.connect(self.baking_complete)
         self.baker.error_occurred.connect(self.error_occurred)
-        
+
+    def request_stop(self):
+        """Ask for a stop; the map in hand finishes and the ones behind it do not run."""
+        self._stop_requested = True
+
     def run(self):
         self.baker.bake(
-            self.high_poly, 
-            self.low_poly, 
-            self.output_dir, 
+            self.high_poly,
+            self.low_poly,
+            self.output_dir,
             self.resolution,
             bake_normals=self.options.get('normals', True),
             bake_diffuse=self.options.get('diffuse', True),
-            bake_ao=self.options.get('ao', True)
+            bake_ao=self.options.get('ao', True),
+            should_cancel=lambda: self._stop_requested
         )

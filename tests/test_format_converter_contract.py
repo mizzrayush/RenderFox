@@ -129,12 +129,12 @@ class TestClaimsAreTrue(FormatCase):
         lose triangles.
         """
         src = self.require_seed('obj')
-        expected = len(self.converter._read_as_trimesh(src)[0].faces)
+        expected = len(self.converter.read_mesh(src)[0].faces)
         for target in self.converter.get_supported_targets('obj'):
             fmt = _extension(target)
             result = self.converter.convert_file(src, self.target(fmt))
             self.assertTrue(result['success'], f'obj -> {fmt}: {result["message"]}')
-            mesh, note = self.converter._read_as_trimesh(self.target(fmt))
+            mesh, note = self.converter.read_mesh(self.target(fmt))
             self.assertIsNotNone(mesh, f'obj -> {fmt} cannot be opened again ({note})')
             self.assertEqual(len(mesh.faces), expected, f'obj -> {fmt} changed the face count')
             self.assertGreater(len(mesh.vertices), 0, f'obj -> {fmt} has no vertices')
@@ -186,7 +186,7 @@ class TestTheFormatsThatWereBroken(FormatCase):
         result = self.converter.convert_file(src, path)
         self.assertTrue(result['success'], result['message'])
 
-        mesh, note = self.converter._read_as_trimesh(path)
+        mesh, note = self.converter.read_mesh(path)
         self.assertIsNotNone(mesh, f'the .dae cannot be opened again ({note})')
         self.assertEqual(len(mesh.faces), 12)
 
@@ -295,7 +295,7 @@ class TestOptionsAndReports(FormatCase):
         self.assertEqual(len(files), 4, f'expected an LOD chain, got {files}')
         for path in files:
             self.assertEqual(Path(path).suffix, '.dae', f'{path} is not the target asked for')
-            mesh, note = self.converter._read_as_trimesh(path)
+            mesh, note = self.converter.read_mesh(path)
             self.assertIsNotNone(mesh, f'{path} cannot be opened ({note})')
 
     def test_16_a_bare_output_filename_does_not_raise(self):
