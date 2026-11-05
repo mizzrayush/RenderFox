@@ -213,24 +213,52 @@ class UnifiedOpen3DViewer(QWidget):
         self.refresh_preview()
 
     def load_from_file(self, file_path):
-        """Load geometry from file path."""
+        """Show a file as a surface if it has faces, as points if it has only points.
+
+        The choice used to be `has_vertices()`, which is wrong in both directions on the
+        files this pane works with. A scanned .ply has vertices and no triangles, so a faceless
+        mesh was handed to the previewer, which renders a mesh by its triangles and showed a
+        blank panel while the caller was told the load succeeded. And `PointCloud` has no
+        `has_vertices` at all - only `has_points` - so every .pcd raised AttributeError inside
+        here and answered False, which is why the Point Clouds pane could never show the files
+        it exists for. Triangles are the one thing that separates the two kinds of file.
+        """
         if not OPEN3D_AVAILABLE:
             return False
-            
+
         try:
-            # Try loading as mesh first
-            geom = o3d.io.read_triangle_mesh(file_path)
-            if not geom.has_vertices():
-                # Try as point cloud
-                geom = o3d.io.read_point_cloud(file_path)
-            
-            if geom.has_vertices():
-                self.add_geometry(geom)
+            mesh = o3d.io.read_triangle_mesh(file_path)
+            if mesh.has_triangles():
+                self.add_geometry(mesh)
                 return True
-            return False
+            cloud = o3d.io.read_point_cloud(file_path)
+            if cloud.has_points():
+                self.add_geometry(cloud)
+                return True
         except Exception as e:
             print(f"Failed to load {file_path}: {e}")
+        return False
+
+    def fit_to_view(self):
+        """Render the preview again so the geometry fills the panel it is in now.
+
+        The preview is a single static image, and its camera is re-framed to the geometry on
+        every render, so the way this view "goes out of frame" is the panel being resized
+        under a pixmap made for the old size. Re-rendering at the label's current size puts
+        that right. False means there is no geometry to frame, which the button reports
+        instead of showing the same picture twice.
+        """
+        if not self.geometries:
             return False
+        self.refresh_preview()
+        return True
+
+    def preview_pixmap(self):
+        """The image on screen, or None when there is nothing here to save."""
+        pixmap = self.image_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return None
+        return pixmap
 
     def clear(self):
         self.geometries = []
@@ -258,12 +286,24 @@ class UnifiedOpen3DViewer(QWidget):
         
         self.preview_worker = PreviewWorker(self.geometries, w, h, self.current_settings)
         self.preview_worker.image_ready.connect(self._on_preview_ready)
+        self.preview_worker.error_occurred.connect(self._on_preview_failed)
         self.preview_worker.finished.connect(self.progress.hide)
         self.preview_worker.start()
 
     def _on_preview_ready(self, q_img):
         self.image_label.setPixmap(QPixmap.fromImage(q_img))
         self.image_label.setText("")
+
+    def _on_preview_failed(self, reason):
+        """Say why the panel is empty.
+
+        `PreviewWorker` already reports a failed render on `error_occurred`; nothing here
+        was listening, so a render that died left the words "Rendering Preview..." on
+        screen forever - the one state that reads as work in progress and is really work
+        that stopped. Every pane that embeds this viewer inherits the sentence.
+        """
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(f"Preview did not render: {reason}")
 
     def open_interactive_viewer(self):
         """Launch the blocking Open3D visualizer."""

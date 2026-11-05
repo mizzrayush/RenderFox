@@ -129,13 +129,17 @@ def main():
         # Create a headless processor for automation
         processor = PointCloudProcessor()
         
-        # Register actions
-        ActionRegistry.register("pcd.load", processor.load_point_cloud, "Load a point cloud file", {'file_path': str})
-        ActionRegistry.register("pcd.save", processor.save_point_cloud, "Save a point cloud file", {'pcd': 'Any', 'output_path': str})
-        ActionRegistry.register("pcd.analyze", processor.analyze_point_cloud, "Analyze point cloud", {'file_path': str})
-        ActionRegistry.register("pcd.filter.voxel", processor.downsample, "Voxel downsampling", {'file_path': str, 'output_path': str, 'voxel_size': float})
-        ActionRegistry.register("pcd.filter.statistical", processor.remove_outliers, "Statistical outlier removal", {'file_path': str, 'output_path': str, 'method': 'statistical', 'nb_neighbors': int, 'std_ratio': float})
-        ActionRegistry.register("pcd.reconstruct.poisson", processor.reconstruct_mesh, "Poisson reconstruction", {'file_path': str, 'output_path': str, 'method': 'poisson', 'depth': int, 'scale': float})
+        # Register actions - the list comes from the module that answers the verbs, so a
+        # point cloud operation cannot be in the pane and missing from Automation. The six
+        # calls this replaced wrote their specs as bare types ({'file_path': str}) while
+        # ActionRegistry.validate reads rule dicts, so calling any of them raised
+        # "type object 'str' has no attribute 'get'" outside execute's own try: the six
+        # actions were in the task list and none of them could ever run.
+        registered_point_cloud = 0
+        for action_id, func, description, params, batch in processor.automation_actions():
+            ActionRegistry.register(action_id, func, description, params, batch=batch)
+            registered_point_cloud += 1
+        print(f"{registered_point_cloud} point cloud automation actions registered.")
         
         print("Core automation actions registered.")
 

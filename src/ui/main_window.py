@@ -530,6 +530,7 @@ class MainWindow(QMainWindow):
 
         # Point Clouds Tab connections
         self.point_clouds_tab.mesh_generated.connect(self.open_in_mesh_tools)
+        self.point_clouds_tab.add_to_library_requested.connect(self.library_tab.add_model_to_library)
 
         # Mesh Tools Tab connections
         self.mesh_tools_tab.add_to_library_requested.connect(self.library_tab.add_model_to_library)

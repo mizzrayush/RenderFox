@@ -140,6 +140,12 @@ SUITES = [
         "description": "Requires organizing, archiving and temp cleanup to stay inside the job's output folder and to survive a job name containing slashes or colons"
     },
     {
+        "id": "point_clouds_contract",
+        "name": "Point Clouds Pane Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_point_clouds_contract.py")],
+        "description": "Clicks every Point Clouds control and requires each verb to write the file it names, count the points off that file rather than off memory, chain the next verb onto it, refuse an impossible parameter by repeating the number typed, keep the progress dialog's maximum equal to the files actually written, and make Cancel and a second click reach the run in flight - including the two defects only a live run found: a verdict slot that raised on QProgressDialog.wasClosed and a finished signal from an old thread silencing a newer one"
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

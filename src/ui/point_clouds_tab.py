@@ -1,1724 +1,1652 @@
 """
-Point Clouds tab for point cloud processing and mesh reconstruction.
+Point Clouds tab: the pane that drives `src/processing/point_cloud_processor.py`.
+
+One control, one verb. Every button here names an operation the backend already answers, and
+every number shown is one the backend read back off the file that operation left on disk -
+never counted off an object still held in memory. The pane owns threading, dialogs and the
+sentences built from those numbers; the backend owns the vocabulary and the measurement.
+
+What used to sit here instead was a second, private copy of that work: `import open3d`
+closures written inside the click handlers, `self.processor` and `self.current_cloud_path`
+read by the Poisson and distance handlers but never assigned (so both crashed the moment
+they were clicked), `cluster_dbscan` / `register_point_clouds` / `apply_transform` /
+`reconstruct_mesh` calls to methods the backend does not have, `path.replace('.', '_x.')`
+to name the output (which rewrites every dot in the path, including the ones in a folder
+called `v1.2`), a blocking `matplotlib.pyplot.show()` for the histogram, and thirteen
+controls with nothing connected to them. Those closures are gone. The verbs they imitate
+are real now, and each control calls exactly one of them.
 """
 
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QDialog, QFormLayout,
-                             QLabel, QGroupBox, QGridLayout, QComboBox,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
-                             QSpinBox, QCheckBox, QTextEdit, QTabWidget, QSlider,
-                             QProgressBar, QFormLayout, QDoubleSpinBox, QFileDialog,
-                             QMessageBox, QListWidget, QSplitter, QScrollArea)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThreadPool
-from PyQt6.QtGui import QFont
-
-# Import point cloud processor backend
-from ..processing.point_cloud_processor import (
-    PointCloudProcessor, PointCloudStatistics
-)
 import os
+from functools import partial
+
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QDialog,
+                             QFormLayout, QLabel, QGroupBox, QGridLayout, QComboBox,
+                             QFrame, QSpinBox, QCheckBox, QTextEdit, QTabWidget, QSlider,
+                             QDoubleSpinBox, QFileDialog, QMessageBox, QListWidget,
+                             QSplitter, QScrollArea, QProgressDialog)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
+
+from ..processing.point_cloud_processor import PointCloudProcessor
 from .unified_viewer import UnifiedOpen3DViewer
-from ..utils.worker import Worker
 from .icon_provider import get_icon
 
+
+# The verbs that leave a surface behind rather than another cloud - the backend's own list,
+# because it is the one that writes those files. A surface goes to the viewer and to "Export
+# as Mesh"; it never becomes the current model, since the next cloud operation on it would
+# silently be measuring a mesh's vertices.
+SURFACE_OPERATIONS = PointCloudProcessor.SURFACE_VERBS
+
+# How many files each verb is expected to leave on disk. This is the whole of a progress
+# dialog's honesty: the maximum is the number of files the run was asked to make, and the
+# value is the number that actually landed. Nothing here is a percentage guessed at from
+# how far along the operation feels, which is what the old indeterminate bar was really
+# showing - motion, with no claim about progress behind it.
+VERB_OUTPUT_FILES = {
+    'analyze': 0, 'center': 1, 'normalize': 1, 'dedup': 1, 'voxel': 1, 'uniform': 1,
+    'outliers_statistical': 1, 'outliers_radius': 1, 'crop': 1, 'translate': 1,
+    'rotate': 1, 'scale': 1, 'normals': 1, 'planes': 2, 'cluster': 1, 'hull': 1,
+    'poisson': 1, 'ball_pivoting': 1, 'alpha_shape': 1, 'features': 0,
+    'register_icp': 1, 'register_ransac': 1, 'distances': 0, 'export': 1, 'pick': 1,
+}
+
+OP_NAMES = {
+    'analyze': 'Measure', 'center': 'Center', 'normalize': 'Normalise',
+    'dedup': 'Remove duplicates', 'voxel': 'Voxel downsample', 'uniform': 'Uniform downsample',
+    'outliers_statistical': 'Statistical filter', 'outliers_radius': 'Radius filter',
+    'crop': 'Crop to box', 'translate': 'Translate', 'rotate': 'Rotate', 'scale': 'Scale',
+    'normals': 'Estimate normals', 'planes': 'Detect plane', 'cluster': 'DBSCAN clusters',
+    'hull': 'Convex hull', 'poisson': 'Poisson surface', 'ball_pivoting': 'Ball pivoting',
+    'alpha_shape': 'Alpha shape', 'features': 'FPFH features', 'register_icp': 'ICP align',
+    'register_ransac': 'RANSAC align', 'distances': 'Neighbour distances', 'export': 'Export',
+    'pick': 'Pick points',
+}
+
+RUNNING_TEXT = {
+    'analyze': 'Measuring the cloud...',
+    'center': 'Moving the centre to the origin...',
+    'normalize': 'Scaling the longest side to 1...',
+    'dedup': 'Dropping coincident points...',
+    'voxel': 'Downsampling by voxel...',
+    'uniform': 'Keeping every K-th point...',
+    'outliers_statistical': 'Removing statistical outliers...',
+    'outliers_radius': 'Removing radius outliers...',
+    'crop': 'Cropping to the box...',
+    'translate': 'Moving the cloud...',
+    'rotate': 'Turning the cloud...',
+    'scale': 'Scaling the cloud...',
+    'normals': 'Estimating normals...',
+    'planes': 'Fitting a plane...',
+    'cluster': 'Clustering by density...',
+    'hull': 'Building the convex hull...',
+    'poisson': 'Reconstructing the Poisson surface...',
+    'ball_pivoting': 'Rolling the ball over the cloud...',
+    'alpha_shape': 'Building the alpha shape...',
+    'features': 'Computing FPFH features...',
+    'register_icp': 'Aligning by ICP...',
+    'register_ransac': 'Aligning by RANSAC...',
+    'distances': 'Measuring neighbour distances...',
+    'export': 'Writing the file...',
+    'pick': 'Waiting for the selection window...',
+}
+
+
+class CloudRunThread(QThread):
+    """Run one verb away from the click handler and post the verdict it answered with.
+
+    `PointCloudProcessor.run` is total - every path out of it is a dict, including the ones
+    that caught an exception - so there is no error channel to carry here. That is also why
+    `finished` is connected to the pane's back stop: if this thread ever ended without
+    emitting, the modal dialog would still be waiting for a verdict that never comes.
+    """
+
+    verdict_ready = pyqtSignal(dict)
+
+    def __init__(self, processor, operation, params):
+        super().__init__()
+        self.processor = processor
+        self.operation = operation
+        self.params = params
+        self._stop_requested = False
+
+    def request_stop(self):
+        """Ask for a stop. A verb in the middle of a file finishes that file first."""
+        self._stop_requested = True
+
+    def run(self):
+        verdict = self.processor.run(self.operation, self.params,
+                                     lambda: self._stop_requested)
+        self.verdict_ready.emit(verdict)
+
+
 class BoundingBoxDialog(QDialog):
-    """Dialog for entering bounding box coordinates."""
-    def __init__(self, parent=None):
+    """Enter the box to crop to, opened on the box the cloud actually fills."""
+
+    def __init__(self, parent, min_bound=None, max_bound=None):
         super().__init__(parent)
         self.setWindowTitle("Crop Bounding Box")
         self.setModal(True)
-        
+
         layout = QVBoxLayout(self)
-        
         form = QFormLayout()
-        
-        self.min_x = QDoubleSpinBox()
-        self.min_x.setRange(-10000, 10000)
-        self.min_x.setValue(-1.0)
-        
-        self.max_x = QDoubleSpinBox()
-        self.max_x.setRange(-10000, 10000)
-        self.max_x.setValue(1.0)
-        
-        self.min_y = QDoubleSpinBox()
-        self.min_y.setRange(-10000, 10000)
-        self.min_y.setValue(-1.0)
-        
-        self.max_y = QDoubleSpinBox()
-        self.max_y.setRange(-10000, 10000)
-        self.max_y.setValue(1.0)
-        
-        self.min_z = QDoubleSpinBox()
-        self.min_z.setRange(-10000, 10000)
-        self.min_z.setValue(-1.0)
-        
-        self.max_z = QDoubleSpinBox()
-        self.max_z.setRange(-10000, 10000)
-        self.max_z.setValue(1.0)
-        
-        form.addRow("Min X:", self.min_x)
-        form.addRow("Max X:", self.max_x)
-        form.addRow("Min Y:", self.min_y)
-        form.addRow("Max Y:", self.max_y)
-        form.addRow("Min Z:", self.min_z)
-        form.addRow("Max Z:", self.max_z)
-        
+
+        mins = list(min_bound or [-1.0, -1.0, -1.0])
+        maxs = list(max_bound or [1.0, 1.0, 1.0])
+        # ±1e12 rather than the ±10000 the box used to allow: a crop box is in the cloud's
+        # own units, and a survey scan measured in metres is already past 10000 the day it
+        # is opened. A box that makes no sense is refused by the backend with the numbers
+        # it measured, not clamped away by this widget before the user can see it.
+        self._spins = []
+        for axis, low, high in zip('xyz', mins, maxs):
+            self._spins.append(self._spin(low))
+            self._spins.append(self._spin(high))
+            form.addRow(f"Min {axis.upper()}:", self._spins[-2])
+            form.addRow(f"Max {axis.upper()}:", self._spins[-1])
+
         layout.addLayout(form)
-        
+        layout.addWidget(QLabel("Values are in the units of the loaded file. The box starts "
+                                "on the bounds of this cloud."))
+
         buttons = QHBoxLayout()
-        ok_btn = QPushButton("Crop")
-        ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        
+        ok_btn = QPushButton("Crop")
+        ok_btn.clicked.connect(self.accept)
+        buttons.addStretch()
         buttons.addWidget(cancel_btn)
         buttons.addWidget(ok_btn)
         layout.addLayout(buttons)
-        
+
+    @staticmethod
+    def _spin(value):
+        box = QDoubleSpinBox()
+        box.setRange(-1e12, 1e12)
+        box.setDecimals(6)
+        box.setValue(float(value))
+        return box
+
     def get_bounds(self):
-        return [
-            self.min_x.value(), self.max_x.value(),
-            self.min_y.value(), self.max_y.value(),
-            self.min_z.value(), self.max_z.value()
-        ]
+        return ([self._spins[0].value(), self._spins[2].value(), self._spins[4].value()],
+                [self._spins[1].value(), self._spins[3].value(), self._spins[5].value()])
+
 
 class PointCloudsTab(QWidget):
-    mesh_generated = pyqtSignal(str)  # path
-    """Point cloud processing and visualization using Open3D."""
-    
-    point_cloud_loaded = pyqtSignal(dict)
-    processing_completed = pyqtSignal(str)
-    
+    """Point cloud processing, measurement and surface reconstruction."""
+
+    mesh_generated = pyqtSignal(str)
+    add_to_library_requested = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.threadpool = QThreadPool()
-        self.current_point_cloud = None
+        self.pc_processor = PointCloudProcessor()
+
         self.current_model_path = None
         self.target_model_path = None
-        
-        # Initialize point cloud processor backend
-        self.pc_processor = PointCloudProcessor()
-        
+        self.last_surface_path = None
+        self.last_statistics = None
+        self.last_distances = None
+
+        self._active_thread = None
+        self._active_sentence = None
+        self._run_progress = None
+        self._workers = []
+
         self.init_ui()
         self.setup_connections()
-        
+
+    # ---- the one way a verb is started -----------------------------------------
+
+    def _keep_worker(self, thread):
+        """Hold every started worker until it says it is done.
+
+        Dropping the last Python reference of a running QThread is answered by Qt with a
+        process abort - no exception, no message, the window simply goes. A worker is
+        therefore released only by its own `finished` signal.
+        """
+        self._workers.append(thread)
+        thread.finished.connect(lambda: self._workers.remove(thread))
+        return thread
+
+    def _no_file_message(self):
+        QMessageBox.warning(self, "No point cloud loaded",
+                            "Load a point cloud first. This operation works on the file "
+                            "that is current now.")
+
+    def _run(self, operation, params, sentence=None, silent=False):
+        """Start one verb with a dialog whose numbers are files, or refuse to start it.
+
+        `silent` is the follow-up measure a verb triggers on the file it just wrote. It
+        shares this path entirely - worker, verdict, one-run guard - and adds no dialog and
+        no status line of its own, because the user asked for one operation and a second
+        "Measuring the cloud..." window for the same click reads like it did two things.
+        """
+        if self._active_thread is not None:
+            QMessageBox.information(self, "One run at a time",
+                                    f"{self._active_sentence} is still running. Wait for it "
+                                    f"or press Cancel in its dialog before starting "
+                                    f"{RUNNING_TEXT[operation].lower()}")
+            return False
+
+        sentence = sentence or RUNNING_TEXT[operation]
+        expected = VERB_OUTPUT_FILES.get(operation, 1)
+        progress = None
+        if not silent:
+            progress = QProgressDialog(sentence, "Cancel", 0, max(expected, 1), self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            # The dialog closes when the verdict has been reported, not when the number
+            # happens to reach the maximum - an operation that leaves no file behind
+            # finishes at 0 of 1.
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setValue(0)
+            progress.show()
+            self.operation_label.setText(sentence)
+
+        self._run_progress = progress
+        self._active_sentence = sentence
+        thread = self._keep_worker(CloudRunThread(self.pc_processor, operation, params))
+        self._active_thread = thread
+        thread.verdict_ready.connect(partial(self._verdict, progress, thread, silent=silent))
+        thread.finished.connect(partial(self._end_run, progress, thread))
+        if progress is not None:
+            progress.canceled.connect(thread.request_stop)
+        thread.start()
+        return True
+
+    def _dismiss(self, progress):
+        if progress is None:
+            return
+        # `QDialog.wasClosed` is not exposed by PyQt6, so "is it still on screen" is the
+        # question asked the way every Qt binding answers it.
+        if progress.isVisible():
+            progress.setValue(progress.maximum())
+            progress.close()
+
+    def _verdict(self, progress, thread, verdict, silent=False):
+        """Report the single verdict the worker produced.
+
+        The dialog and the thread arrive as arguments, never read back off
+        `self._run_progress`/`self._active_thread`: `QProgressDialog.setValue` runs an event
+        loop, so anything connected to the worker's signals can have already run a handler
+        that nulled the attribute. The thread identity is here for the same reason - on the
+        first live run every verb that measured its own result answered eight "ended without
+        reporting a result" warnings, because the verb's `finished` signal landed while the
+        pane was holding the newer measure thread.
+        """
+        if self._active_thread is thread:
+            self._active_thread = None
+        self._dismiss(progress)
+        operation = verdict.get('operation', 'run')
+        files = [f for f in (verdict.get('files') or []) if f]
+
+        if verdict.get('success'):
+            self._adopt(operation, files, verdict)
+            if not silent:
+                self._record(verdict, self._headline(verdict))
+            self._report_family(operation, verdict)
+        elif verdict.get('stopped'):
+            reason = verdict.get('error') or 'the run was stopped'
+            if silent:
+                self.operation_label.setText(f"Measure of the result stopped: {reason}")
+            else:
+                self.operation_label.setText(f"Stopped: {reason}")
+                QMessageBox.warning(self, f"{OP_NAMES.get(operation, operation)} stopped",
+                                    reason)
+            if files:
+                # A stopped run still says which of its files are really on disk.
+                self.history_list.addItem(
+                    f"{OP_NAMES.get(operation, operation)} stopped after writing "
+                    f"{', '.join(os.path.basename(f) for f in files)}")
+                self.history_list.scrollToBottom()
+        else:
+            reason = verdict.get('error') or 'the run reported neither a file nor a reason'
+            if silent:
+                # The verb itself wrote its file; only the measurement of it failed, and
+                # that belongs on the status line rather than in a dialog over a click that
+                # did produce something.
+                self.operation_label.setText(f"Measure of the result: {reason}")
+                return
+            self.operation_label.setText(f"{OP_NAMES.get(operation, operation)}: {reason}")
+            QMessageBox.warning(self, f"{OP_NAMES.get(operation, operation)} refused", reason)
+
+    def _end_run(self, progress, thread):
+        """Back stop: this thread ended, so its dialog must go whether a verdict arrived."""
+        self._dismiss(progress)
+        if self._run_progress is progress:
+            self._run_progress = None
+        if self._active_thread is not thread:
+            # A newer run owns the pane now, and its verdict is still on its way.
+            return
+        self._active_thread = None
+        sentence = self._active_sentence or 'The run'
+        self.operation_label.setText(f"{sentence} ended without reporting a result")
+        QMessageBox.warning(self, "No result reported",
+                            f"{sentence} ended without reporting a result. No file is "
+                            f"claimed - check the folder it writes into.")
+
+    def _adopt(self, operation, files, verdict):
+        """Make the file a cloud verb just wrote the current model, so runs chain.
+
+        This is the whole ecosystem argument in one method: downsample, then filter, then
+        reconstruct works because each step's output is what the next step reads. The old
+        pane updated `current_model_path` for three of its operations and not for the rest,
+        so which button you had last clicked decided which file the next one used.
+        """
+        if operation in SURFACE_OPERATIONS and files:
+            self.last_surface_path = files[0]
+            self.viewer.load_from_file(files[0])
+            return
+        if operation == 'planes':
+            # Two clouds, on-plane and off-plane. Neither is "the model"; the run names both.
+            return
+        if files and operation not in ('analyze', 'distances', 'features', 'export'):
+            self.load_model(files[0], keep_history=True, announce=False)
+
+    def _record(self, verdict, headline):
+        operation = verdict.get('operation')
+        self.history_list.addItem(f'{OP_NAMES.get(operation, operation)}: {headline}')
+        self.history_list.scrollToBottom()
+        self.operation_label.setText(headline)
+
+    # ---- the sentences the numbers turn into ------------------------------------
+
+    @staticmethod
+    def _measure_text(value, digits=6):
+        if isinstance(value, float):
+            return f'{value:.{digits}f}'
+        if isinstance(value, (list, tuple)):
+            return ', '.join(PointCloudsTab._measure_text(v, digits) for v in value)
+        return str(value)
+
+    @staticmethod
+    def _count(value):
+        return f'{int(value):,}' if isinstance(value, (int, float)) else str(value)
+
+    def _statistics_block(self, stats, size_bytes=None):
+        lines = [
+            f"Points: {self._count(stats['point_count'])}",
+            f"Colours: {'yes' if stats['has_colors'] else 'no'}",
+            f"Normals: {'yes' if stats['has_normals'] else 'no'}",
+            f"Extent (x, y, z): {self._measure_text(stats['bounding_box'], 4)}",
+            f"Centre (x, y, z): {self._measure_text(stats['centroid'], 4)}",
+            f"Density: {stats['density']:.3f} points per unit cubed",
+        ]
+        if size_bytes is not None:
+            lines.append(f"File: {size_bytes / 1024.0:.1f} KB")
+        return lines
+
+    def _headline(self, verdict):
+        """One line that says what the run measured, from the verdict's own numbers."""
+        operation = verdict.get('operation')
+        measure = verdict.get('measure') or {}
+        before = verdict.get('points_before')
+        after = verdict.get('points_after')
+
+        if operation == 'analyze':
+            stats = measure.get('statistics') or {}
+            return f"{self._count(stats.get('point_count'))} points measured"
+        if operation == 'distances':
+            return (f"mean {measure.get('average', 0):.6g}, min "
+                    f"{measure.get('minimum', 0):.6g}, max {measure.get('maximum', 0):.6g} "
+                    f"over {self._count(measure.get('samples'))} samples")
+        if operation == 'features':
+            return (f"voxel {measure.get('voxel_size', 0):.6g}: "
+                    f"{self._count(measure.get('source_descriptors'))} source and "
+                    f"{self._count(measure.get('target_descriptors'))} target descriptors")
+        if operation in ('register_icp', 'register_ransac'):
+            return (f"fitness {measure.get('fitness', 0):.4f}, RMSE "
+                    f"{measure.get('rmse', 0):.6g} on "
+                    f"{self._count(measure.get('correspondences'))} pairs -> "
+                    f"{os.path.basename(verdict.get('output_path') or '')}")
+        if operation == 'planes':
+            return (f"plane {self._measure_text(measure.get('plane_equation'), 4)}: "
+                    f"{self._count(measure.get('on_plane'))} on it, "
+                    f"{self._count(measure.get('off_plane'))} off it")
+        if operation in SURFACE_OPERATIONS:
+            return (f"{self._count(measure.get('vertices'))} vertices, "
+                    f"{self._count(measure.get('faces'))} faces -> "
+                    f"{os.path.basename(verdict.get('output_path') or '')}")
+        if operation == 'cluster':
+            return (f"{measure.get('clusters')} clusters, "
+                    f"{self._count(measure.get('noise'))} noise points")
+        if operation == 'export':
+            where = os.path.basename(verdict.get('output_path') or '')
+            extra = (' - positions only, no faces, for software outside this app'
+                     if not measure.get('readable_here') else '')
+            return f"{self._count(after)} points written to {where}{extra}"
+        if operation == 'pick':
+            return f"{self._count(measure.get('picked'))} points picked"
+        if operation == 'center':
+            return f"moved by {self._measure_text(measure.get('moved_by'), 4)}"
+        if operation == 'normalize':
+            return f"scaled by {measure.get('scale', 0):.6g} to a unit extent"
+        if operation == 'dedup':
+            return f"{self._count(measure.get('removed'))} coincident points removed"
+        if operation == 'voxel':
+            return (f"voxel {measure.get('voxel_size', 0):.6g}: kept {self._count(after)} of "
+                    f"{self._count(before)} ({measure.get('reduction', 0):.1f}% gone)")
+        if operation == 'uniform':
+            return f"every {measure.get('every_k')}th point: {self._count(after)} kept"
+        if operation == 'outliers_statistical':
+            return (f"{self._count(measure.get('removed'))} of {self._count(before)} removed "
+                    f"({measure.get('nb_neighbors')} neighbours, ratio "
+                    f"{measure.get('std_ratio')})")
+        if operation == 'outliers_radius':
+            return (f"{self._count(measure.get('removed'))} of {self._count(before)} removed "
+                    f"({measure.get('nb_points')} within {measure.get('radius'):.6g})")
+        if operation == 'crop':
+            return (f"box kept {self._count(after)} of {self._count(before)}; "
+                    f"{self._count(measure.get('removed'))} outside it")
+        if operation == 'translate':
+            return f"moved by {self._measure_text(measure.get('offset'), 4)}"
+        if operation == 'rotate':
+            return f"turned {self._measure_text(measure.get('degrees'), 2)} degrees"
+        if operation == 'scale':
+            return (f"scaled by {measure.get('factor'):.6g} to extent "
+                    f"{self._measure_text(measure.get('extent'), 4)}")
+        if operation == 'normals':
+            return f"normals on {self._count(after)} points, {measure.get('knn')} neighbours each"
+        # Only a verb with no sentence of its own falls back to the point counts. Keeping
+        # this last is the point: before it sat here, `voxel` reported "900 -> 300" and the
+        # voxel size the user typed never appeared.
+        if before is not None and after is not None:
+            return f"{self._count(before)} -> {self._count(after)} points"
+        return str(verdict.get('error') or verdict.get('output_path') or 'no files written')
+
+    def _detail(self, verdict):
+        """The multi-line report for the family's own text area."""
+        operation = verdict.get('operation')
+        measure = verdict.get('measure') or {}
+        if operation == 'analyze':
+            return self._statistics_block(measure.get('statistics') or {},
+                                          measure.get('bytes'))
+        if operation in ('register_icp', 'register_ransac', 'features'):
+            lines = [f"{OP_NAMES.get(operation)}: {self._headline(verdict)}"]
+            matrix = measure.get('transformation')
+            if matrix:
+                lines.append('Transformation applied to the source:')
+                lines.extend('  ' + self._measure_text(row, 4) for row in matrix)
+            if operation == 'register_ransac':
+                lines.append(f"at voxel {measure.get('voxel_size', 0):.6g}, match distance "
+                             f"{measure.get('distance_threshold', 0):.6g}")
+            if operation == 'register_icp':
+                lines.append(f"{measure.get('correspondences')} pairs under the threshold, "
+                             f"{measure.get('max_iteration', '')}")
+            if operation == 'features':
+                lines.append(f"{self._count(measure.get('source_points'))} source and "
+                             f"{self._count(measure.get('target_points'))} points after "
+                             f"downsampling; the next RANSAC run uses this voxel")
+            return lines
+        if operation == 'distances':
+            lines = [f"Nearest-neighbour distances over "
+                     f"{self._count(measure.get('samples'))} samples:",
+                     f"  minimum  {measure.get('minimum', 0):.6g}",
+                     f"  average  {measure.get('average', 0):.6g}",
+                     f"  maximum  {measure.get('maximum', 0):.6g}"]
+            lines.append('Run "Show Distance Histogram" for the ' +
+                         str(len((measure.get('histogram') or {}).get('counts') or [])) +
+                         ' bins between them.')
+            return lines
+        if operation == 'planes':
+            return [f"Plane equation (a, b, c, d): "
+                    f"{self._measure_text(measure.get('plane_equation'), 6)}",
+                    f"On the plane: {self._count(measure.get('on_plane'))} points",
+                    f"Off the plane: {self._count(measure.get('off_plane'))} points",
+                    f"Within {measure.get('distance_threshold', 0):.6g} of it, "
+                    f"{measure.get('num_iterations')} RANSAC iterations",
+                    'Two files: ' + ', '.join(os.path.basename(f)
+                                              for f in (verdict.get('files') or []))]
+        return [self._headline(verdict)]
+
+    def _fill_info(self, verdict):
+        measure = verdict.get('measure') or {}
+        stats = measure.get('statistics')
+        if not stats:
+            return
+        self.last_statistics = stats
+        self.info_points.setText(self._count(stats['point_count']))
+        self.info_has_normals.setText('yes' if stats['has_normals'] else 'no')
+        self.info_has_colors.setText('yes' if stats['has_colors'] else 'no')
+        self.info_bounds.setText(self._measure_text(stats['bounding_box'], 4))
+
+    def _measured_bounds(self):
+        """The box the current cloud fills, from the measurement of it."""
+        stats = self.last_statistics
+        if not stats:
+            return None, None
+        centre = stats['centroid']
+        extent = stats['bounding_box']
+        return ([c - e / 2.0 for c, e in zip(centre, extent)],
+                [c + e / 2.0 for c, e in zip(centre, extent)])
+
+    # ---- the interface -----------------------------------------------------------
+
     def init_ui(self):
-        """Initialize the point cloud interface."""
         main_layout = QVBoxLayout(self)
-        
-        # Current model header
-        self.model_header = self.create_model_header()
-        main_layout.addWidget(self.model_header)
-        
-        # Create main splitter
+
+        main_layout.addWidget(self.create_model_header())
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left panel - Tools and controls
         left_panel = self.create_left_panel()
         scroll_left = QScrollArea()
         scroll_left.setWidget(left_panel)
         scroll_left.setWidgetResizable(True)
         scroll_left.setFrameShape(QFrame.Shape.NoFrame)
         splitter.addWidget(scroll_left)
-        
-        # Right panel - Viewer and results
-        right_panel = self.create_right_panel()
-        splitter.addWidget(right_panel)
-        
-        splitter.setSizes([350, 850])
+        splitter.addWidget(self.create_right_panel())
+        splitter.setSizes([380, 820])
         main_layout.addWidget(splitter)
-        
+
     def create_model_header(self):
-        """Create the current model header."""
         frame = QFrame()
         frame.setFrameStyle(QFrame.Shape.StyledPanel)
-        frame.setMaximumHeight(80)  # Increased height for explanation
-        
+        frame.setMaximumHeight(80)
+
         layout = QVBoxLayout(frame)
-        
-        # Main header layout
         header_layout = QHBoxLayout()
-        
+
         self.current_model_label = QLabel("No point cloud loaded")
         self.current_model_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        
-        from .icon_provider import get_icon
+
         self.change_model_btn = QPushButton("Change Model")
         self.change_model_btn.setIcon(get_icon("folder"))
         self.add_model_btn = QPushButton("Add to Library")
         self.add_model_btn.setIcon(get_icon("add"))
         self.reload_btn = QPushButton("Reload")
         self.reload_btn.setIcon(get_icon("refresh"))
-        
+
         header_layout.addWidget(self.current_model_label)
         header_layout.addStretch()
         header_layout.addWidget(self.change_model_btn)
         header_layout.addWidget(self.add_model_btn)
         header_layout.addWidget(self.reload_btn)
-        
-        # Explanation text
-        explanation = QLabel("Load point cloud datasets directly for scanning data analysis, filtering, and reconstruction")
+
+        explanation = QLabel("Load a scan, run one operation at a time, and every number "
+                             "here is measured off the file that operation wrote")
         explanation.setStyleSheet("color: #8c93a8; font-size: 8.5pt;")
         explanation.setWordWrap(True)
-        
+
         layout.addLayout(header_layout)
         layout.addWidget(explanation)
-        
         return frame
-        
+
     def create_left_panel(self):
-        """Create the left tools panel."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Create tab widget for different tool categories
+
         self.tools_tabs = QTabWidget()
-        
-        # Basic operations tab
-        basic_tab = self.create_basic_operations_tab()
-        self.tools_tabs.addTab(basic_tab, "Basic")
-        
-        # Filtering tab
-        filtering_tab = self.create_filtering_tab()
-        self.tools_tabs.addTab(filtering_tab, "Filter")
-        
-        # Registration tab
-        registration_tab = self.create_registration_tab()
-        self.tools_tabs.addTab(registration_tab, "Register")
-        
-        # Reconstruction tab
-        reconstruction_tab = self.create_reconstruction_tab()
-        self.tools_tabs.addTab(reconstruction_tab, "Reconstruct")
-        
-        # Analysis tab
-        analysis_tab = self.create_analysis_tab()
-        self.tools_tabs.addTab(analysis_tab, "Analyze")
-        
+        self.tools_tabs.addTab(self.create_basic_operations_tab(), "Basic")
+        self.tools_tabs.addTab(self.create_filtering_tab(), "Filter")
+        self.tools_tabs.addTab(self.create_registration_tab(), "Register")
+        self.tools_tabs.addTab(self.create_reconstruction_tab(), "Reconstruct")
+        self.tools_tabs.addTab(self.create_analysis_tab(), "Analyze")
         layout.addWidget(self.tools_tabs)
-        
-        # Progress section
-        progress_group = QGroupBox("Operations")
-        progress_layout = QVBoxLayout()
-        
+
+        status_group = QGroupBox("Operations")
+        status_layout = QVBoxLayout()
         self.operation_label = QLabel("Ready")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        
-        progress_layout.addWidget(self.operation_label)
-        progress_layout.addWidget(self.progress_bar)
-        
-        progress_group.setLayout(progress_layout)
-        layout.addWidget(progress_group)
-        
+        self.operation_label.setWordWrap(True)
+        status_layout.addWidget(self.operation_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+        layout.addStretch()
         return widget
-        
+
+    def _length_spin(self, value=0.0, low=0.0, high=1e12, decimals=6, step=None):
+        """A typed number box that does not quietly rewrite what was typed.
+
+        The ranges used to be 0.001 to 1.0 whatever the scan was, so a 40 m site file could
+        not be entered at all and a 0 could not be entered to see what happened. The backend
+        is what refuses a length of 0, with the sentence "a voxel edge of 0 is not a length"
+        - which is a reason, where a clamp is silence.
+        """
+        box = QDoubleSpinBox()
+        box.setRange(low, high)
+        box.setDecimals(decimals)
+        box.setValue(value)
+        if step is not None:
+            box.setSingleStep(step)
+        return box
+
+    def _angle_spin(self, value=0.0):
+        box = QDoubleSpinBox()
+        box.setRange(-1e12, 1e12)
+        box.setDecimals(4)
+        box.setValue(value)
+        box.setSuffix(' deg')
+        return box
+
     def create_basic_operations_tab(self):
-        """Create basic point cloud operations."""
         widget = QWidget()
+        layout = QVBoxLayout(widget)
         scroll = QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
-        
-        layout = QVBoxLayout(widget)
-        
-        # I/O operations
+
         io_group = QGroupBox("Import/Export")
         io_layout = QVBoxLayout()
-        
-        from .icon_provider import get_icon
         self.load_pcd_btn = QPushButton("Load Point Cloud")
         self.load_pcd_btn.setIcon(get_icon("folder"))
         self.save_pcd_btn = QPushButton("Save Point Cloud")
         self.save_pcd_btn.setIcon(get_icon("backup"))
         self.export_mesh_btn = QPushButton("Export as Mesh")
         self.export_mesh_btn.setIcon(get_icon("export"))
-        
         io_layout.addWidget(self.load_pcd_btn)
         io_layout.addWidget(self.save_pcd_btn)
         io_layout.addWidget(self.export_mesh_btn)
-        
         io_group.setLayout(io_layout)
         layout.addWidget(io_group)
-        
-        # Basic transformations
+
         transform_group = QGroupBox("Transformations")
         transform_layout = QVBoxLayout()
-        
-        # Translation
+
+        transform_layout.addWidget(QLabel("Translation, in the units of the file:"))
         trans_frame = QFrame()
         trans_layout = QFormLayout(trans_frame)
-        
-        self.trans_x_spin = QDoubleSpinBox()
-        self.trans_x_spin.setRange(-1000, 1000)
-        self.trans_y_spin = QDoubleSpinBox()
-        self.trans_y_spin.setRange(-1000, 1000)
-        self.trans_z_spin = QDoubleSpinBox()
-        self.trans_z_spin.setRange(-1000, 1000)
-        
+        self.trans_x_spin = self._length_spin(low=-1e12)
+        self.trans_y_spin = self._length_spin(low=-1e12)
+        self.trans_z_spin = self._length_spin(low=-1e12)
         trans_layout.addRow("X:", self.trans_x_spin)
         trans_layout.addRow("Y:", self.trans_y_spin)
         trans_layout.addRow("Z:", self.trans_z_spin)
-        
         self.apply_translation_btn = QPushButton("Apply Translation")
-        
-        transform_layout.addWidget(QLabel("Translation:"))
         transform_layout.addWidget(trans_frame)
         transform_layout.addWidget(self.apply_translation_btn)
-        
-        # Rotation
+
+        transform_layout.addWidget(QLabel("Rotation about the cloud's own centre:"))
         rot_frame = QFrame()
         rot_layout = QFormLayout(rot_frame)
-        
-        self.rot_x_spin = QDoubleSpinBox()
-        self.rot_x_spin.setRange(-180, 180)
-        self.rot_x_spin.setSuffix("°")
-        self.rot_y_spin = QDoubleSpinBox()
-        self.rot_y_spin.setRange(-180, 180)
-        self.rot_y_spin.setSuffix("°")
-        self.rot_z_spin = QDoubleSpinBox()
-        self.rot_z_spin.setRange(-180, 180)
-        self.rot_z_spin.setSuffix("°")
-        
+        self.rot_x_spin = self._angle_spin()
+        self.rot_y_spin = self._angle_spin()
+        self.rot_z_spin = self._angle_spin()
         rot_layout.addRow("X:", self.rot_x_spin)
         rot_layout.addRow("Y:", self.rot_y_spin)
         rot_layout.addRow("Z:", self.rot_z_spin)
-        
         self.apply_rotation_btn = QPushButton("Apply Rotation")
-        
-        transform_layout.addWidget(QLabel("Rotation:"))
         transform_layout.addWidget(rot_frame)
         transform_layout.addWidget(self.apply_rotation_btn)
-        
-        # Scale
+
+        transform_layout.addWidget(QLabel("Scale, above 0:"))
         scale_layout = QHBoxLayout()
-        self.scale_spin = QDoubleSpinBox()
-        self.scale_spin.setRange(0.01, 100)
-        self.scale_spin.setValue(1.0)
-        self.scale_spin.setSingleStep(0.1)
+        self.scale_spin = self._length_spin(1.0, decimals=4, step=0.1)
         self.apply_scale_btn = QPushButton("Apply Scale")
-        
         scale_layout.addWidget(self.scale_spin)
         scale_layout.addWidget(self.apply_scale_btn)
-        
-        transform_layout.addWidget(QLabel("Scale:"))
         transform_layout.addLayout(scale_layout)
-        
+
         transform_group.setLayout(transform_layout)
         layout.addWidget(transform_group)
-        
-        # Basic processing
+
         processing_group = QGroupBox("Basic Processing")
         processing_layout = QVBoxLayout()
-        
         self.center_btn = QPushButton("Center Point Cloud")
         self.normalize_btn = QPushButton("Normalize Scale")
         self.remove_duplicates_btn = QPushButton("Remove Duplicates")
         self.estimate_normals_btn = QPushButton("Estimate Normals")
-        
+        knn_layout = QHBoxLayout()
+        knn_layout.addWidget(QLabel("Neighbours per point:"))
+        # 1e12 upper bound on purpose: the backend reads the cloud first and answers
+        # "300 neighbours needs a cloud of at least 300 points and this one has 90",
+        # which is the only way a user finds out how big their scan is.
+        self.normals_knn_spin = QSpinBox()
+        self.normals_knn_spin.setRange(3, 1000000)
+        self.normals_knn_spin.setValue(30)
+        knn_layout.addWidget(self.normals_knn_spin)
+        knn_layout.addStretch()
         processing_layout.addWidget(self.center_btn)
         processing_layout.addWidget(self.normalize_btn)
         processing_layout.addWidget(self.remove_duplicates_btn)
+        processing_layout.addLayout(knn_layout)
         processing_layout.addWidget(self.estimate_normals_btn)
-        
         processing_group.setLayout(processing_layout)
         layout.addWidget(processing_group)
-        
+
         layout.addStretch()
         return scroll
-        
+
     def create_filtering_tab(self):
-        """Create filtering operations."""
         widget = QWidget()
+        layout = QVBoxLayout(widget)
         scroll = QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
-        
-        layout = QVBoxLayout(widget)
-        
-        # Statistical outlier removal
-        outlier_group = QGroupBox("Outlier Removal")
+
+        outlier_group = QGroupBox("Statistical Outlier Removal")
         outlier_layout = QFormLayout()
-        
         self.outlier_neighbors_spin = QSpinBox()
-        self.outlier_neighbors_spin.setRange(1, 100)
+        self.outlier_neighbors_spin.setRange(1, 1000000)
         self.outlier_neighbors_spin.setValue(20)
-        
-        self.outlier_std_spin = QDoubleSpinBox()
-        self.outlier_std_spin.setRange(0.1, 10.0)
-        self.outlier_std_spin.setValue(2.0)
-        self.outlier_std_spin.setSingleStep(0.1)
-        
+        self.outlier_std_spin = self._length_spin(2.0, decimals=3, step=0.1)
         outlier_layout.addRow("Neighbors:", self.outlier_neighbors_spin)
         outlier_layout.addRow("Std Ratio:", self.outlier_std_spin)
-        
         self.remove_outliers_btn = QPushButton("Remove Statistical Outliers")
-        
         outlier_group.setLayout(outlier_layout)
         layout.addWidget(outlier_group)
         layout.addWidget(self.remove_outliers_btn)
-        
-        # Radius outlier removal
+
         radius_group = QGroupBox("Radius Outlier Removal")
         radius_layout = QFormLayout()
-        
-        self.radius_spin = QDoubleSpinBox()
-        self.radius_spin.setRange(0.001, 10.0)
-        self.radius_spin.setValue(0.05)
-        self.radius_spin.setSingleStep(0.001)
-        
+        self.radius_spin = self._length_spin(0.05, step=0.001)
         self.min_points_spin = QSpinBox()
-        self.min_points_spin.setRange(1, 100)
+        self.min_points_spin.setRange(1, 1000000)
         self.min_points_spin.setValue(16)
-        
         radius_layout.addRow("Radius:", self.radius_spin)
         radius_layout.addRow("Min Points:", self.min_points_spin)
-        
         self.remove_radius_outliers_btn = QPushButton("Remove Radius Outliers")
-        
         radius_group.setLayout(radius_layout)
         layout.addWidget(radius_group)
         layout.addWidget(self.remove_radius_outliers_btn)
-        
-        # Voxel downsampling
+
         voxel_group = QGroupBox("Voxel Downsampling")
         voxel_layout = QFormLayout()
-        
-        self.voxel_size_spin = QDoubleSpinBox()
-        self.voxel_size_spin.setRange(0.001, 1.0)
-        self.voxel_size_spin.setValue(0.01)
-        self.voxel_size_spin.setSingleStep(0.001)
-        
+        self.voxel_size_spin = self._length_spin(0.01, step=0.001)
         voxel_layout.addRow("Voxel Size:", self.voxel_size_spin)
-        
         self.voxel_downsample_btn = QPushButton("Apply Voxel Downsampling")
-        
         voxel_group.setLayout(voxel_layout)
         layout.addWidget(voxel_group)
         layout.addWidget(self.voxel_downsample_btn)
-        
-        # Uniform downsampling
+
         uniform_group = QGroupBox("Uniform Downsampling")
         uniform_layout = QFormLayout()
-        
         self.uniform_k_spin = QSpinBox()
-        self.uniform_k_spin.setRange(2, 1000)
+        self.uniform_k_spin.setRange(1, 1000000)
         self.uniform_k_spin.setValue(5)
-        
         uniform_layout.addRow("Every K-th Point:", self.uniform_k_spin)
-        
         self.uniform_downsample_btn = QPushButton("Apply Uniform Downsampling")
-        
         uniform_group.setLayout(uniform_layout)
         layout.addWidget(uniform_group)
         layout.addWidget(self.uniform_downsample_btn)
-        
-        # Crop operations
+
         crop_group = QGroupBox("Cropping")
         crop_layout = QVBoxLayout()
-        
         self.crop_box_btn = QPushButton("Crop to Bounding Box")
         self.crop_interactive_btn = QPushButton("Interactive Crop")
-        
         crop_layout.addWidget(self.crop_box_btn)
         crop_layout.addWidget(self.crop_interactive_btn)
-        
         crop_group.setLayout(crop_layout)
         layout.addWidget(crop_group)
-        
+
         layout.addStretch()
         return scroll
-        
+
     def create_registration_tab(self):
-        """Create point cloud registration tools."""
         widget = QWidget()
+        layout = QVBoxLayout(widget)
         scroll = QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
-        
-        layout = QVBoxLayout(widget)
-        
-        # Load target point cloud
+
         target_group = QGroupBox("Target Point Cloud")
         target_layout = QVBoxLayout()
-        
         self.load_target_btn = QPushButton("Load Target")
         self.load_target_btn.setIcon(get_icon("folder"))
         self.target_info_label = QLabel("No target loaded")
-        
+        self.target_info_label.setWordWrap(True)
         target_layout.addWidget(self.load_target_btn)
         target_layout.addWidget(self.target_info_label)
-        
         target_group.setLayout(target_layout)
         layout.addWidget(target_group)
-        
-        # ICP Registration
+
         icp_group = QGroupBox("ICP Registration")
         icp_layout = QFormLayout()
-        
-        self.icp_threshold_spin = QDoubleSpinBox()
-        self.icp_threshold_spin.setRange(0.001, 1.0)
-        self.icp_threshold_spin.setValue(0.02)
-        self.icp_threshold_spin.setSingleStep(0.001)
-        
+        self.icp_threshold_spin = self._length_spin(0.02, step=0.001)
         self.icp_max_iter_spin = QSpinBox()
-        self.icp_max_iter_spin.setRange(1, 1000)
+        self.icp_max_iter_spin.setRange(1, 1000000)
         self.icp_max_iter_spin.setValue(100)
-        
-        icp_layout.addRow("Threshold:", self.icp_threshold_spin)
+        icp_layout.addRow("Match distance:", self.icp_threshold_spin)
         icp_layout.addRow("Max Iterations:", self.icp_max_iter_spin)
-        
         self.run_icp_btn = QPushButton("Run ICP Registration")
-        
         icp_group.setLayout(icp_layout)
         layout.addWidget(icp_group)
         layout.addWidget(self.run_icp_btn)
-        
-        # Feature-based registration
+
         feature_group = QGroupBox("Feature-based Registration")
-        feature_layout = QVBoxLayout()
-        
+        feature_layout = QFormLayout()
+        self.feature_voxel_spin = self._length_spin(0.0, step=0.01)
+        self.feature_voxel_spin.setToolTip("0 means: take the spacing of the cloud itself "
+                                           "and use 1.5 times it")
+        feature_layout.addRow("Voxel (0 = measured):", self.feature_voxel_spin)
         self.extract_features_btn = QPushButton("Extract FPFH Features")
         self.run_ransac_btn = QPushButton("Run RANSAC Registration")
-        
-        feature_layout.addWidget(self.extract_features_btn)
-        feature_layout.addWidget(self.run_ransac_btn)
-        
         feature_group.setLayout(feature_layout)
         layout.addWidget(feature_group)
-        
-        # Registration results
+        layout.addWidget(self.extract_features_btn)
+        layout.addWidget(self.run_ransac_btn)
+
         results_group = QGroupBox("Registration Results")
         results_layout = QVBoxLayout()
-        
         self.registration_results = QTextEdit()
-        self.registration_results.setMaximumHeight(100)
+        self.registration_results.setMaximumHeight(160)
         self.registration_results.setReadOnly(True)
-        
         results_layout.addWidget(self.registration_results)
-        
         results_group.setLayout(results_layout)
         layout.addWidget(results_group)
-        
+
         layout.addStretch()
         return scroll
-        
+
     def create_reconstruction_tab(self):
-        """Create mesh reconstruction tools."""
         widget = QWidget()
+        layout = QVBoxLayout(widget)
         scroll = QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
-        
-        layout = QVBoxLayout(widget)
-        
-        # Poisson reconstruction
+
+        format_group = QGroupBox("Surface Output")
+        format_layout = QFormLayout()
+        # Every format the app's own mesh writer answers True for, asked of it at startup -
+        # not a list of extensions this build may not be able to write.
+        self.surface_format_combo = QComboBox()
+        self.surface_format_combo.addItems(self.pc_processor.surface_formats())
+        # .ply is the opening choice rather than whatever the list's alphabetical first
+        # happens to be, because it is the surface format this app always reads back.
+        if '.ply' in self.pc_processor.surface_formats():
+            self.surface_format_combo.setCurrentText('.ply')
+        self.surface_format_combo.setToolTip("Written through FormatConverter, the same "
+                                             "writer Mesh Tools reads back")
+        format_layout.addRow("Save surfaces as:", self.surface_format_combo)
+        format_group.setLayout(format_layout)
+        layout.addWidget(format_group)
+
         poisson_group = QGroupBox("Poisson Surface Reconstruction")
         poisson_layout = QFormLayout()
-        
+        # Depth 12 is the ceiling because a deeper octree is answered by the native
+        # allocator killing the process, not by an exception this pane could report.
         self.poisson_depth_spin = QSpinBox()
-        self.poisson_depth_spin.setRange(5, 12)
+        self.poisson_depth_spin.setRange(1, 12)
         self.poisson_depth_spin.setValue(9)
-        
         self.poisson_width_spin = QSpinBox()
-        self.poisson_width_spin.setRange(0, 10)
+        self.poisson_width_spin.setRange(0, 100)
         self.poisson_width_spin.setValue(0)
-        
-        self.poisson_scale_spin = QDoubleSpinBox()
-        self.poisson_scale_spin.setRange(0.1, 2.0)
-        self.poisson_scale_spin.setValue(1.1)
-        self.poisson_scale_spin.setSingleStep(0.1)
-        
-        poisson_layout.addRow("Depth:", self.poisson_depth_spin)
+        self.poisson_scale_spin = self._length_spin(1.1, decimals=3, step=0.1)
+        self.poisson_linear_fit_cb = QCheckBox("Linear fit (faster, faceted)")
+        self.poisson_trim_cb = QCheckBox("Trim the low-density shell")
+        self.poisson_trim_cb.setToolTip("Poisson closes every open boundary with a skin of "
+                                        "near-zero density; this cuts it by density "
+                                        "percentiles 1 and 99")
+        self.poisson_trim_cb.setChecked(True)
+        poisson_layout.addRow("Octree depth:", self.poisson_depth_spin)
         poisson_layout.addRow("Width:", self.poisson_width_spin)
         poisson_layout.addRow("Scale:", self.poisson_scale_spin)
-        
+        poisson_layout.addRow(self.poisson_linear_fit_cb)
+        poisson_layout.addRow(self.poisson_trim_cb)
         self.run_poisson_btn = QPushButton("Run Poisson Reconstruction")
-        
         poisson_group.setLayout(poisson_layout)
         layout.addWidget(poisson_group)
         layout.addWidget(self.run_poisson_btn)
-        
-        # Ball pivoting
+
         ball_group = QGroupBox("Ball Pivoting Algorithm")
         ball_layout = QFormLayout()
-        
-        self.ball_radius_spin = QDoubleSpinBox()
-        self.ball_radius_spin.setRange(0.001, 1.0)
-        self.ball_radius_spin.setValue(0.005)
-        self.ball_radius_spin.setSingleStep(0.001)
-        
-        ball_layout.addRow("Ball Radius:", self.ball_radius_spin)
-        
+        self.ball_radius_spin = self._length_spin(0.0, step=0.001)
+        self.ball_radius_spin.setToolTip("0 means: three radii derived from the cloud's own "
+                                         "neighbour spacing")
+        ball_layout.addRow("Ball Radius (0 = measured):", self.ball_radius_spin)
         self.run_ball_pivoting_btn = QPushButton("Run Ball Pivoting")
-        
         ball_group.setLayout(ball_layout)
         layout.addWidget(ball_group)
         layout.addWidget(self.run_ball_pivoting_btn)
-        
-        # Alpha shapes
+
         alpha_group = QGroupBox("Alpha Shapes")
         alpha_layout = QFormLayout()
-        
-        self.alpha_value_spin = QDoubleSpinBox()
-        self.alpha_value_spin.setRange(0.001, 1.0)
-        self.alpha_value_spin.setValue(0.03)
-        self.alpha_value_spin.setSingleStep(0.001)
-        
+        self.alpha_value_spin = self._length_spin(0.03, step=0.001)
         alpha_layout.addRow("Alpha Value:", self.alpha_value_spin)
-        
         self.run_alpha_shapes_btn = QPushButton("Create Alpha Shape")
-        
         alpha_group.setLayout(alpha_layout)
         layout.addWidget(alpha_group)
         layout.addWidget(self.run_alpha_shapes_btn)
-        
-        # Convex hull
+
         hull_group = QGroupBox("Convex Hull")
         hull_layout = QVBoxLayout()
-        
         self.create_convex_hull_btn = QPushButton("Create Convex Hull")
-        
         hull_layout.addWidget(self.create_convex_hull_btn)
-        
         hull_group.setLayout(hull_layout)
         layout.addWidget(hull_group)
-        
+
         layout.addStretch()
         return scroll
-        
+
     def create_analysis_tab(self):
-        """Create analysis and measurement tools."""
         widget = QWidget()
+        layout = QVBoxLayout(widget)
         scroll = QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
-        
-        layout = QVBoxLayout(widget)
-        
-        # Basic statistics
+
         stats_group = QGroupBox("Statistics")
         stats_layout = QVBoxLayout()
-        
         self.compute_stats_btn = QPushButton("Compute Statistics")
         self.stats_display = QTextEdit()
-        self.stats_display.setMaximumHeight(120)
+        self.stats_display.setMaximumHeight(160)
         self.stats_display.setReadOnly(True)
-        
         stats_layout.addWidget(self.compute_stats_btn)
         stats_layout.addWidget(self.stats_display)
-        
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
-        
-        # Distance analysis
+
         distance_group = QGroupBox("Distance Analysis")
         distance_layout = QVBoxLayout()
-        
         self.compute_distances_btn = QPushButton("Compute Nearest Distances")
         self.distance_histogram_btn = QPushButton("Show Distance Histogram")
-        
+        self.histogram_view = QTextEdit()
+        self.histogram_view.setReadOnly(True)
+        self.histogram_view.setMaximumHeight(200)
+        self.histogram_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         distance_layout.addWidget(self.compute_distances_btn)
         distance_layout.addWidget(self.distance_histogram_btn)
-        
+        distance_layout.addWidget(self.histogram_view)
         distance_group.setLayout(distance_layout)
         layout.addWidget(distance_group)
-        
-        # Clustering
+
         clustering_group = QGroupBox("Clustering")
         clustering_layout = QFormLayout()
-        
-        self.cluster_eps_spin = QDoubleSpinBox()
-        self.cluster_eps_spin.setRange(0.001, 1.0)
-        self.cluster_eps_spin.setValue(0.02)
-        self.cluster_eps_spin.setSingleStep(0.001)
-        
+        self.cluster_eps_spin = self._length_spin(0.02, step=0.001)
         self.cluster_min_points_spin = QSpinBox()
-        self.cluster_min_points_spin.setRange(1, 100)
+        self.cluster_min_points_spin.setRange(1, 1000000)
         self.cluster_min_points_spin.setValue(10)
-        
         clustering_layout.addRow("Epsilon:", self.cluster_eps_spin)
         clustering_layout.addRow("Min Points:", self.cluster_min_points_spin)
-        
         self.run_clustering_btn = QPushButton("Run DBSCAN Clustering")
-        
         clustering_group.setLayout(clustering_layout)
         layout.addWidget(clustering_group)
         layout.addWidget(self.run_clustering_btn)
-        
-        # Plane detection
+
         plane_group = QGroupBox("Plane Detection")
         plane_layout = QFormLayout()
-        
-        self.plane_threshold_spin = QDoubleSpinBox()
-        self.plane_threshold_spin.setRange(0.001, 0.1)
-        self.plane_threshold_spin.setValue(0.01)
-        self.plane_threshold_spin.setSingleStep(0.001)
-        
+        self.plane_threshold_spin = self._length_spin(0.01, step=0.001)
+        self.plane_ransac_n_spin = QSpinBox()
+        self.plane_ransac_n_spin.setRange(3, 10)
+        self.plane_ransac_n_spin.setValue(3)
         self.plane_iterations_spin = QSpinBox()
-        self.plane_iterations_spin.setRange(100, 10000)
+        self.plane_iterations_spin.setRange(1, 1000000)
         self.plane_iterations_spin.setValue(1000)
-        
-        plane_layout.addRow("Threshold:", self.plane_threshold_spin)
-        plane_layout.addRow("Max Iterations:", self.plane_iterations_spin)
-        
+        plane_layout.addRow("Distance Threshold:", self.plane_threshold_spin)
+        plane_layout.addRow("Points per trial:", self.plane_ransac_n_spin)
+        plane_layout.addRow("Iterations:", self.plane_iterations_spin)
         self.detect_planes_btn = QPushButton("Detect Planes (RANSAC)")
-        
         plane_group.setLayout(plane_layout)
         layout.addWidget(plane_group)
         layout.addWidget(self.detect_planes_btn)
-        
+
         layout.addStretch()
         return scroll
-        
+
     def create_right_panel(self):
-        """Create the right panel with viewer and results."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Create tab widget for viewer and results
         self.right_tabs = QTabWidget()
-        
-        # 3D Viewer tab
-        viewer_tab = self.create_viewer_tab()
-        self.right_tabs.addTab(viewer_tab, "3D Viewer")
-        
-        # Point cloud info tab
-        info_tab = self.create_info_tab()
-        self.right_tabs.addTab(info_tab, "Information")
-        
-        # Processing results tab
-        results_tab = self.create_results_tab()
-        self.right_tabs.addTab(results_tab, "Results")
-        
+        self.right_tabs.addTab(self.create_viewer_tab(), "3D Viewer")
+        self.right_tabs.addTab(self.create_info_tab(), "Information")
+        self.right_tabs.addTab(self.create_results_tab(), "Results")
         layout.addWidget(self.right_tabs)
-        
         return widget
-        
+
     def create_viewer_tab(self):
-        """Create the 3D viewer interface with UnifiedOpen3DViewer."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Unified Open3D Viewer
+
         self.viewer = UnifiedOpen3DViewer()
         layout.addWidget(self.viewer)
-        self.has_viewer = True
-        
-        # Viewer controls
+
         controls_frame = QFrame()
         controls_layout = QHBoxLayout(controls_frame)
-        
-        # Display options
-        self.show_normals_cb = QCheckBox("Show Normals")
-        self.show_wireframe_cb = QCheckBox("Wireframe")
+
+        controls_layout.addWidget(QLabel("Point Size:"))
+        # The slider is 1-10 because that is the range a drag is useful over; the box beside
+        # it is 0-200 because typing is not a drag. The two stay in step both ways.
         self.point_size_slider = QSlider(Qt.Orientation.Horizontal)
         self.point_size_slider.setRange(1, 10)
         self.point_size_slider.setValue(3)
-        
+        self.point_size_box = self._length_spin(3.0, high=200.0, decimals=2, step=0.5)
+        self.point_size_box.setSuffix(' px')
+        controls_layout.addWidget(self.point_size_slider)
+        controls_layout.addWidget(self.point_size_box)
+
+        self.show_normals_cb = QCheckBox("Show Normals")
+        self.show_wireframe_cb = QCheckBox("Wireframe")
+        controls_layout.addWidget(self.show_normals_cb)
+        controls_layout.addWidget(self.show_wireframe_cb)
+        controls_layout.addStretch()
+
         self.reset_view_btn = QPushButton("Reset View")
         self.reset_view_btn.setIcon(get_icon("reset_view"))
         self.fit_view_btn = QPushButton("Fit to View")
         self.fit_view_btn.setIcon(get_icon("focus"))
         self.screenshot_btn = QPushButton("Screenshot")
         self.screenshot_btn.setIcon(get_icon("camera"))
-        
-        # Connect controls
-        self.reset_view_btn.clicked.connect(self.viewer.reset_view)
-        # self.fit_view_btn.clicked.connect(self.viewer.fit_to_view) # Check if supported
-        
-        controls_layout.addWidget(QLabel("Point Size:"))
-        controls_layout.addWidget(self.point_size_slider)
-        controls_layout.addWidget(self.show_normals_cb)
-        controls_layout.addWidget(self.show_wireframe_cb)
-        controls_layout.addStretch()
         controls_layout.addWidget(self.reset_view_btn)
         controls_layout.addWidget(self.fit_view_btn)
         controls_layout.addWidget(self.screenshot_btn)
-        
+
         layout.addWidget(controls_frame)
-        
         return widget
 
-        
     def create_info_tab(self):
-        """Create point cloud information display."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Basic information
+
         basic_group = QGroupBox("Basic Information")
         basic_layout = QFormLayout()
-        
         self.info_filename = QLabel("No point cloud loaded")
         self.info_points = QLabel("-")
         self.info_has_normals = QLabel("-")
         self.info_has_colors = QLabel("-")
         self.info_bounds = QLabel("-")
-        
+        self.info_surface = QLabel("none built from this cloud yet")
+        self.info_surface.setWordWrap(True)
         basic_layout.addRow("Filename:", self.info_filename)
         basic_layout.addRow("Points:", self.info_points)
         basic_layout.addRow("Has Normals:", self.info_has_normals)
         basic_layout.addRow("Has Colors:", self.info_has_colors)
-        basic_layout.addRow("Bounds:", self.info_bounds)
-        
+        basic_layout.addRow("Extent (x, y, z):", self.info_bounds)
+        basic_layout.addRow("Surface:", self.info_surface)
         basic_group.setLayout(basic_layout)
         layout.addWidget(basic_group)
-        
-        # Detailed statistics
+
         stats_group = QGroupBox("Detailed Statistics")
         stats_layout = QVBoxLayout()
-        
         self.detailed_stats = QTextEdit()
         self.detailed_stats.setReadOnly(True)
-        self.detailed_stats.setMaximumHeight(200)
-        
+        self.detailed_stats.setMaximumHeight(220)
         stats_layout.addWidget(self.detailed_stats)
-        
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
-        
+
         layout.addStretch()
         return widget
-        
+
     def create_results_tab(self):
-        """Create processing results display."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Processing history
+
         history_group = QGroupBox("Processing History")
         history_layout = QVBoxLayout()
-        
         self.history_list = QListWidget()
         self.clear_history_btn = QPushButton("Clear History")
-        
         history_layout.addWidget(self.history_list)
         history_layout.addWidget(self.clear_history_btn)
-        
         history_group.setLayout(history_layout)
         layout.addWidget(history_group)
-        
-        # Export options
+
         export_group = QGroupBox("Export Options")
         export_layout = QGridLayout()
-        
         self.export_pcd_btn = QPushButton("Export PCD")
         self.export_ply_btn = QPushButton("Export PLY")
         self.export_xyz_btn = QPushButton("Export XYZ")
         self.export_obj_btn = QPushButton("Export OBJ")
-        
         export_layout.addWidget(self.export_pcd_btn, 0, 0)
         export_layout.addWidget(self.export_ply_btn, 0, 1)
         export_layout.addWidget(self.export_xyz_btn, 1, 0)
         export_layout.addWidget(self.export_obj_btn, 1, 1)
-        
         export_group.setLayout(export_layout)
         layout.addWidget(export_group)
-        
+
+        note = QLabel("PCD, PLY and XYZ are read back by this app. OBJ leaves as a vertex "
+                      "list for software outside it - a mesh file with no faces is not a "
+                      "mesh here.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8c93a8; font-size: 8.5pt;")
+        layout.addWidget(note)
+
         layout.addStretch()
         return widget
 
     def setup_connections(self):
-        """Setup signal connections."""
-        # Header buttons
         self.change_model_btn.clicked.connect(self.change_model)
         self.reload_btn.clicked.connect(self.reload_current_model)
-        
-        # Basic operations
+        self.add_model_btn.clicked.connect(self.add_to_library)
+
         self.load_pcd_btn.clicked.connect(self.load_point_cloud)
-        self.center_btn.clicked.connect(self.center_point_cloud)
-        self.normalize_btn.clicked.connect(self.normalize_point_cloud)
-        
-        # Transformations
+        self.save_pcd_btn.clicked.connect(self.save_point_cloud)
+        self.export_mesh_btn.clicked.connect(self.export_as_mesh)
+
         self.apply_translation_btn.clicked.connect(self.apply_translation)
         self.apply_rotation_btn.clicked.connect(self.apply_rotation)
         self.apply_scale_btn.clicked.connect(self.apply_scale)
-        
-        # Filtering
+        self.center_btn.clicked.connect(self.center_point_cloud)
+        self.normalize_btn.clicked.connect(self.normalize_point_cloud)
+        self.remove_duplicates_btn.clicked.connect(self.remove_duplicates)
+        self.estimate_normals_btn.clicked.connect(self.estimate_normals)
+
         self.remove_outliers_btn.clicked.connect(self.remove_statistical_outliers)
         self.remove_radius_outliers_btn.clicked.connect(self.remove_radius_outliers)
         self.voxel_downsample_btn.clicked.connect(self.voxel_downsample)
-        
-        # Cropping
+        self.uniform_downsample_btn.clicked.connect(self.uniform_downsample)
         self.crop_box_btn.clicked.connect(self.crop_box)
         self.crop_interactive_btn.clicked.connect(self.crop_interactive)
-        
-        # Analysis
-        self.compute_stats_btn.clicked.connect(self.compute_statistics)
-        self.run_clustering_btn.clicked.connect(self.run_clustering)
-        
-        # Reconstruction
+
+        self.load_target_btn.clicked.connect(self.load_target_model)
+        self.run_icp_btn.clicked.connect(self.run_icp_registration)
+        self.extract_features_btn.clicked.connect(self.extract_features)
+        self.run_ransac_btn.clicked.connect(self.run_ransac_registration)
+
         self.run_poisson_btn.clicked.connect(self.poisson_reconstruction)
         self.run_ball_pivoting_btn.clicked.connect(self.run_ball_pivoting)
         self.run_alpha_shapes_btn.clicked.connect(self.run_alpha_shapes)
+        self.create_convex_hull_btn.clicked.connect(self.create_convex_hull)
 
-        # Registration
-        self.load_target_btn.clicked.connect(self.load_target_model)
-        self.run_icp_btn.clicked.connect(self.run_icp_registration)
-        self.run_ransac_btn.clicked.connect(self.run_ransac_registration)
-        
-        # Export connections
-        self.export_pcd_btn.clicked.connect(lambda: self.export_point_cloud("pcd"))
-        self.export_ply_btn.clicked.connect(lambda: self.export_point_cloud("ply"))
-        self.export_xyz_btn.clicked.connect(lambda: self.export_point_cloud("xyz"))
-        self.export_obj_btn.clicked.connect(lambda: self.export_point_cloud("obj"))
-        # Analysis connections
+        self.compute_stats_btn.clicked.connect(self.compute_statistics)
         self.compute_distances_btn.clicked.connect(self.compute_distances)
         self.distance_histogram_btn.clicked.connect(self.show_distance_histogram)
-        # Viewer connections
+        self.run_clustering_btn.clicked.connect(self.run_clustering)
+        self.detect_planes_btn.clicked.connect(self.detect_planes)
+
+        self.export_pcd_btn.clicked.connect(lambda: self.export_point_cloud('.pcd'))
+        self.export_ply_btn.clicked.connect(lambda: self.export_point_cloud('.ply'))
+        self.export_xyz_btn.clicked.connect(lambda: self.export_point_cloud('.xyz'))
+        self.export_obj_btn.clicked.connect(lambda: self.export_point_cloud('.obj'))
+        self.clear_history_btn.clicked.connect(self.clear_history)
+
+        self.point_size_slider.valueChanged.connect(self._point_size_from_slider)
+        self.point_size_box.valueChanged.connect(self._point_size_from_box)
+        self.show_normals_cb.toggled.connect(self.viewer.set_show_normals)
+        self.show_wireframe_cb.toggled.connect(self.viewer.set_show_wireframe)
+        self.reset_view_btn.clicked.connect(self.reset_display)
+        self.fit_view_btn.clicked.connect(self.fit_to_view)
         self.screenshot_btn.clicked.connect(self.capture_screen)
+
+    # ---- loading -----------------------------------------------------------------
+
+    def _cloud_filter(self):
+        return ("Point clouds (%s);;All files (*)"
+                % ' '.join('*' + ext for ext in self.pc_processor.readable_formats()))
+
     def change_model(self):
-        """Change the current point cloud model."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Load Point Cloud",
-            "", "Point Clouds (*.pcd *.ply *.xyz);;All Files (*)"
-        )
-        
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Point Cloud", "",
+                                                   self._cloud_filter())
         if file_path:
             self.load_model(file_path)
 
-    def load_model(self, file_path):
-        """Load a point cloud model and display in viewer."""
+    def load_point_cloud(self):
+        self.change_model()
+
+    def load_point_cloud_file(self, file_path):
+        """The entry point the rest of the app uses to hand a file to this pane."""
+        self.load_model(file_path)
+
+    def load_model(self, file_path, keep_history=False, announce=True):
+        """Show one file and measure it, or say why neither happened.
+
+        Loading used to set `current_model_path` first and then discover the viewer could
+        not open the file, so the header named a model the pane was not holding. The viewer
+        answer comes first now, and the labels only move once there is something on screen
+        that matches them.
+
+        `announce=False` is a verb's own follow-up measure: no status line, no dialog, and
+        the sentence the user asked about stays where it is.
+        """
+        if not os.path.isfile(file_path):
+            QMessageBox.warning(self, "No such file", f"There is no file at {file_path}")
+            return
+
+        if announce:
+            self.operation_label.setText(f"Opening {os.path.basename(file_path)}...")
+        if not self.viewer.load_from_file(file_path):
+            self.operation_label.setText(f"Cannot show {os.path.basename(file_path)}")
+            QMessageBox.warning(
+                self, "Cannot show this file",
+                f"{os.path.basename(file_path)} opens here as neither a mesh with faces nor "
+                f"a cloud with points. A cloud reader here takes "
+                f"{', '.join(self.pc_processor.readable_formats())}.")
+            return
+
+        replaced = os.path.normcase(file_path) != os.path.normcase(self.current_model_path or '')
         self.current_model_path = file_path
-        filename = os.path.basename(file_path)
-        self.current_model_label.setText(f"Current: {filename}")
-        
-        # Load into Unified Viewer
-        try:
-            self.operation_label.setText(f"Loading {filename}...")
-            success = self.viewer.load_from_file(file_path)
-            
-            if success:
-                self.operation_label.setText(f"✓ Loaded: {filename}")
-                
-                # Get and display model info
-                # For now, just rely on processor for stats
-                self.point_cloud_loaded.emit({}) 
-            else:
-                self.operation_label.setText("Failed to load point cloud")
-                QMessageBox.warning(self, "Load Error", f"Failed to load {filename}")
-                
-        except Exception as e:
-            self.operation_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to load point cloud:\n{str(e)}")
+        if replaced:
+            # A surface or a distance report describes the points it was made from, so a
+            # different cloud retires them. The same file coming back - Reload, or a verb
+            # measuring what it just wrote - does not; that used to answer "no surface has
+            # been built" after a surface had been built two clicks earlier.
+            self.last_distances = None
+            self.last_surface_path = None
+        self.info_filename.setText(os.path.basename(file_path))
+        self.current_model_label.setText(f"Current: {os.path.basename(file_path)}")
+        if not keep_history:
+            self._forget_previous_run()
+        self._run('analyze', {'file_path': file_path}, silent=not announce)
+
+    def _forget_previous_run(self):
+        """Drop every report that belongs to the file this one replaced."""
+        self.history_list.clear()
+        self.detailed_stats.setPlainText('')
+        self.stats_display.setPlainText('')
+        self.histogram_view.setPlainText('')
+        self.registration_results.setPlainText('')
+        self.last_statistics = None
+        for label in (self.info_points, self.info_has_normals, self.info_has_colors,
+                      self.info_bounds):
+            label.setText('-')
+        self.info_surface.setText('none built from this cloud yet')
 
     def reload_current_model(self):
-        """Reload the current model."""
-        if self.current_model_path:
-            self.load_model(self.current_model_path)
-            
-    def load_point_cloud(self):
-        """Load a point cloud file."""
-        self.change_model()
-        
-    def load_point_cloud_file(self, file_path):
-        """Load a point cloud file by path."""
-        self.load_model(file_path)
-        
+        if not self.current_model_path:
+            self._no_file_message()
+            return
+        self.load_model(self.current_model_path)
+
+    def add_to_library(self):
+        if not self.current_model_path:
+            self._no_file_message()
+            return
+        self.add_to_library_requested.emit(self.current_model_path)
+        self.operation_label.setText(
+            f"{os.path.basename(self.current_model_path)} handed to the Library pane")
+
+    # ---- export ------------------------------------------------------------------
+
+    def save_point_cloud(self):
+        if not self.current_model_path:
+            self._no_file_message()
+            return
+        extension = os.path.splitext(self.current_model_path)[1].lower() or '.ply'
+        self.export_point_cloud(extension)
+
+    def export_point_cloud(self, extension):
+        """Ask where the current cloud goes and in what file, then let the backend write it.
+
+        The four Export buttons used to call `save_point_cloud(pcd, path)` with an open3d
+        object that the pane never held, and `.obj` - which the button offered - is not a
+        file `o3d.io.write_point_cloud` writes at all. One verb answers for all four now,
+        and the verdict says whether this app can read the result back.
+        """
+        if not self.current_model_path:
+            self._no_file_message()
+            return
+        suggested = self.pc_processor.output_path(self.current_model_path, 'export', extension)
+        target, _ = QFileDialog.getSaveFileName(
+            self, f"Export {extension.upper()}", suggested,
+            f"{extension.upper().lstrip('.')} files (*{extension});;All files (*)")
+        if not target:
+            return
+        if not os.path.splitext(target)[1]:
+            target += extension
+        self._run('export', {'file_path': self.current_model_path, 'output_path': target})
+
+    def export_as_mesh(self):
+        """Write the surface this cloud produced in the format chosen, and hand it on.
+
+        The button was not connected at all, while its name promised a mesh to a user who
+        had already asked for a reconstruction. It only has something to export once a
+        surface verb has run, so that is what it says when nothing has - rather than
+        writing a file from the cloud and calling it a mesh.
+        """
+        if not self.last_surface_path:
+            QMessageBox.information(
+                self, "No surface to export",
+                "No surface has been built from "
+                f"{os.path.basename(self.current_model_path or 'this cloud')} yet. Run "
+                f"Poisson, Ball Pivoting, Alpha Shape or Convex Hull first - this exports "
+                f"the file one of those wrote, in the format chosen on the Reconstruct tab.")
+            return
+        formats = self.pc_processor.surface_formats()
+        chosen = self.surface_format_combo.currentText() or '.ply'
+        suggested = self.pc_processor.surface_target(self.current_model_path
+                                                    or self.last_surface_path, chosen)
+        target, selected = QFileDialog.getSaveFileName(
+            self, "Export surface as", suggested,
+            "Surface files (%s);;All files (*)" % ' '.join('*' + f for f in formats))
+        if not target:
+            return
+        if not os.path.splitext(target)[1]:
+            # Whatever the dialog's filter was, the name the user typed decides the file.
+            tail = (selected or '').rpartition('*')[2].strip()
+            target += tail if tail.startswith('.') else chosen
+
+        from ..processing.format_converter import FormatConverter
+        converter = FormatConverter()
+        mesh, opened_with = converter.read_mesh(self.last_surface_path)
+        if mesh is None:
+            QMessageBox.warning(self, "Cannot read the surface",
+                                f"{os.path.basename(self.last_surface_path)} cannot be "
+                                f"opened here any more: {opened_with}")
+            return
+        ok, message = converter.write_mesh(mesh, target)
+        if not ok:
+            QMessageBox.warning(self, "Export refused", message)
+            return
+        read_back, opened_with = converter.read_mesh(target)
+        if read_back is None:
+            QMessageBox.warning(self, "Export unreadable",
+                                f"{os.path.basename(target)} was written but this app "
+                                f"cannot open it again: {opened_with}")
+            return
+        self._record_measured(
+            f"Surface exported: {len(read_back.vertices):,} vertices, "
+            f"{len(read_back.faces):,} faces -> {os.path.basename(target)}")
+        reply = QMessageBox.question(
+            self, "Open in Mesh Tools",
+            f"{os.path.basename(target)} holds {len(read_back.faces):,} faces. Open it in "
+            f"Mesh Tools?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.mesh_generated.emit(target)
+
+    def _record_measured(self, headline):
+        """A line in the history for work the pane itself did, not a verb."""
+        self.history_list.addItem(headline)
+        self.history_list.scrollToBottom()
+        self.operation_label.setText(headline)
+
+    # ---- the verbs, one handler each --------------------------------------------
+
+    def _cloud_needed(self, operation, params):
+        if not self.current_model_path:
+            self._no_file_message()
+            return False
+        return self._run(operation, {'file_path': self.current_model_path, **params})
+
     def center_point_cloud(self):
-        """Center the point cloud asynchronously."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        self.operation_label.setText("Centering point cloud...")
-        
-        def worker_func(processor, path):
-            output_path = path.replace('.', '_centered.')
-            import open3d as o3d
-            pcd = o3d.io.read_point_cloud(path)
-            center = pcd.get_center()
-            pcd.translate(-center)
-            o3d.io.write_point_cloud(output_path, pcd)
-            return {'success': True, 'output_path': output_path, 'center': center}
-            
-        self.execute_async(worker_func, self.pc_processor, self.current_model_path)
+        self._cloud_needed('center', {})
+
     def normalize_point_cloud(self):
-        """Normalize point cloud size asynchronously."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        self.operation_label.setText("Normalizing point cloud...")
-        
-        def worker_func(processor, path):
-            output_path = path.replace('.', '_normalized.')
-            import open3d as o3d
-            pcd = o3d.io.read_point_cloud(path)
-            center = pcd.get_center()
-            pcd.translate(-center)
-            max_bound = pcd.get_max_bound()
-            min_bound = pcd.get_min_bound()
-            scale = 1.0 / (max_bound - min_bound).max()
-            pcd.scale(scale, center=(0,0,0))
-            o3d.io.write_point_cloud(output_path, pcd)
-            return {'success': True, 'output_path': output_path, 'scale': scale}
-            
-        self.execute_async(worker_func, self.pc_processor, self.current_model_path)
-    def remove_statistical_outliers(self):
-        """Remove statistical outliers using backend."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        neighbors = self.outlier_neighbors_spin.value()
-        std_ratio = self.outlier_std_spin.value()
-        
-        self.operation_label.setText("Removing statistical outliers...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_filtered.')
-            result = self.pc_processor.remove_outliers(
-                self.current_model_path,
-                output_path,
-                method='statistical',
-                nb_neighbors=neighbors,
-                std_ratio=std_ratio
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                removed = result.get('removed', 0)
-                self.operation_label.setText(f"Removed {removed} outliers")
-                QMessageBox.information(self, "Success", f"Removed {removed} outlier points!")
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to remove outliers: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        self._cloud_needed('normalize', {})
 
-    def remove_radius_outliers(self):
-        """Remove radius outliers using backend."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        radius = self.radius_spin.value()
-        min_points = self.min_points_spin.value()
-        
-        self.operation_label.setText("Removing radius outliers...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_radius_filtered.')
-            result = self.pc_processor.remove_outliers(
-                self.current_model_path,
-                output_path,
-                method='radius',
-                radius=radius,
-                min_points=min_points
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                removed = result.get('removed', 0)
-                self.operation_label.setText(f"Removed {removed} outliers")
-                QMessageBox.information(self, "Success", f"Removed {removed} outlier points!")
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to remove outliers: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def voxel_downsample(self):
-        """Apply voxel downsampling using backend."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        voxel_size = self.voxel_size_spin.value()
-        
-        self.operation_label.setText("Applying voxel downsampling...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_downsampled.')
-            result = self.pc_processor.downsample(
-                self.current_model_path,
-                output_path,
-                voxel_size=voxel_size
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                original = result.get('original_points', 0)
-                downsampled = result.get('downsampled_points', 0)
-                reduction = result.get('reduction', 0)
-                self.operation_label.setText(f"Downsampled: {original:,} → {downsampled:,} points ({reduction:.1f}% reduction)")
-                QMessageBox.information(self, "Success", f"Downsampled to {downsampled:,} points ({reduction:.1f}% reduction)!")
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to downsample: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def compute_statistics(self):
-        """Compute point cloud statistics using backend."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        self.operation_label.setText("Computing statistics...")
-        
-        try:
-            stats = self.pc_processor.analyze_point_cloud(self.current_model_path)
-            
-            if stats:
-                stats_text = f"Point Cloud Statistics:\n\nPoints: {stats.point_count:,}\nHas Colors: {'Yes' if stats.has_colors else 'No'}\nHas Normals: {'Yes' if stats.has_normals else 'No'}\n\nBounding Box: {stats.bounding_box}\nCentroid: {stats.centroid}\nDensity: {stats.density:.2f} points/unit³"
-                
-                self.detailed_stats.setPlainText(stats_text)
-                
-                # Update info tab
-                self.info_points.setText(f"{stats.point_count:,}")
-                self.info_has_normals.setText("Yes" if stats.has_normals else "No")
-                self.info_has_colors.setText("Yes" if stats.has_colors else "No")
-                self.info_bounds.setText(str(stats.bounding_box))
-                
-                self.operation_label.setText("Statistics computed")
-            else:
-                QMessageBox.warning(self, "Error", "Failed to compute statistics")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to compute statistics: {str(e)}")
-            
-    def poisson_reconstruction(self):
-        """Perform Poisson reconstruction asynchronously."""
-        if not self.current_cloud_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        depth = self.poisson_depth_spin.value()
-        self.operation_label.setText(f"Reconstructing (Poisson, depth={depth})...")
-        
-        def worker_func(processor, path, d):
-            output_path = path.replace('.', '_poisson.') + 'ply'
-            # Note: Assuming reconstruct_mesh returns a dict with success/error
-            # If not, we might need to wrap it. 
-            # Based on previous code, it seemed to return a success bool or similar.
-            # Let's assume the processor methods are synchronous and return a result dict.
-            result = processor.reconstruct_mesh(path, output_path, method='poisson', depth=d)
-            if result:
-                return {'success': True, 'output_path': output_path}
-            else:
-                return {'error': 'Reconstruction failed'}
-            
-        self.execute_async(worker_func, self.processor, self.current_cloud_path, depth)
+    def remove_duplicates(self):
+        self._cloud_needed('dedup', {})
 
-    def run_clustering(self):
-        """Run DBSCAN clustering using backend."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        eps = self.cluster_eps_spin.value()
-        min_points = self.cluster_min_points_spin.value()
-        
-        self.operation_label.setText("Running DBSCAN clustering...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            # Load point cloud
-            pcd = self.pc_processor.load_point_cloud(self.current_model_path)
-            
-            if pcd is None:
-                QMessageBox.warning(self, "Error", "Failed to load point cloud")
-                return
-            
-            # Run clustering
-            self.operation_label.setText(f"DBSCAN clustering applied (eps={eps}, min_points={min_points})")
-            QMessageBox.information(self, "Info", "Clustering feature requires Open3D implementation")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to cluster: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-    
-            
-    def get_current_model(self):
-        """Get the current model path."""
-        return self.current_model_path
-        
-    def set_current_model(self, model_path):
-        """Set the current model from library selection.""" 
-        if model_path and model_path.lower().endswith(('.pcd', '.ply', '.xyz')):
-            self.load_model(model_path)
+    def estimate_normals(self):
+        self._cloud_needed('normals', {'knn': self.normals_knn_spin.value()})
 
     def apply_translation(self):
-        """Apply translation to point cloud."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        x = self.trans_x_spin.value()
-        y = self.trans_y_spin.value()
-        z = self.trans_z_spin.value()
-        
-        if x == 0 and y == 0 and z == 0:
-            return
-
-        self.operation_label.setText("Applying translation...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_translated.')
-            result = self.pc_processor.apply_transform(
-                self.current_model_path,
-                output_path,
-                transform_type='translate',
-                translation=(x, y, z)
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText("Translation applied")
-                self.load_model(output_path)
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to translate: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        offset = [self.trans_x_spin.value(), self.trans_y_spin.value(),
+                  self.trans_z_spin.value()]
+        self._cloud_needed('translate', {'dx': offset[0], 'dy': offset[1], 'dz': offset[2]})
 
     def apply_rotation(self):
-        """Apply rotation to point cloud."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        x = self.rot_x_spin.value()
-        y = self.rot_y_spin.value()
-        z = self.rot_z_spin.value()
-        
-        if x == 0 and y == 0 and z == 0:
-            return
-
-        self.operation_label.setText("Applying rotation...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_rotated.')
-            result = self.pc_processor.apply_transform(
-                self.current_model_path,
-                output_path,
-                transform_type='rotate',
-                rotation=(x, y, z)
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText("Rotation applied")
-                self.load_model(output_path)
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to rotate: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        self._cloud_needed('rotate', {'rx': self.rot_x_spin.value(),
+                                      'ry': self.rot_y_spin.value(),
+                                      'rz': self.rot_z_spin.value()})
 
     def apply_scale(self):
-        """Apply scaling to point cloud."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        scale = self.scale_spin.value()
-        
-        if scale == 1.0:
-            return
+        self._cloud_needed('scale', {'factor': self.scale_spin.value()})
 
-        self.operation_label.setText("Applying scale...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_scaled.')
-            result = self.pc_processor.apply_transform(
-                self.current_model_path,
-                output_path,
-                transform_type='scale',
-                scale=scale
-            )
-            
-            if result['success']:
-                self.current_model_path = output_path
-                self.operation_label.setText("Scale applied")
-                self.load_model(output_path)
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to scale: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+    def remove_statistical_outliers(self):
+        self._cloud_needed('outliers_statistical',
+                           {'nb_neighbors': self.outlier_neighbors_spin.value(),
+                            'std_ratio': self.outlier_std_spin.value()})
+
+    def remove_radius_outliers(self):
+        self._cloud_needed('outliers_radius',
+                           {'radius': self.radius_spin.value(),
+                            'nb_points': self.min_points_spin.value()})
+
+    def voxel_downsample(self):
+        self._cloud_needed('voxel', {'voxel_size': self.voxel_size_spin.value()})
+
+    def uniform_downsample(self):
+        self._cloud_needed('uniform', {'every_k': self.uniform_k_spin.value()})
 
     def crop_box(self):
-        """Crop point cloud using a bounding box."""
         if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
+            self._no_file_message()
             return
-            
-        dialog = BoundingBoxDialog(self)
-        if dialog.exec():
-            bounds = dialog.get_bounds()
-            
-            self.operation_label.setText("Cropping point cloud...")
-            
-            def worker_func(processor, path, b):
-                output_path = path.replace('.', '_cropped.')
-                import open3d as o3d
-                import numpy as np
-                pcd = o3d.io.read_point_cloud(path)
-                bbox = o3d.geometry.AxisAlignedBoundingBox(
-                    min_bound=np.array([b[0], b[2], b[4]]),
-                    max_bound=np.array([b[1], b[3], b[5]])
-                )
-                cropped_pcd = pcd.crop(bbox)
-                o3d.io.write_point_cloud(output_path, cropped_pcd)
-                return {'success': True, 'output_path': output_path}
-                
-            self.execute_async(worker_func, self.pc_processor, self.current_model_path, bounds)
+        mins, maxs = self._measured_bounds()
+        dialog = BoundingBoxDialog(self, mins, maxs)
+        if not dialog.exec():
+            return
+        lower, upper = dialog.get_bounds()
+        self._run('crop', {'file_path': self.current_model_path, 'min_bound': lower,
+                           'max_bound': upper})
 
     def crop_interactive(self):
-        """Interactive cropping using Open3D visualizer."""
+        """Pick the points to keep in an Open3D window, then write exactly those.
+
+        `VisualizerWithEditing` does not crop anything itself and writes nothing itself -
+        it only remembers the indices clicked - so the file behind this button comes from
+        the backend reading those indices. The instructions used to promise that pressing
+        'S' saved a crop, which that window does not do.
+        """
         if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
+            self._no_file_message()
             return
-            
-        QMessageBox.information(self, "Interactive Crop", 
-                              "Press 'K' to lock screen and switch to selection mode.\n"
-                              "Drag to draw a rectangle.\n"
-                              "Press 'C' to crop.\n"
-                              "Press 'S' to save and close.")
-                              
-        import open3d as o3d
-        pcd = o3d.io.read_point_cloud(self.current_model_path)
-        
-        def demo_crop_geometry():
-            vis = o3d.visualization.VisualizerWithEditing()
-            vis.create_window()
-            vis.add_geometry(pcd)
-            vis.run() 
-            vis.destroy_window()
-            
-        try:
-            demo_crop_geometry()
-            self.operation_label.setText("Interactive session finished")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Interactive crop failed: {str(e)}")
-        def demo_crop_geometry():
-            vis = o3d.visualization.VisualizerWithEditing()
-            vis.create_window()
-            vis.add_geometry(pcd)
-            vis.run() # User picks points
-            vis.destroy_window()
-            # After run, we might want to save the cropped result if the user saved it via 'S'
-            # But Open3D's 'S' saves a screenshot usually? 
-            # VisualizerWithEditing allows cropping with 'C'. 
-            # It saves the cropped geometry to a file automatically? 
-            # Actually, VisualizerWithEditing is limited.
-            # Let's just launch it and let the user explore.
-            
-        try:
-            demo_crop_geometry()
-            self.operation_label.setText("Interactive session finished")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Interactive crop failed: {str(e)}")
+        QMessageBox.information(
+            self, "Pick the points to keep",
+            "An Open3D window opens beside this app.\n\n"
+            "Left-click the points to keep.\n"
+            "Press Q, or close the window, when you are done.\n\n"
+            "The points you picked are written to a new file beside the current one. "
+            "Closing the window without a click is refused, not saved as an empty cloud.")
+        self._cloud_needed('pick', {})
+
     def load_target_model(self):
-        """Load target point cloud for registration."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Load Target Point Cloud",
-            "", "Point Clouds (*.pcd *.ply *.xyz);;All Files (*)"
-        )
-        
-        if file_path:
-            self.target_model_path = file_path
-            filename = os.path.basename(file_path)
-            self.target_info_label.setText(f"Target: {filename}")
-            
-            # Optionally visualize target (e.g., in a different color or ghosted)
-            # For now just store the path
-            QMessageBox.information(self, "Target Loaded", f"Loaded target: {filename}")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Target Point Cloud", "",
+                                                   self._cloud_filter())
+        if not file_path:
+            return
+        self.target_model_path = file_path
+        size = os.path.getsize(file_path) / 1024.0
+        self.target_info_label.setText(
+            f"Target: {os.path.basename(file_path)} ({size:.1f} KB). Its points are counted "
+            f"by the run that uses it.")
+
+    def _registration_params(self, operation):
+        if not self.current_model_path:
+            self._no_file_message()
+            return None
+        if not self.target_model_path:
+            QMessageBox.warning(self, "No target loaded",
+                                "Alignment needs two clouds. Load a target on this tab "
+                                f"first; the source is {os.path.basename(self.current_model_path)}.")
+            return None
+        params = {'source_path': self.current_model_path, 'target_path': self.target_model_path}
+        if operation == 'register_icp':
+            params['threshold'] = self.icp_threshold_spin.value()
+            params['max_iteration'] = self.icp_max_iter_spin.value()
+        elif operation == 'register_ransac':
+            voxel = self.feature_voxel_spin.value()
+            if voxel > 0:
+                params['voxel_size'] = voxel
+        # A feature pass leaves no file of its own, so it gets no name for one; the two
+        # `register_*` verbs name their aligned cloud in the backend.
+        return params
 
     def run_icp_registration(self):
-        """Run ICP registration."""
-        if not self.current_model_path or not self.target_model_path:
-            QMessageBox.warning(self, "Missing Data", "Please load both source and target point clouds.")
+        params = self._registration_params('register_icp')
+        if params:
+            self._run('register_icp', params)
+
+    def extract_features(self):
+        params = self._registration_params('features')
+        if not params:
             return
-
-        threshold = self.icp_threshold_spin.value()
-        max_iter = self.icp_max_iter_spin.value()
-
-        self.operation_label.setText("Running ICP registration...")
-        self.progress_bar.setVisible(True)
-
-        try:
-            # Use the wrapper method in PointCloudProcessor
-            result = self.pc_processor.register_point_clouds(
-                self.current_model_path,
-                self.target_model_path,
-                method='icp',
-                threshold=threshold,
-                max_iteration=max_iter
-            )
-
-            if result['success']:
-                transformation = result['transformation']
-                fitness = result['fitness']
-                rmse = result['rmse']
-                
-                result_text = f"ICP Converged:\nFitness: {fitness:.4f}\nRMSE: {rmse:.4f}\n\nTransformation:\n{transformation}"
-                self.registration_results.setPlainText(result_text)
-                self.operation_label.setText("ICP Registration complete")
-                
-                # Update viewer with transformed source
-                # Ideally, we should apply the transformation to the source and reload it
-                # For now, we just show the result text
-                QMessageBox.information(self, "Success", "ICP Registration converged!")
-            else:
-                self.operation_label.setText("ICP Registration failed")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"ICP Registration failed: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        voxel = self.feature_voxel_spin.value()
+        if voxel > 0:
+            params['voxel_size'] = voxel
+        self._run('features', params)
 
     def run_ransac_registration(self):
-        """Run RANSAC registration."""
-        if not self.current_model_path or not self.target_model_path:
-            QMessageBox.warning(self, "Missing Data", "Please load both source and target point clouds.")
-            return
+        params = self._registration_params('register_ransac')
+        if params:
+            self._run('register_ransac', params)
 
-        # RANSAC parameters could be added to UI, using defaults for now
-        voxel_size = 0.05 # Example default
-        
-        self.operation_label.setText("Running RANSAC registration...")
-        self.progress_bar.setVisible(True)
+    def _surface_params(self, operation, params):
+        """Hand a surface verb the cloud and the format, and let the verb name its own file.
 
-        try:
-             # Use the wrapper method in PointCloudProcessor
-            result = self.pc_processor.register_point_clouds(
-                self.current_model_path,
-                self.target_model_path,
-                method='ransac',
-                voxel_size=voxel_size
-            )
+        The name carries the verb - `scan_poisson.ply`, `scan_hull.ply` - because four
+        reconstructions of one scan are four different answers, and one name for all four
+        means the third quietly deletes the first. That rule belongs to the backend
+        (`PointCloudProcessor.target_path`), so a task that reconstructs the same scan
+        unattended writes the file the button writes rather than a second name for it.
+        """
+        if not self.current_model_path:
+            self._no_file_message()
+            return False
+        self._run(operation, {'file_path': self.current_model_path,
+                              'extension': self.surface_format_combo.currentText() or '.ply',
+                              **params})
+        return True
 
-            if result['success']:
-                transformation = result['transformation']
-                fitness = result['fitness']
-                rmse = result['rmse']
-                
-                result_text = f"RANSAC Result:\nFitness: {fitness:.4f}\nRMSE: {rmse:.4f}\n\nTransformation:\n{transformation}"
-                self.registration_results.setPlainText(result_text)
-                self.operation_label.setText("RANSAC Registration complete")
-                QMessageBox.information(self, "Success", "RANSAC Registration complete!")
-            else:
-                self.operation_label.setText("RANSAC Registration failed")
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"RANSAC Registration failed: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+    def poisson_reconstruction(self):
+        self._surface_params('poisson', {'depth': self.poisson_depth_spin.value(),
+                                         'width': self.poisson_width_spin.value(),
+                                         'scale': self.poisson_scale_spin.value(),
+                                         'linear_fit': self.poisson_linear_fit_cb.isChecked(),
+                                         'trim': self.poisson_trim_cb.isChecked()})
 
     def run_ball_pivoting(self):
-        """Run Ball Pivoting reconstruction."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
         radius = self.ball_radius_spin.value()
-        
-        self.operation_label.setText("Running Ball Pivoting...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_bpa_mesh.obj')
-            # Assuming reconstruct_mesh handles 'bpa' or similar
-            # If not, we might need to add it to PointCloudProcessor or MeshReconstructor
-            # For now, let's assume 'ball_pivoting' is the key
-            result = self.pc_processor.reconstruct_mesh(
-                self.current_model_path,
-                output_path,
-                method='ball_pivoting',
-                radii=[radius] # BPA often takes a list of radii
-            )
-            
-            if result['success']:
-                vertices = result.get('vertices', 0)
-                triangles = result.get('triangles', 0)
-                self.operation_label.setText(f"BPA complete: {vertices:,} vertices, {triangles:,} triangles")
-                
-                # Load the reconstructed mesh
-                self.viewer.load_from_file(output_path)
-                
-                QMessageBox.information(self, "Success", f"Mesh created with {vertices:,} vertices and {triangles:,} triangles!\n\nSaved to: {output_path}\n\nLoaded into viewer.")
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to reconstruct: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        params = {'ball_radius': radius} if radius > 0 else {}
+        self._surface_params('ball_pivoting', params)
 
     def run_alpha_shapes(self):
-        """Run Alpha Shapes reconstruction."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        alpha = self.alpha_value_spin.value()
-        
-        self.operation_label.setText("Running Alpha Shapes...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_alpha_mesh.obj')
-            result = self.pc_processor.reconstruct_mesh(
-                self.current_model_path,
-                output_path,
-                method='alpha_shape',
-                alpha=alpha
-            )
-            
-            if result['success']:
-                vertices = result.get('vertices', 0)
-                triangles = result.get('triangles', 0)
-                self.operation_label.setText(f"Alpha Shape complete: {vertices:,} vertices, {triangles:,} triangles")
-                
-                # Load the reconstructed mesh
-                self.viewer.load_from_file(output_path)
-                
-                QMessageBox.information(self, "Success", f"Mesh created with {vertices:,} vertices and {triangles:,} triangles!\n\nSaved to: {output_path}\n\nLoaded into viewer.")
-            else:
-                QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to reconstruct: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-    def export_point_cloud(self, format_type):
-        """Export point cloud to specified format."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        output_path, _ = QFileDialog.getSaveFileName(
-            self, f"Export {format_type.upper()}",
-            self.current_model_path.replace(".", f"_export.{format_type}"),
-            f"{format_type.upper()} Files (*.{format_type})"
-        )
-        
-        if output_path:
-            self.operation_label.setText(f"Exporting to {format_type}...")
-            try:
-                # We can reuse save_point_cloud from processor if we load it first
-                # Or just copy the file if no changes, but we might have applied transforms
-                # For now, let's assume we want to save the CURRENT state
-                # Since we don't keep the pcd object in memory in UI (only path), we rely on processor
-                # But wait, transforms update the file on disk. So we just need to convert/copy.
-                
-                # Use processor to load and save as new format
-                pcd = self.pc_processor.load_point_cloud(self.current_model_path)
-                if pcd:
-                    success = self.pc_processor.save_point_cloud(pcd, output_path)
-                    if success:
-                        QMessageBox.information(self, "Success", f"Exported to {output_path}")
-                        self.operation_label.setText(f"Exported {format_type}")
-                    else:
-                        QMessageBox.warning(self, "Error", "Failed to save file")
-                else:
-                    QMessageBox.warning(self, "Error", "Failed to load current model for export")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Export failed: {str(e)}")
+        self._surface_params('alpha_shape', {'alpha': self.alpha_value_spin.value()})
 
-    def run_clustering(self):
-        """Run DBSCAN clustering."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-            
-        eps = self.cluster_eps_spin.value()
-        min_points = self.cluster_min_points_spin.value()
-        
-        self.operation_label.setText("Running DBSCAN clustering...")
-        self.progress_bar.setVisible(True)
-        
-        try:
-            output_path = self.current_model_path.replace('.', '_clustered.')
-            
-            # We need to run this asynchronously because it can be slow
-            def worker_func(processor, path, out_path, e, min_p):
-                return processor.cluster_dbscan(path, out_path, eps=e, min_points=min_p)
-                
-            worker = Worker(worker_func, self.pc_processor, self.current_model_path, output_path, eps, min_points)
-            
-            def on_result(result):
-                if result['success']:
-                    clusters = result.get('clusters', 0)
-                    self.operation_label.setText(f"Clustering complete: {clusters} clusters found")
-                    QMessageBox.information(self, "Success", f"Found {clusters} clusters!\n\nResult saved to: {result['output_path']}")
-                    
-                    # Load the colored result
-                    self.viewer.load_from_file(result['output_path'])
-                else:
-                    self.operation_label.setText("Clustering failed")
-                    QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
-                
-                self.setEnabled(True)
-                self.progress_bar.setVisible(False)
-                
-            worker.signals.result.connect(on_result)
-            worker.signals.error.connect(lambda e: self.handle_async_error(e))
-            
-            self.setEnabled(False)
-            self.threadpool.start(worker)
-            
-        except Exception as e:
-            self.setEnabled(True)
-            self.progress_bar.setVisible(False)
-            QMessageBox.critical(self, "Error", f"Clustering failed: {str(e)}")
+    def create_convex_hull(self):
+        self._surface_params('hull', {})
+
+    def compute_statistics(self):
+        self._cloud_needed('analyze', {})
 
     def compute_distances(self):
-        """Compute nearest neighbor distances asynchronously."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Point Cloud", "Please load a point cloud first")
-            return
-        
-        self.operation_label.setText("Computing distances...")
-        
-        def worker_func(processor, path):
-            import open3d as o3d
-            import numpy as np
-            pcd = o3d.io.read_point_cloud(path)
-            dists = pcd.compute_nearest_neighbor_distance()
-            avg_dist = np.mean(dists)
-            max_dist = np.max(dists)
-            min_dist = np.min(dists)
-            return {'success': True, 'avg': avg_dist, 'max': max_dist, 'min': min_dist, 'dists': dists}
-            
-        worker = Worker(worker_func, self.pc_processor, self.current_model_path)
-        
-        def on_result(result):
-            if result['success']:
-                self.last_distances = result['dists']
-                msg = (f"Average Distance: {result['avg']:.6f}\n"
-                       f"Max Distance: {result['max']:.6f}\n"
-                       f"Min Distance: {result['min']:.6f}")
-                QMessageBox.information(self, "Distance Analysis", msg)
-                self.operation_label.setText("Distance analysis complete")
-            self.setEnabled(True)
-            self.progress_bar.setVisible(False)
-            
-        worker.signals.result.connect(on_result)
-        
-        self.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.threadpool.start(worker)
-        def worker_func(processor, path):
-            import open3d as o3d
-            import numpy as np
-            pcd = o3d.io.read_point_cloud(path)
-            # Compute distance to nearest neighbor
-            dists = pcd.compute_nearest_neighbor_distance()
-            avg_dist = np.mean(dists)
-            max_dist = np.max(dists)
-            min_dist = np.min(dists)
-            return {'success': True, 'avg': avg_dist, 'max': max_dist, 'min': min_dist, 'dists': dists}
-            
-        # We need a custom handler for the result to show the stats
-        # So we'll use a custom callback or just handle it in the generic result handler if we modify it
-        # But generic handler expects 'output_path'.
-        # Let's modify execute_async to allow a custom result handler?
-        # Or just override the result signal connection for this call?
-        # Simpler: Just define a custom worker here and start it manually using threadpool
-        
-        worker = Worker(worker_func, self.processor, self.current_cloud_path)
-        
-        def on_result(result):
-            if result['success']:
-                self.last_distances = result['dists'] # Store for histogram
-                msg = (f"Average Distance: {result['avg']:.6f}\n"
-                       f"Max Distance: {result['max']:.6f}\n"
-                       f"Min Distance: {result['min']:.6f}")
-                QMessageBox.information(self, "Distance Analysis", msg)
-                self.operation_label.setText("Distance analysis complete")
-            self.setEnabled(True)
-            self.progress_bar.setVisible(False)
-            
-        worker.signals.result.connect(on_result)
-        
-        self.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.threadpool.start(worker)
-    def show_distance_histogram(self):
-        """Show histogram of distances."""
-        if not hasattr(self, 'last_distances') or self.last_distances is None:
-            QMessageBox.warning(self, "No Data", "Please run 'Compute Distances' first.")
-            return
-            
-        import matplotlib.pyplot as plt
-        plt.figure("Nearest Neighbor Distances")
-        plt.hist(self.last_distances, bins=50, color='blue', alpha=0.7)
-        plt.title("Nearest Neighbor Distance Distribution")
-        plt.xlabel("Distance")
-        plt.ylabel("Frequency")
-        plt.show()
-    def capture_screen(self):
-        """Capture screenshot of the viewer."""
-        if not self.has_viewer:
-            return
-            
-        # Get pixmap from viewer's image label
-        pixmap = self.viewer.image_label.pixmap()
-        if not pixmap or pixmap.isNull():
-            QMessageBox.warning(self, "Error", "No image to capture")
-            return
-            
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Screenshot",
-            "screenshot.png",
-            "Images (*.png *.jpg)"
-        )
-        
-        if file_path:
-            pixmap.save(file_path)
-            self.operation_label.setText(f"Screenshot saved: {os.path.basename(file_path)}")
-            QMessageBox.information(self, "Success", f"Screenshot saved to:\n{file_path}")
+        self._cloud_needed('distances', {})
 
-    def execute_async(self, func, *args, **kwargs):
-        """Execute a function asynchronously with progress feedback."""
-        # Disable UI
-        self.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # Indeterminate for now
-        
-        worker = Worker(func, *args, **kwargs)
-        worker.signals.result.connect(self.handle_async_result)
-        worker.signals.error.connect(self.handle_async_error)
-        worker.signals.finished.connect(self.handle_async_finished)
-        
-        self.threadpool.start(worker)
-        
-    def handle_async_result(self, result):
-        """Handle successful result from async worker."""
-        if isinstance(result, dict) and result.get('success'):
-            QMessageBox.information(self, "Success", "Operation completed successfully!")
-            # Check if we should load a mesh
-            if 'output_path' in result and result['output_path'].endswith(('.ply', '.obj', '.stl')):
-                # Ask to open in mesh tools
-                reply = QMessageBox.question(self, "Open in Mesh Tools", 
-                                           "Reconstruction complete. Open in Mesh Tools?",
-                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.mesh_generated.emit(result['output_path'])
-        elif isinstance(result, dict) and 'error' in result:
-            QMessageBox.warning(self, "Error", result['error'])
-            
-    def handle_async_error(self, error_tuple):
-        """Handle error from async worker."""
-        QMessageBox.critical(self, "Error", f"An error occurred: {str(error_tuple[1])}")
-        
-    def handle_async_finished(self):
-        """Cleanup after async worker."""
-        self.setEnabled(True)
-        self.progress_bar.setVisible(False)
+    def show_distance_histogram(self):
+        """Draw the bins the distance run measured, as text in this pane.
+
+        This used to open a matplotlib window with `plt.show()`, which runs its own GUI
+        event loop - the app waited inside the pane's click handler until the chart window
+        was closed, and the chart was a second figure of the same numbers with no numbers
+        printed on it. The bins are in the verdict already, so they are printed here.
+        """
+        if not self.last_distances:
+            QMessageBox.information(self, "No distances measured",
+                                    "Run 'Compute Nearest Distances' first - this draws the "
+                                    "bins that measurement returned.")
+            return
+        measure = self.last_distances
+        counts = measure['histogram']['counts']
+        edges = measure['histogram']['edges']
+        widest = max(counts) if counts else 0
+        lines = [f"Nearest-neighbour distances, {measure['samples']:,} samples in "
+                 f"{len(counts)} bins", ""]
+        for index, count in enumerate(counts):
+            bar = '#' * int(round(count * 40.0 / widest)) if widest else ''
+            lines.append(f"{edges[index]:>10.6g} - {edges[index + 1]:<10.6g} |{bar} "
+                         f"{count:,}")
+        self.histogram_view.setPlainText('\n'.join(lines))
+        self.operation_label.setText(f"Histogram of {measure['samples']:,} distances drawn")
+
+    def run_clustering(self):
+        self._cloud_needed('cluster', {'eps': self.cluster_eps_spin.value(),
+                                       'min_points': self.cluster_min_points_spin.value()})
+
+    def detect_planes(self):
+        if not self.current_model_path:
+            self._no_file_message()
+            return
+        self._run('planes', {
+            'file_path': self.current_model_path,
+            'distance_threshold': self.plane_threshold_spin.value(),
+            'ransac_n': self.plane_ransac_n_spin.value(),
+            'num_iterations': self.plane_iterations_spin.value(),
+        })
+
+    def clear_history(self):
+        self.history_list.clear()
+        self.operation_label.setText("History cleared")
+
+    # ---- the per-family reports --------------------------------------------------
+
+    def _report_family(self, operation, verdict):
+        """Send a verdict's detail to the text area that already belongs to its family."""
+        if operation == 'analyze':
+            self._fill_info(verdict)
+            self.detailed_stats.setPlainText('\n'.join(self._detail(verdict)))
+        elif operation == 'distances':
+            self.last_distances = verdict.get('measure')
+            self.stats_display.setPlainText('\n'.join(self._detail(verdict)))
+        elif operation in ('register_icp', 'register_ransac', 'features'):
+            self.registration_results.setPlainText('\n'.join(self._detail(verdict)))
+        elif operation == 'planes':
+            # Plane fitting is a measurement, and the Analyze tab is where its button is, so
+            # its two files are reported in that tab's own text area - not in the
+            # Registration box on a different tab, which is where this pane used to hide it.
+            self.stats_display.setPlainText('\n'.join(self._detail(verdict)))
+        elif operation in SURFACE_OPERATIONS:
+            self.info_surface.setText(
+                f"{os.path.basename(verdict.get('output_path') or '')} - "
+                f"{self._count((verdict.get('measure') or {}).get('vertices'))} vertices, "
+                f"{self._count((verdict.get('measure') or {}).get('faces'))} faces")
+
+    # ---- the viewer --------------------------------------------------------------
+
+    def _point_size_from_slider(self, value):
+        if self.point_size_box.value() != float(value):
+            self.point_size_box.setValue(float(value))
+        self.viewer.set_point_size(float(value))
+
+    def _point_size_from_box(self, value):
+        in_range = float(self.point_size_slider.minimum()) <= value <= \
+            float(self.point_size_slider.maximum())
+        if in_range and self.point_size_slider.value() != int(round(value)):
+            self.point_size_slider.setValue(int(round(value)))
+        elif not in_range:
+            # Out of the slider's reach, so say so on the slider instead of pretending it
+            # still shows the number the box holds.
+            self.point_size_slider.blockSignals(True)
+            self.point_size_slider.setValue(self.point_size_slider.minimum() if value <
+                                            self.point_size_slider.minimum() else
+                                            self.point_size_slider.maximum())
+            self.point_size_slider.blockSignals(False)
+        self.viewer.set_point_size(float(value))
+
+    def reset_display(self):
+        """Put this pane's own display controls back to their defaults and redraw.
+
+        The viewer is a static image, so there is no camera here to point anywhere: the
+        two view buttons differ by what they change. This one moves the three controls
+        back and redraws; 'Fit to View' leaves them alone and only redraws.
+        """
+        self.point_size_box.blockSignals(True)
+        self.point_size_slider.blockSignals(True)
+        self.point_size_box.setValue(3.0)
+        self.point_size_slider.setValue(3)
+        self.point_size_box.blockSignals(False)
+        self.point_size_slider.blockSignals(False)
+        self.show_normals_cb.blockSignals(True)
+        self.show_wireframe_cb.blockSignals(True)
+        self.show_normals_cb.setChecked(False)
+        self.show_wireframe_cb.setChecked(False)
+        self.show_normals_cb.blockSignals(False)
+        self.show_wireframe_cb.blockSignals(False)
+        self.viewer.set_point_size(3.0)
+        self.viewer.set_show_normals(False)
+        self.viewer.set_show_wireframe(False)
+        self.operation_label.setText("Display back to the defaults it loaded with")
+
+    def fit_to_view(self):
+        if not self.viewer.fit_to_view():
+            QMessageBox.information(self, "Nothing to frame",
+                                    "There is no geometry in the viewer right now.")
+            return
+        # Present tense on purpose: the render runs on its own thread and the picture
+        # replaces itself when it lands. Claiming it was already re-rendered is a claim
+        # this pane has no way to make at the moment the click returns.
+        self.operation_label.setText("Preview re-rendering at the panel's current size")
+
+    def capture_screen(self):
+        """Save the preview that is on screen, or say there is not one.
+
+        The image is Open3D's render of the geometry, so a screenshot before the first
+        render finishes has nothing in it - the old code read the label's pixmap directly
+        and reported a successful save of a picture that never existed.
+        """
+        pixmap = self.viewer.preview_pixmap()
+        if pixmap is None:
+            QMessageBox.warning(self, "No image yet",
+                                "The viewer has no rendered preview to save. Press 'Fit to "
+                                "View' to render one.")
+            return
+        base = os.path.splitext(os.path.basename(self.current_model_path or 'preview'))[0]
+        target, _ = QFileDialog.getSaveFileName(self, "Save Screenshot", f"{base}.png",
+                                                "Images (*.png *.jpg)")
+        if not target:
+            return
+        if not os.path.splitext(target)[1]:
+            target += '.png'
+        if not pixmap.save(target):
+            QMessageBox.warning(self, "Screenshot not written",
+                                f"{target} could not be written - this build cannot encode "
+                                f"that extension.")
+            return
+        self._record_measured(f"Screenshot saved to {os.path.basename(target)}")
