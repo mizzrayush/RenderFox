@@ -680,8 +680,7 @@ class PreProcessingPane(unittest.TestCase):
         del self.dialogs.messages[:]
         # One pane is shared by the whole class, so a run a failing test left in flight
         # would answer the next test's click. Nothing may be running when a test starts.
-        for worker in list(self.tab._workers):
-            self.assertTrue(worker.wait(30000), f'{worker} never finished')
+        self.drain()
         self.tab.load_model(self.scene)
         self.tab.enable_texture_opt.setChecked(False)
         self.tab.enable_scene_opt.setChecked(False)
@@ -703,6 +702,20 @@ class PreProcessingPane(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f'the pane never produced: {label}')
 
+    def drain(self, timeout=90.0):
+        """Wait for every worker the pane holds, including ones it starts while waiting.
+
+        A preview left running by an earlier click answers after the next test's clear and
+        writes rows nobody asked for, so the pane has to be idle before an ask is measured.
+        """
+        deadline = time.time() + timeout
+        while self.tab._workers:
+            for worker in list(self.tab._workers):
+                self.assertTrue(worker.wait(30000), f'{worker} never finished')
+            APP.processEvents()
+            if time.time() > deadline:
+                self.fail('the pane never stops starting new workers')
+
     def extracted(self, min_faces=10, method='connected_components'):
         self.tab.min_faces_spin.setValue(min_faces)
         index = next(i for i in range(self.tab.extraction_method.count())
@@ -718,6 +731,23 @@ class PreProcessingPane(unittest.TestCase):
         path = write_textured_scene(folder)
         self.tab.load_model(path)
         return folder, path
+
+    def lod_rows(self, levels):
+        """The pane's own preview for a chain of `levels` levels, as the user reads it.
+
+        The pane is idle before and after the ask, because arming the LOD switch starts a
+        preview of its own and a stale answer would be counted as the one under test.
+        """
+        self.tab.enable_lod.setChecked(True)
+        self.drain()
+        self.tab.lod_preview.clear()
+        if self.tab.lod_levels.value() == levels:
+            self.tab.update_lod_preview()  # the spinbox cannot fire on its own value
+        else:
+            self.tab.lod_levels.setValue(levels)
+        self.drain()
+        return [line for line in self.tab.lod_preview.toPlainText().splitlines()
+                if re.match(r'LOD\d+:', line)]
 
     def test_browse_filters_are_the_readers_own_list(self):
         filter_text = self.tab.readable_filter()
@@ -748,6 +778,33 @@ class PreProcessingPane(unittest.TestCase):
         sentence = self.tab.extraction_summary_label.text()
         self.assertIn('0 kept', sentence, sentence)
         self.assertIn('2 below the 999-face minimum', sentence, sentence)
+
+    def test_the_lod_preview_shows_one_row_per_level_asked(self):
+        """HEAD appended the last level a second time after the loop, reusing its i/ratio.
+
+        Four levels asked for, five rows shown: the fifth was a copy of LOD3, and it
+        reached the table on every Preview because the pane prints what it is given.
+        """
+        for levels in (2, 4, 6):
+            rows = self.lod_rows(levels)
+            self.assertEqual(len(rows), levels,
+                             f'{levels} levels asked, {len(rows)} rows shown: {rows}')
+            self.assertEqual([row.split(':')[0] for row in rows],
+                             [f'LOD{i}' for i in range(levels)],
+                             f'these rows are not the chain LOD0..LOD{levels - 1}: {rows}')
+
+    def test_the_lod_preview_prints_faces_the_file_has_and_no_guesses(self):
+        rows = self.lod_rows(3)
+        mesh, _note = self.tab.format_converter.read_mesh(self.tab.current_file)
+        expected = int(len(mesh.faces) * self.tab.ratio_inputs[0].value())
+        self.assertIn(f'{expected:,} faces', rows[0],
+                      f"LOD0 is not this file's own arithmetic: {rows[0]} "
+                      f'({len(mesh.faces)} faces at '
+                      f'{self.tab.ratio_inputs[0].value():.2f})')
+        joined = '\n'.join(rows)
+        for guess in ('MB', 'Recommended', 'hero objects', 'crowd/fill'):
+            self.assertNotIn(guess, joined,
+                             f'the preview quotes {guess!r}, which nothing here measured')
 
     def test_loading_a_file_forgets_the_one_it_replaced(self):
         """A report about the previous file is a false claim about the current one."""
