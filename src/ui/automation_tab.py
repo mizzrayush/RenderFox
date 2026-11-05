@@ -23,7 +23,7 @@ from .icon_provider import get_icon
 
 # Import automation engine
 from ..features.automation_engine import (
-    AutomationEngine, FileWatcher, WorkflowStep, BatchProcessor, ActionRegistry
+    AutomationEngine, FileWatcher, WorkflowStep, ActionRegistry
 )
 
 
@@ -41,8 +41,7 @@ class AutomationTab(QWidget):
         # Initialize automation engine
         self.automation_engine = AutomationEngine()
         self.file_watcher = FileWatcher()
-        # The engine runs workflows on its own executor; the pane only tracks what it started.
-        self.batch_processor = BatchProcessor()
+        # Workflows and batches both run inside the engine; the pane only reports what it started.
         
         # Connect engine signals
         self.automation_engine.workflow_started.connect(self.on_workflow_started)
@@ -59,8 +58,9 @@ class AutomationTab(QWidget):
         self.file_watcher.file_moved.connect(self.on_file_moved)
         self.auto_actions_finished.connect(self.on_auto_actions_finished)
         
-        self.batch_processor.progress_updated.connect(self.on_batch_progress)
-        self.batch_processor.batch_completed.connect(self.on_batch_completed_engine)
+        engine_processor = self.automation_engine.batch_processor
+        engine_processor.progress_updated.connect(self.on_batch_progress)
+        engine_processor.batch_completed.connect(self.on_batch_completed_engine)
         
         self.active_workflows = {}
         self.watch_requests = {}
@@ -283,192 +283,124 @@ class AutomationTab(QWidget):
         return widget
         
     def create_batch_operations_tab(self):
-        """Create batch operations interface."""
+        """Batch pane: one registry action repeated over a list of real files.
+
+        Every control here changes a call the app can make: the operations are the
+        registry's own, `Files` picks which files a folder gives up, `Parameters` is read
+        by the same parser the task editor uses, and Preview prints the exact arguments
+        each file would get. What this tab used to hold - five source types, nine
+        operation names, a target-format list and a LOD group - matched no action
+        anywhere in the app, and Start Batch fell over on a progress value the file
+        only ever mentioned and never assigned.
+        """
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Batch controls
-        controls_group = QGroupBox("Batch Operation Setup")
+
+        self.controls_group = QGroupBox("Batch Operation Setup")
         controls_layout = QGridLayout()
-        
-        # Source selection
+
         controls_layout.addWidget(QLabel("Source:"), 0, 0)
         self.source_type_combo = QComboBox()
-        self.source_type_combo.addItems([
-            "Folder", "File List", "Model Library", "Search Results", "Selected Models"
-        ])
+        self.source_type_combo.addItems(["Folder", "Model Library"])
         controls_layout.addWidget(self.source_type_combo, 0, 1)
-        
+
         self.source_path_edit = QLineEdit()
-        self.source_path_edit.setPlaceholderText("Select source folder or files...")
+        self.source_path_edit.setPlaceholderText("Folder the files are read from...")
         controls_layout.addWidget(self.source_path_edit, 0, 2)
-        
+
         self.browse_source_btn = QPushButton("Browse")
         self.browse_source_btn.setIcon(get_icon("folder"))
         controls_layout.addWidget(self.browse_source_btn, 0, 3)
-        
-        # Operation selection
-        controls_layout.addWidget(QLabel("Operation:"), 1, 0)
+
+        controls_layout.addWidget(QLabel("Files:"), 1, 0)
+        self.file_types_edit = QLineEdit()
+        self.file_types_edit.setPlaceholderText(
+            ".obj .fbx, or * for every file - blank means every model format")
+        controls_layout.addWidget(self.file_types_edit, 1, 1, 1, 3)
+
+        controls_layout.addWidget(QLabel("Operation:"), 2, 0)
         self.operation_combo = QComboBox()
-        self.operation_combo.addItems([
-            "Format Conversion", "LOD Generation", "Texture Optimization", 
-            "Model Validation", "Metadata Extraction", "Thumbnail Generation",
-            "File Organization", "Quality Analysis", "Custom Script"
-        ])
-        controls_layout.addWidget(self.operation_combo, 1, 1, 1, 2)
-        
-        # Output settings
-        controls_layout.addWidget(QLabel("Output:"), 2, 0)
+        self._fill_batch_operations()
+        controls_layout.addWidget(self.operation_combo, 2, 1, 1, 3)
+
+        controls_layout.addWidget(QLabel("Output:"), 3, 0)
         self.output_path_edit = QLineEdit()
-        self.output_path_edit.setPlaceholderText("Select output folder...")
-        controls_layout.addWidget(self.output_path_edit, 2, 1, 1, 2)
-        
+        self.output_path_edit.setPlaceholderText("Folder the results go to...")
+        controls_layout.addWidget(self.output_path_edit, 3, 1, 1, 2)
+
         self.browse_output_btn = QPushButton("Browse")
         self.browse_output_btn.setIcon(get_icon("folder"))
-        controls_layout.addWidget(self.browse_output_btn, 2, 3)
-        
-        controls_group.setLayout(controls_layout)
-        layout.addWidget(controls_group)
-        
-        # Operation parameters
-        params_layout = QHBoxLayout()
-        
-        # General parameters
-        general_group = QGroupBox("General Parameters")
-        general_form = QFormLayout()
-        
-        self.recursive_cb = QCheckBox("Process Subfolders")
+        controls_layout.addWidget(self.browse_output_btn, 3, 3)
+
+        controls_layout.addWidget(QLabel("Parameters:"), 4, 0)
+        self.batch_params_edit = QLineEdit()
+        self.batch_params_edit.setPlaceholderText(
+            '"levels": 2   or   "command": "py export.py {file}"')
+        controls_layout.addWidget(self.batch_params_edit, 4, 1, 1, 3)
+
+        self.recursive_cb = QCheckBox("Include subfolders")
         self.recursive_cb.setChecked(True)
-        
-        self.overwrite_cb = QCheckBox("Overwrite Existing Files")
-        
-        self.backup_cb = QCheckBox("Create Backup")
+        self.overwrite_cb = QCheckBox("Replace a file already in the output folder")
+        self.backup_cb = QCheckBox(f"Copy each file into {BACKUP_SUBFOLDER} first")
         self.backup_cb.setChecked(True)
-        
-        self.parallel_processing_cb = QCheckBox("Parallel Processing")
-        self.parallel_processing_cb.setChecked(True)
-        
-        self.max_threads_spin = QSpinBox()
-        self.max_threads_spin.setRange(1, 16)
-        self.max_threads_spin.setValue(4)
-        
-        general_form.addRow(self.recursive_cb)
-        general_form.addRow(self.overwrite_cb)
-        general_form.addRow(self.backup_cb)
-        general_form.addRow(self.parallel_processing_cb)
-        general_form.addRow("Max Threads:", self.max_threads_spin)
-        
-        general_group.setLayout(general_form)
-        params_layout.addWidget(general_group)
-        
-        # Operation-specific parameters
-        specific_group = QGroupBox("Operation Parameters")
-        specific_layout = QVBoxLayout()
-        
-        # Format conversion parameters
-        self.format_group = QGroupBox("Format Conversion")
-        format_layout = QFormLayout()
-        
-        self.target_format_combo = QComboBox()
-        self.target_format_combo.addItems([
-            "OBJ", "FBX", "GLTF", "GLB", "DAE", "3DS", "PLY", "STL"
-        ])
-        
-        self.preserve_materials_cb = QCheckBox("Preserve Materials")
-        self.preserve_materials_cb.setChecked(True)
-        
-        self.optimize_geometry_cb = QCheckBox("Optimize Geometry")
-        
-        format_layout.addRow("Target Format:", self.target_format_combo)
-        format_layout.addRow(self.preserve_materials_cb)
-        format_layout.addRow(self.optimize_geometry_cb)
-        
-        self.format_group.setLayout(format_layout)
-        specific_layout.addWidget(self.format_group)
-        
-        # LOD parameters
-        self.lod_group = QGroupBox("LOD Generation")
-        lod_layout = QFormLayout()
-        
-        self.lod_levels_spin = QSpinBox()
-        self.lod_levels_spin.setRange(1, 10)
-        self.lod_levels_spin.setValue(3)
-        
-        self.lod_reduction_spin = QDoubleSpinBox()
-        self.lod_reduction_spin.setRange(0.1, 0.9)
-        self.lod_reduction_spin.setValue(0.5)
-        self.lod_reduction_spin.setSingleStep(0.1)
-        
-        lod_layout.addRow("LOD Levels:", self.lod_levels_spin)
-        lod_layout.addRow("Reduction Factor:", self.lod_reduction_spin)
-        
-        self.lod_group.setLayout(lod_layout)
-        self.lod_group.setVisible(False)
-        specific_layout.addWidget(self.lod_group)
-        
-        specific_group.setLayout(specific_layout)
-        params_layout.addWidget(specific_group)
-        
-        layout.addLayout(params_layout)
-        
-        # Batch execution
+        controls_layout.addWidget(self.recursive_cb, 5, 0, 1, 4)
+        controls_layout.addWidget(self.overwrite_cb, 6, 0, 1, 4)
+        controls_layout.addWidget(self.backup_cb, 7, 0, 1, 4)
+
+        self.batch_hint_label = QLabel()
+        self.batch_hint_label.setWordWrap(True)
+        controls_layout.addWidget(self.batch_hint_label, 8, 0, 1, 4)
+
+        self.controls_group.setLayout(controls_layout)
+        layout.addWidget(self.controls_group)
+
         execution_group = QGroupBox("Batch Execution")
         execution_layout = QVBoxLayout()
-        
-        # Progress and status
+
         progress_layout = QHBoxLayout()
-        
         self.batch_progress = QProgressBar()
-        self.batch_status_label = QLabel("Ready to start batch operation")
-        
+        self.batch_progress.setRange(0, 100)
+        self.batch_progress.setValue(0)
+        self.batch_status_label = QLabel("Nothing has run yet.")
         progress_layout.addWidget(self.batch_progress)
         progress_layout.addWidget(self.batch_status_label)
-        
         execution_layout.addLayout(progress_layout)
-        
-        # Control buttons
+
         batch_controls = QHBoxLayout()
-        
         self.start_batch_btn = QPushButton("Start Batch")
         self.start_batch_btn.setIcon(get_icon("batch_render"))
         self.start_batch_btn.setProperty("primary", "true")
-        
+
         self.pause_batch_btn = QPushButton("Pause")
         self.pause_batch_btn.setIcon(get_icon("clock"))
         self.pause_batch_btn.setEnabled(False)
-        
+
         self.stop_batch_btn = QPushButton("Stop")
         self.stop_batch_btn.setIcon(get_icon("delete"))
         self.stop_batch_btn.setEnabled(False)
-        
+
         self.preview_batch_btn = QPushButton("Preview")
         self.preview_batch_btn.setIcon(get_icon("models"))
-        
+
         batch_controls.addWidget(self.start_batch_btn)
         batch_controls.addWidget(self.pause_batch_btn)
         batch_controls.addWidget(self.stop_batch_btn)
         batch_controls.addWidget(self.preview_batch_btn)
         batch_controls.addStretch()
-        
         execution_layout.addLayout(batch_controls)
-        
-        # Batch log
+
         self.batch_log = QPlainTextEdit()
-        self.batch_log.setMaximumHeight(100)
+        self.batch_log.setMaximumHeight(160)
         self.batch_log.setReadOnly(True)
-        self.batch_log.setPlainText("Batch operation log will appear here...")
-        
         execution_layout.addWidget(self.batch_log)
-        
+
         execution_group.setLayout(execution_layout)
         layout.addWidget(execution_group)
-        
-        scroll = QScrollArea()
-        scroll.setWidget(widget)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        return scroll
-        
+
+        self._update_batch_controls()
+
+        return widget
+
     def create_scheduler_tab(self):
         """Create task scheduler interface."""
         widget = QWidget()
@@ -1023,8 +955,12 @@ class AutomationTab(QWidget):
         self.move_down_btn.clicked.connect(lambda checked=False: self.move_workflow_step(False))
         
         # Batch operations
-        self.operation_combo.currentTextChanged.connect(self.update_operation_params)
+        self.source_type_combo.currentTextChanged.connect(self._update_batch_controls)
+        self.operation_combo.currentIndexChanged.connect(self._update_batch_controls)
         self.start_batch_btn.clicked.connect(self.start_batch_operation)
+        self.pause_batch_btn.clicked.connect(self.toggle_batch_pause)
+        self.stop_batch_btn.clicked.connect(self.stop_batch_operation)
+        self.preview_batch_btn.clicked.connect(self.preview_batch)
         self.browse_source_btn.clicked.connect(self.browse_source_folder)
         self.browse_output_btn.clicked.connect(self.browse_output_folder)
         
@@ -1604,65 +1540,318 @@ class AutomationTab(QWidget):
         lines = (done.stderr or done.stdout or '').strip().splitlines()
         return f"custom script exited {done.returncode}" + (f": {lines[-1]}" if lines else '')
 
-    def on_batch_progress(self, current, total, current_file):
-        """Handle batch processing progress."""
-        progress = int((current / total) * 100)
-        self.batch_progress.setValue(progress)
-        self.batch_status_label.setText(f"Processing {current}/{total}: {current_file}")
-        
-    def on_batch_completed_engine(self, results):
-        """Handle batch completion from engine."""
-        self.start_batch_btn.setEnabled(True)
-        self.pause_batch_btn.setEnabled(False)
-        self.stop_batch_btn.setEnabled(False)
-        self.batch_status_label.setText("Batch operation completed!")
-        self.batch_log.appendPlainText(f"Completed: {results}")
-        
+    # --- Batch Operations --------------------------------------------------------
+    def _fill_batch_operations(self):
+        """The operations that can be repeated one file at a time, taken from the registry."""
+        self.operation_combo.clear()
+        for action_id, description in ActionRegistry.batch_actions().items():
+            label = f"{action_id} - {description}" if description else action_id
+            self.operation_combo.addItem(label, action_id)
 
-    def update_operation_params(self):
-        """Update operation parameters based on selected operation."""
-        operation = self.operation_combo.currentText()
-        
-        # Hide all parameter groups
-        self.format_group.setVisible(False)
-        self.lod_group.setVisible(False)
-        
-        # Show relevant parameter group
-        if operation == "Format Conversion":
-            self.format_group.setVisible(True)
-        elif operation == "LOD Generation":
-            self.lod_group.setVisible(True)
-            
-    def start_batch_operation(self):
-        """Start batch operation."""
-        source = self.source_path_edit.text()
-        if not source:
-            QMessageBox.warning(self, "Warning", "Please select a source folder!")
+    def _batch_action(self):
+        return self.operation_combo.currentData()
+
+    def _batch_hint(self, action_id):
+        """What this operation will do with a file, said from the binding the engine uses."""
+        binding = ActionRegistry.batch_binding(action_id)
+        if not binding or len(binding) != 2:
+            return (f"{action_id or 'this operation'} does not say how a batch hands it one "
+                    'file, so it cannot be repeated here.')
+        item_param, folder_param = binding
+        if item_param == 'command':
+            return ("Runs one command once per file. Write {file} where the file's path "
+                    "should appear; the command's exit code is the verdict.")
+        if folder_param == 'destination':
+            return (f"Reads each file as {item_param} and writes it into the output "
+                    f"folder under its own name as {folder_param}.")
+        if folder_param:
+            return (f"Reads each file as {item_param} and puts whatever it writes in the "
+                    f"output folder given as {folder_param}.")
+        return f"Runs on each file as {item_param}, and leaves no file of its own."
+
+    def _update_batch_controls(self, *_ignored):
+        """Enable only the fields the chosen source and operation can actually use."""
+        action = self._batch_action()
+        binding = ActionRegistry.batch_binding(action) if action else None
+        folder_source = self.source_type_combo.currentText() == 'Folder'
+        self.source_path_edit.setEnabled(folder_source)
+        self.browse_source_btn.setEnabled(folder_source)
+        self.recursive_cb.setEnabled(folder_source)
+        writes_a_file = bool(binding and binding[1])
+        self.output_path_edit.setEnabled(writes_a_file)
+        self.browse_output_btn.setEnabled(writes_a_file)
+        self.backup_cb.setEnabled(True)
+        self.overwrite_cb.setEnabled(bool(binding and binding[1] == 'destination'))
+        self.batch_hint_label.setText(self._batch_hint(action))
+
+    def _batch_extensions(self):
+        """The extensions the filter names, or None when it asks for every file."""
+        raw = self.file_types_edit.text().strip()
+        if not raw:
+            from ..core.library_manager import SUPPORTED_MODEL_EXTS
+            return {ext.lower() for ext in SUPPORTED_MODEL_EXTS}
+        wanted = set()
+        for token in raw.replace(',', ' ').replace(';', ' ').replace('|', ' ').split():
+            token = token.strip().lstrip('*').lower()
+            if not token:
+                return None  # a bare * is "every file, whatever it is"
+            wanted.add(token if token.startswith('.') else '.' + token)
+        return wanted
+
+    def _walk_batch_folder(self, folder, wanted):
+        """Every file the folder holds that the filter accepts, backups left out."""
+        found = []
+        if self.recursive_cb.isChecked():
+            for root, dirs, names in os.walk(folder):
+                dirs[:] = [one for one in dirs if one != BACKUP_SUBFOLDER]
+                found.extend(os.path.join(root, name) for name in names)
+        else:
+            found = [os.path.join(folder, name) for name in os.listdir(folder)
+                     if os.path.isfile(os.path.join(folder, name))]
+        if wanted is None:
+            return found
+        return [path for path in found if os.path.splitext(path)[1].lower() in wanted]
+
+    def collect_batch_items(self):
+        """The files this batch would run on, or the reason it has none."""
+        folder_source = self.source_type_combo.currentText() == 'Folder'
+        wanted = self._batch_extensions()
+        if folder_source:
+            folder = self.source_path_edit.text().strip()
+            if not folder:
+                return [], 'choose the folder the files come from'
+            if not os.path.isdir(folder):
+                return [], f'{folder} is not a folder'
+            try:
+                found = self._walk_batch_folder(folder, wanted)
+            except OSError as error:
+                return [], f'{folder} could not be read: {error}'
+        else:
+            try:
+                rows = self._library_instance().get_models() or []
+            except Exception as error:
+                return [], f'the model library could not be read: {error}'
+            found = [str(row.get('path') or '') for row in rows]
+            if wanted is not None:
+                found = [path for path in found
+                         if os.path.splitext(path)[1].lower() in wanted]
+        items = sorted({os.path.normpath(path) for path in found
+                        if path and os.path.isfile(path)})
+        if not items:
+            where = 'that folder' if folder_source else 'the library'
+            return [], (f'no file in {where} matches: it looks empty, or nothing in it '
+                        'has an extension the filter names')
+        return items, None
+
+    def _batch_plan(self):
+        """What would run, and everything that stops it - Preview and Start both come here.
+
+        Every file is bound through the same call the batch will make, so the preview
+        reads as the plan it is rather than as a description of a plan.
+        """
+        action = self._batch_action()
+        output_dir = self.output_path_edit.text().strip()
+        switches = {'overwrite': self.overwrite_cb.isChecked(),
+                    'backup': self.backup_cb.isChecked()}
+        if not action:
+            return {'lines': ['choose an operation first'], 'ready': [],
+                    'blocked': ['choose an operation first'], 'action': None,
+                    'output_dir': output_dir, 'params': {}, 'switches': switches}
+        binding = ActionRegistry.batch_binding(action)
+        if not binding or len(binding) != 2:
+            why = (f"{action} does not say how a batch hands it one file, so it "
+                   "cannot be repeated over a list")
+            return {'lines': [why], 'ready': [], 'blocked': [why], 'action': action,
+                    'output_dir': output_dir, 'params': {}, 'switches': switches}
+        params, complaint = self._parse_parameters(self.batch_params_edit.text())
+        if complaint:
+            return {'lines': [complaint], 'ready': [], 'blocked': [complaint],
+                    'action': action, 'output_dir': output_dir, 'params': {},
+                    'switches': switches}
+        items, why = self.collect_batch_items()
+        if why:
+            return {'lines': [why], 'ready': [], 'blocked': [why], 'action': action,
+                    'output_dir': output_dir, 'params': params, 'switches': switches}
+
+        ready, blocked = [], []
+        for item in items:
+            kwargs, problem = ActionRegistry.bind_batch_params(
+                action, item, output_dir, params)
+            if problem:
+                blocked.append(f'{os.path.basename(item)}: {problem}')
+                continue
+            destination = kwargs.get('destination')
+            if destination and not switches['overwrite'] and os.path.exists(destination):
+                blocked.append(f"{os.path.basename(item)}: {destination} is already there, "
+                               'and overwrite is off')
+                continue
+            ready.append((item, kwargs))
+
+        lines = [f'{len(ready)} file(s) would run as {action}']
+        lines.append('output: ' + (output_dir or '(not chosen)') if binding[1]
+                     else 'output: (this action writes no file)')
+        lines.append('backup: ' + ('on' if switches['backup'] else 'off'))
+        lines.append('parameters: ' + (json.dumps(params) if params else '(none)'))
+        lines.append('overwrite: ' + ('on' if switches['overwrite'] else 'off')
+                     if binding[1] == 'destination' else
+                     'overwrite: (this action names no single output file)')
+        for item, kwargs in ready[:200]:
+            target = (kwargs.get('destination') or kwargs.get('output_dir')
+                      or kwargs.get('command') or '(in place)')
+            lines.append(f'  {os.path.basename(item)} -> {target}')
+        if len(ready) > 200:
+            lines.append(f'  ... and {len(ready) - 200} more')
+        lines.extend(f'  cannot run - {one}' for one in blocked[:50])
+        if len(blocked) > 50:
+            lines.append(f'  ... and {len(blocked) - 50} more that cannot run')
+        return {'lines': lines, 'ready': ready, 'blocked': blocked, 'action': action,
+                'output_dir': output_dir, 'params': params, 'switches': switches}
+
+    def preview_batch(self):
+        """Print the plan and run none of it."""
+        plan = self._batch_plan()
+        self.batch_log.setPlainText('\n'.join(plan['lines']))
+        if not plan['ready']:
+            self.batch_status_label.setText('Preview: nothing can run yet.')
+            QMessageBox.warning(self, 'Preview', plan['blocked'][0] if plan['blocked']
+                                else 'there is nothing to preview')
             return
-            
-        self.start_batch_btn.setEnabled(False)
-        self.pause_batch_btn.setEnabled(True)
-        self.stop_batch_btn.setEnabled(True)
-        if self.batch_progress_value >= 100:
-            self.batch_timer.stop()
-            self.start_batch_btn.setEnabled(True)
-            self.pause_batch_btn.setEnabled(False)
-            self.stop_batch_btn.setEnabled(False)
-            self.batch_status_label.setText("Batch operation completed!")
-            self.batch_log.appendPlainText("Batch operation completed successfully.")
-            
+        note = f"Preview only - nothing was run. {len(plan['ready'])} file(s) ready"
+        if plan['blocked']:
+            note += f", {len(plan['blocked'])} cannot"
+        self.batch_status_label.setText(note)
+
+    def _batch_operation(self, action, output_dir, params, switches):
+        """The one call every file gets, with the switches read once at the start."""
+        def run_one(item):
+            kwargs, why = ActionRegistry.bind_batch_params(action, item, output_dir, params)
+            if why:
+                return {'success': False, 'error': why}
+            destination = kwargs.get('destination')
+            if destination and not switches['overwrite'] and os.path.exists(destination):
+                return {'success': False,
+                        'error': f'{destination} is already there, and overwrite is off'}
+            if switches['backup']:
+                note = self._auto_backup(item)
+                if not note.startswith('auto backup: copied to '):
+                    return {'success': False, 'error': f'left alone - {note}'}
+            return ActionRegistry.execute(action, **kwargs)
+        return run_one
+
+    def _set_batch_running(self, running):
+        """A running batch cannot be retuned: the setup group closes until it reports."""
+        self.controls_group.setEnabled(not running)
+        self.start_batch_btn.setEnabled(not running)
+        self.preview_batch_btn.setEnabled(not running)
+        self.pause_batch_btn.setEnabled(running)
+        self.stop_batch_btn.setEnabled(running)
+
+    def start_batch_operation(self):
+        """Run the plan on the engine's thread; every number on screen comes back from it."""
+        plan = self._batch_plan()
+        self.batch_log.setPlainText('\n'.join(plan['lines']))
+        if not plan['ready']:
+            self.batch_status_label.setText('Nothing ran.')
+            QMessageBox.warning(self, 'Batch', plan['blocked'][0] if plan['blocked']
+                                else 'there is nothing to run')
+            return
+        if plan['blocked']:
+            self.batch_status_label.setText('Nothing was started.')
+            QMessageBox.warning(
+                self, 'Batch',
+                f"{len(plan['blocked'])} of the {len(plan['ready']) + len(plan['blocked'])} "
+                "files cannot run. Nothing was started - a batch that stops halfway "
+                "leaves you guessing which files it got to. Fix those (overwrite is the "
+                "usual one) or leave them out of the folder, then start again.")
+            return
+        items = [item for item, _ in plan['ready']]
+        operation = self._batch_operation(plan['action'], plan['output_dir'],
+                                          plan['params'], plan['switches'])
+        if not self.automation_engine.run_batch(items, operation):
+            self.batch_status_label.setText('A batch is already running.')
+            QMessageBox.warning(self, 'Batch',
+                                'a batch is already running - wait for it, or stop it first')
+            return
+        self._set_batch_running(True)
+        self.batch_status_label.setText(
+            f"Running {plan['action']} over {len(items)} file(s)...")
+
+    def toggle_batch_pause(self):
+        """Hold the batch at the next file, or let it go again."""
+        processor = self.automation_engine.batch_processor
+        hold = not processor.is_paused
+        if not self.automation_engine.pause_batch(hold):
+            self.batch_status_label.setText('Nothing is running to pause.')
+            return
+        self.pause_batch_btn.setText('Resume' if hold else 'Pause')
+        self.batch_status_label.setText(
+            'Paused - no new file starts until you resume.' if hold else 'Resumed.')
+
+    def stop_batch_operation(self):
+        """Ask for a stop; the file in hand finishes before the batch halts."""
+        if not self.automation_engine.stop_batch():
+            self.batch_status_label.setText('Nothing is running to stop.')
+            return
+        self.batch_status_label.setText('Stopping - the file in hand finishes first.')
+
+    def on_batch_progress(self, current, total, current_file):
+        """The file the batch is working on now."""
+        if total <= 0:
+            return
+        self.batch_progress.setValue(int(current / total * 100))
+        self.batch_status_label.setText(
+            f"Processing {current}/{total}: {os.path.basename(str(current_file))}")
+
+    @staticmethod
+    def _batch_verdict(result):
+        """What the action itself said it did."""
+        if isinstance(result, dict):
+            inner = result.get('result')
+            if isinstance(inner, str):
+                return inner
+            if inner is None:
+                return 'it gave no report'
+            return json.dumps(inner, default=str)
+        return str(result) if result is not None else 'it gave no report'
+
+    def on_batch_completed_engine(self, summary):
+        """One line per file, then the count the engine actually reached."""
+        self._set_batch_running(False)
+        self.pause_batch_btn.setText('Pause')
+        lines = []
+        for record in summary.get('results') or []:
+            name = os.path.basename(str(record.get('item')))
+            if record.get('success'):
+                lines.append(f"  ok - {name}: {self._batch_verdict(record.get('result'))}")
+            else:
+                lines.append(f"  failed - {name}: {record.get('error')}")
+        total = summary.get('total') or 0
+        ran = summary.get('ran', len(summary.get('results') or []))
+        succeeded = summary.get('succeeded', 0)
+        failed = summary.get('failed', 0)
+        self.batch_progress.setValue(int(round(ran / total * 100)) if total else 0)
+        if summary.get('stopped'):
+            head = (f'Stopped after {ran} of {total}: {succeeded} ok, {failed} failed, '
+                    f'{total - ran} never ran')
+        elif not total:
+            head = 'Ran nothing - there were no files to work on'
+        else:
+            head = f'Finished {total} file(s): {succeeded} ok, {failed} failed'
+        self.batch_status_label.setText(head)
+        self.batch_log.appendPlainText('\n'.join(lines) + ('\n' if lines else '') + head)
+
     def browse_source_folder(self):
-        """Browse for source folder."""
+        """Put a picked folder where the batch reads its files from."""
         folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
         if folder:
             self.source_path_edit.setText(folder)
-            
+
     def browse_output_folder(self):
-        """Browse for output folder."""
+        """Put a picked folder where the batch writes its results."""
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
             self.output_path_edit.setText(folder)
-            
+
     def _task_action_choices(self):
         """The actions a task can name, read from the registry rather than typed here."""
         choices = []

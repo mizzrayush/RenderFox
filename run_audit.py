@@ -116,6 +116,12 @@ SUITES = [
         "description": "Runs a workflow end to end, requires the copy on disk, the retry count, the tolerated failure, the stop between steps and every builder button - Save, Load, Duplicate, Delete, Move, Test, Stop - to reach the engine or name why not"
     },
     {
+        "id": "automation_batch_contract",
+        "name": "Automation Batch Operations Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_automation_batch_contract.py")],
+        "description": "Repeats one registry action over a real folder of real files, requires a file the action refused to be counted as failed instead of done, checks Preview prints the exact call each file will get, and makes Start, Pause, Stop, Preview and both Browse buttons reach the engine or name why they cannot"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],

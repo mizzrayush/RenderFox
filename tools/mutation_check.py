@@ -17,7 +17,10 @@ spec.py must define MUTATIONS as a list of dicts:
     note    why this defect matters (printed in the report)
     which   optional 1-based number, for a line the file says more than once
 
-A mutation that no test catches is a hole in the suite, not a defect in the product.
+A mutation that no test catches is a hole in the suite, not a defect in the product. A
+mutation that kills the suite before it reports is the same hole in a worse disguise: PyQt6
+aborts the process on an exception raised inside a slot, so no FAIL or ERROR line is ever
+printed and a reader who only counts named failures sees a clean run. Both are called out.
 """
 
 import argparse
@@ -93,6 +96,7 @@ def main():
                      if index in wanted]
     cache = {}
     survived = []
+    crashed = []
     broken_restore = []
     for position, item in enumerate(mutations, 1):
         index = item.get('number', position)
@@ -104,6 +108,7 @@ def main():
         text = raw.decode('utf-8')
         crlf = '\r\n' in text
         body = text.replace('\r\n', '\n')
+        number = f'[{index:02d}]'
         try:
             mutated = swap(body, item['find'], item['replace'], item.get('which'))
         except ValueError as error:
@@ -114,7 +119,6 @@ def main():
             mutated = mutated.replace('\n', '\r\n')
         open(path, 'wb').write(mutated.encode('utf-8'))
 
-        number = f'[{index:02d}]'
         suite = item.get('suite') or args.suite
         proc = subprocess.run([sys.executable, '-X', 'utf8', os.path.join(ROOT, suite)],
                               capture_output=True, text=True, encoding='utf-8', errors='replace',
@@ -135,6 +139,13 @@ def main():
         label = f'{number} {item["note"]}'
         if caught:
             print(f'{label}\n      caught by {len(caught)} test(s): ' + ', '.join(sorted(set(caught))[:4]))
+        elif proc.returncode != 0 or 'OK' not in proc.stderr:
+            # a suite that never reaches its report line detected the defect too, but not in
+            # a way anyone can read: PyQt6 aborts the process on an exception raised inside a
+            # slot, so the crash stands in for a named failure and hides which test owns it
+            print(f'{label}\n      CRASHED - the suite died (exit {proc.returncode:#x}) without '
+                  f'reporting; no named test, so the test must reach the defect directly')
+            crashed.append(label)
         else:
             print(f'{label}\n      SURVIVED - no test named {item["expect"]!r} failed '
                   f'({len(names)} failures: {", ".join(names[:6]) or "none"})')
@@ -145,10 +156,15 @@ def main():
         print('RESTORE FAILURES (check these files by hand):')
         for line in broken_restore:
             print('  ' + line)
+    if crashed:
+        print(f'{len(crashed)} defect(s) were detected only by killing the suite:')
+        for line in crashed:
+            print('  ' + line)
     if survived:
         print(f'{len(survived)} of {len(mutations)} defects went unnoticed:')
         for line in survived:
             print('  ' + line)
+    if survived or crashed:
         return 1
     print(f'all {len(mutations)} defects were caught by a named test')
     return 0

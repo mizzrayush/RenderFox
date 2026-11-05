@@ -66,13 +66,19 @@ class ActionRegistry:
     _actions: Dict[str, Callable] = {}
     _descriptions: Dict[str, str] = {}
     _param_specs: Dict[str, Dict] = {}
+    # An action that says how a batch feeds it one file - (the parameter the file goes
+    # into, the parameter the output folder goes into, or None when it leaves no file of
+    # its own) - can be repeated over a list. The rest cannot be, so they are not offered.
+    _batch_specs: Dict[str, Any] = {}
     
     @classmethod
-    def register(cls, action_id: str, func: Callable, description: str = "", params: Dict = None):
-        """Register a new action."""
+    def register(cls, action_id: str, func: Callable, description: str = "", params: Dict = None,
+                 batch: Any = None):
+        """Register a new action, and say whether a batch of files can use it."""
         cls._actions[action_id] = func
         cls._descriptions[action_id] = description
         cls._param_specs[action_id] = params or {}
+        cls._batch_specs[action_id] = tuple(batch) if batch else None
         print(f"Registered action: {action_id}")
         
     @classmethod
@@ -157,7 +163,7 @@ class ActionRegistry:
         cls.register("file.copy", copy_file, "Copy a file", {
             "source": {"type": "str", "required": True},
             "destination": {"type": "str", "required": True}
-        })
+        }, batch=('source', 'destination'))
 
         def move_file(source: str, destination: str):
             if not os.path.isfile(source):
@@ -173,7 +179,7 @@ class ActionRegistry:
         cls.register("file.move", move_file, "Move a file", {
             "source": {"type": "str", "required": True},
             "destination": {"type": "str", "required": True}
-        })
+        }, batch=('source', 'destination'))
 
         def delete_file(path: str):
             if os.path.isdir(path):
@@ -188,7 +194,7 @@ class ActionRegistry:
 
         cls.register("file.delete", delete_file, "Delete a file", {
             "path": {"type": "str", "required": True}
-        })
+        }, batch=('path', None))
 
         def run_command(command: str):
             try:
@@ -209,7 +215,7 @@ class ActionRegistry:
         cls.register("system.run_command", run_command,
                      "Run a shell command; its exit code is the verdict", {
             "command": {"type": "str", "required": True}
-        })
+        }, batch=('command', None))
 
         # --- Processing Actions ---
 
@@ -261,8 +267,64 @@ class ActionRegistry:
             "input_file": {"type": "str", "required": True},
             "output_dir": {"type": "str", "required": True},
             "levels": {"type": "int", "required": False}
-        })
+        }, batch=('input_file', 'output_dir'))
 
+
+    @classmethod
+    def batch_actions(cls) -> Dict[str, str]:
+        """Every action that can run once per file, with the description it carries."""
+        return {action_id: cls._descriptions.get(action_id, '')
+                for action_id in sorted(cls._actions) if cls._batch_specs.get(action_id)}
+
+    @classmethod
+    def batch_binding(cls, action_id: str):
+        """How a batch feeds this action one file, or None when it cannot have one."""
+        return cls._batch_specs.get(action_id)
+
+    @classmethod
+    def bind_batch_params(cls, action_id: str, item: str, output_dir: str = '',
+                          params: Optional[Dict] = None):
+        """The exact kwargs this file will be run with, or the reason there are none.
+
+        Nothing here runs. Preview and the real batch both come through this method, so
+        what Preview shows is the call that will be made rather than a description of it.
+        """
+        binding = cls._batch_specs.get(action_id)
+        if binding is None:
+            return None, (f"nothing can run a batch of files as '{action_id}', because that "
+                          "action never said how it takes one file at a time")
+        if not item or not os.path.isfile(item):
+            return None, f"{item or 'the source'} is not a file right now"
+        if len(binding) != 2:
+            return None, (f"{action_id} registered the batch binding {binding}, which is not a file parameter and an output parameter")
+        item_param, folder_param = binding
+        merged = dict(params or {})
+        if item_param == 'command':
+            command = str(merged.get('command') or '')
+            if '{file}' not in command:
+                return None, ("the command needs {file} in it, so that each file in the "
+                              "batch becomes the thing the command runs on")
+            merged['command'] = command.replace('{file}', f'"{item}"' if ' ' in item else item)
+        else:
+            merged[item_param] = item
+            if folder_param:
+                folder = (output_dir or '').strip()
+                if not folder:
+                    return None, (f"{action_id} leaves a file behind, so it needs an output "
+                                  "folder chosen before it runs")
+                if not os.path.isdir(folder):
+                    return None, (f"the output folder {folder} is not a folder - make it, or "
+                                  "choose somewhere that already exists")
+                merged[folder_param] = (os.path.join(folder, os.path.basename(item))
+                                        if folder_param == 'destination' else folder)
+                if folder_param == 'destination' and (
+                        os.path.normcase(merged['destination']) == os.path.normcase(item)):
+                    return None, (f"{os.path.basename(item)} already sits in {folder}; "
+                                  "this would write the file onto itself")
+        complaints = cls.validate(action_id, merged)
+        if complaints:
+            return None, complaints[0]
+        return merged, None
 
 
 class WorkflowStep:
@@ -950,46 +1012,89 @@ class WorkflowExecutor:
 
 
 class BatchProcessor(QObject):
-    """Process multiple items in batch."""
-    
-    progress_updated = pyqtSignal(int, int, str)  # current, total, current_item
-    batch_completed = pyqtSignal(dict)  # results
-    
+    """Run one action over a list of items, and stop or pause when it is asked to.
+
+    An item only counts as done when the action says it did. The loop used to record a
+    success whenever the callable came back without raising, and registry actions answer
+    `{'success': False, 'error': ...}` instead of raising - so a batch in which every
+    file failed reported every file as processed, and the pane printed the total.
+    """
+
+    progress_updated = pyqtSignal(int, int, str)  # current, total, the item about to run
+    batch_completed = pyqtSignal(dict)            # one summary of the whole run
+
     def __init__(self):
         super().__init__()
         self.current_batch = None
         self.is_processing = False
-        
+        self._stop = False
+        self._pause = False
+
+    @property
+    def is_paused(self) -> bool:
+        """Whether a run is holding at an item boundary."""
+        return self._pause
+
+    def request_stop(self):
+        """Let the item in hand finish, then start no more."""
+        self._stop = True
+        self._pause = False
+
+    def set_paused(self, paused: bool):
+        """Hold the run at the next item boundary, or let it go again."""
+        self._pause = bool(paused)
+
+    def _hold(self):
+        """Wait out a pause; asking to stop cuts a pause short."""
+        while self._pause and not self._stop:
+            time.sleep(0.05)
+
     def process_batch(self, items: List[Any], operation: Callable,
                      progress_callback: Optional[Callable] = None) -> List[Dict[str, Any]]:
-        """Process batch of items."""
-        results = []
+        """Every item through `operation`, then one summary that tells the truth about it.
+
+        A pause or a stop only bites between items. An action that already started - a
+        copy halfway through, a command still running - finishes first, because pulling
+        the rug out from under those is how a file gets left half-written.
+        """
+        items = list(items or [])
         total = len(items)
-        
-        for idx, item in enumerate(items):
-            # Emit progress signal
-            self.progress_updated.emit(idx + 1, total, str(item))
-            
-            try:
-                result = operation(item)
-                results.append({
-                    'item': item,
-                    'success': True,
-                    'result': result
-                })
-            except Exception as e:
-                results.append({
-                    'item': item,
-                    'success': False,
-                    'error': str(e)
-                })
-            
-            if progress_callback:
-                progress_callback(idx + 1, total, item)
-        
-        # Emit completion signal
-        self.batch_completed.emit({'results': results, 'total': total})
-        
+        results: List[Dict[str, Any]] = []
+        self.is_processing = True
+        self._stop = False
+        self._pause = False
+        self.current_batch = {'total': total, 'done': 0}
+        try:
+            for index, item in enumerate(items):
+                self._hold()
+                if self._stop:
+                    break
+                self.progress_updated.emit(index + 1, total, str(item))
+                try:
+                    outcome = operation(item)
+                except Exception as error:
+                    results.append({'item': item, 'success': False, 'error': str(error)})
+                else:
+                    if isinstance(outcome, dict) and outcome.get('success') is False:
+                        results.append({
+                            'item': item, 'success': False,
+                            'error': str(outcome.get('error') or
+                                         'the action said no and gave no reason')})
+                    else:
+                        results.append({'item': item, 'success': True, 'result': outcome})
+                if progress_callback:
+                    progress_callback(index + 1, total, item)
+        finally:
+            ran = len(results)
+            summary = {'results': results, 'total': total, 'ran': ran,
+                       'succeeded': sum(1 for one in results if one['success']),
+                       'failed': sum(1 for one in results if not one['success']),
+                       'not_run': total - ran, 'stopped': ran < total}
+            self.current_batch = None
+            self.is_processing = False
+            self._stop = False
+            self._pause = False
+            self.batch_completed.emit(summary)
         return results
 
 
@@ -1054,6 +1159,12 @@ class ConditionEvaluator:
         return False
 
 
+#: How long AutomationEngine.stop() waits for one worker thread. A file that takes
+#: longer is left to finish on its own - the thread holds the engine alive, so it still
+#: has something to report to; what must not happen is the engine going away under it.
+WORKER_SHUTDOWN_WAIT = 5.0
+
+
 class AutomationEngine(QObject):
     """Main automation engine coordinating all automation features."""
     
@@ -1080,6 +1191,10 @@ class AutomationEngine(QObject):
         # Workflows the user asked to stop; the worker checks this before
         # each step, because a python thread cannot be killed from outside.
         self._stopped: set = set()
+        # Every worker thread started since, kept so stop() can wait for it. A thread
+        # that outlives the engine goes on posting its verdicts into whatever was
+        # listening when it started - which by then may be nothing.
+        self._worker_threads: List[threading.Thread] = []
         
         # Load saved workflows and tasks
         ActionRegistry.register_default_actions()
@@ -1377,13 +1492,9 @@ class AutomationEngine(QObject):
                 else:
                     self.workflow_failed.emit(workflow_id, reason)
 
-        thread = threading.Thread(
-            target=self.workflow_executor.execute_workflow,
-            args=(workflow, completion, progress,
-                  lambda: workflow_id in self._stopped),
-            daemon=True
-        )
-        thread.start()
+        self._spawn(self.workflow_executor.execute_workflow,
+                    (workflow, completion, progress,
+                     lambda: workflow_id in self._stopped))
         return True
 
     def stop_workflow(self, workflow_id: str) -> bool:
@@ -1433,20 +1544,65 @@ class AutomationEngine(QObject):
         self.triggers[trigger_id]['enabled'] = False
         return True
     
+    def _spawn(self, target: Callable, args: tuple) -> threading.Thread:
+        """Start a worker thread and keep hold of it until it is finished."""
+        self._worker_threads = [one for one in self._worker_threads if one.is_alive()]
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        self._worker_threads.append(thread)
+        thread.start()
+        return thread
+
     def batch_process(self, items: List[Any], operation: Callable,
                      progress_callback: Optional[Callable] = None) -> List[Dict[str, Any]]:
         """Process items in batch."""
         return self.batch_processor.process_batch(items, operation, progress_callback)
     
+    def run_batch(self, items: List[Any], operation: Callable) -> bool:
+        """Repeat one action over many files on a worker thread; its signals tell the tale.
+
+        The processor is claimed here rather than on the thread, because the click that
+        starts a batch can land twice before a thread has had a chance to run.
+        """
+        if self.batch_processor.is_processing or not items:
+            return False
+        self.batch_processor.is_processing = True
+        self._spawn(self._run_batch, (list(items), operation))
+        return True
+
+    def _run_batch(self, items: List[Any], operation: Callable):
+        """The worker's whole job: run the batch, and never leave it claimed."""
+        try:
+            self.batch_processor.process_batch(items, operation)
+        finally:
+            self.batch_processor.is_processing = False
+
+    def stop_batch(self) -> bool:
+        """Ask a running batch to stop between files; the file in hand finishes first."""
+        if not self.batch_processor.is_processing:
+            return False
+        self.batch_processor.request_stop()
+        return True
+
+    def pause_batch(self, paused: bool = True) -> bool:
+        """Hold a running batch at the next file, or let it go again."""
+        if not self.batch_processor.is_processing:
+            return False
+        self.batch_processor.set_paused(paused)
+        return True
+
     def start(self):
         """Start automation engine."""
         self.scheduler.start_scheduler()
         # File watcher starts automatically when directories are added
     
     def stop(self):
-        """Stop automation engine."""
+        """Stop automation engine, and wait for the work it started."""
         self.scheduler.stop_scheduler()
         self.file_watcher.stop_watching()
+        self.batch_processor.request_stop()
+        for thread in list(self._worker_threads):
+            thread.join(timeout=WORKER_SHUTDOWN_WAIT)
+        self._worker_threads = [one for one in self._worker_threads if one.is_alive()]
     
     def _execute_task_type(self, task: AutomationTask) -> Dict[str, Any]:
         """Run the task's action id through the registry; task_type *is* the action id."""
