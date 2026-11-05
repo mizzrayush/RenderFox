@@ -227,6 +227,10 @@ class ExecutorCase(unittest.TestCase):
                                     on_error='continue'))
         self.executor.execute_workflow(workflow)
         record = workflow.to_dict()
+        # Written on one day, read back on another: the record has to keep the moments it
+        # was given, or a round trip in the same clock tick looks like it did.
+        record['created_at'] = '2026-01-02T03:04:05.000007'
+        record['modified_at'] = '2026-01-03T04:05:06.000008'
         again = Workflow.from_dict(record)
         self.assertEqual(again.workflow_id, workflow.workflow_id)
         self.assertEqual(again.name, 'Kept')
@@ -235,6 +239,8 @@ class ExecutorCase(unittest.TestCase):
         self.assertEqual(again.error, workflow.error)
         self.assertEqual([s.action for s in again.steps], ['file.copy'])
         self.assertEqual([s.on_error for s in again.steps], ['continue'])
+        self.assertEqual(again.created_at.isoformat(), record['created_at'])
+        self.assertEqual(again.modified_at.isoformat(), record['modified_at'])
         self.assertEqual(again.to_dict(), record)
 
 
@@ -651,7 +657,9 @@ class PaneCase(unittest.TestCase):
         self.spin(lambda: False, timeout=0.6)
         self.assertEqual(started, [], 'Test Workflow handed the workflow to the engine')
         self.assertIsNone(self.tab._running_workflow, 'the pane counts a check as a run')
-        self.assertEqual(self.tab.active_workflows, {}, 'a check was counted as active work')
+        self.tab.update_dashboard_metrics()
+        self.assertEqual(self.tab.active_workflows_label.text(), '0',
+                         'a check was counted as active work')
         self.assertFalse(os.path.exists(target), 'Test Workflow ran the step it was checking')
         kinds = [kind for kind, _ in self.popups]
         self.assertEqual(kinds, ['information'], self.popups)
@@ -684,7 +692,8 @@ class PaneCase(unittest.TestCase):
         self.assertTrue(any("completed 1/1 step(s)" in line for line in lines), lines)
         self.assertTrue(self.tab.run_workflow_btn.isEnabled())
         self.assertFalse(self.tab.stop_workflow_btn.isEnabled())
-        self.assertEqual(self.tab.active_workflows, {}, 'the run is still counted as active')
+        self.assertEqual(self.tab.active_workflows_label.text(), '0',
+                         'the run is still counted as active')
 
     def test_39_a_failing_run_reports_the_reason_and_no_success(self):
         missing = os.path.join(self.work, 'not-here.obj')
@@ -868,14 +877,23 @@ class PaneCase(unittest.TestCase):
         self.assertTrue(any('holds no record' in text for text in self.warnings()),
                         self.warnings())
 
-    def test_52_the_dashboard_counts_the_workflows_the_engine_has(self):
+    def test_52_the_dashboard_counts_the_runs_the_engine_is_running(self):
         self.fill(name='Counted', steps=(('copy', 'file.copy', '"source": "a", '
                                                              '"destination": "b"'),))
         self.tab.save_workflow_btn.click()
-        self.assertEqual(self.tab.active_workflows_label.text(), '0')
-        self.tab.active_workflows['somewhere-else'] = 'Counted'
+        self.assertEqual(self.tab.active_workflows_label.text(), '0',
+                         'a workflow that was only saved is counted as a run')
+        stored = [one for one in self.tab.automation_engine.workflows.values()
+                  if one.name == 'Counted']
+        self.assertEqual(len(stored), 1, self.tab.automation_engine.workflows)
+        stored[0].status = TaskStatus.RUNNING
         self.tab.update_dashboard_metrics()
-        self.assertEqual(self.tab.active_workflows_label.text(), '1')
+        self.assertEqual(self.tab.active_workflows_label.text(), '1',
+                         'a run the engine is doing is missing from the card')
+        stored[0].status = TaskStatus.COMPLETED
+        self.tab.update_dashboard_metrics()
+        self.assertEqual(self.tab.active_workflows_label.text(), '0',
+                         'a finished run never left the card')
         self.fill(name='Second counted', steps=(('copy', 'file.copy', '"source": "a", '
                                                                  '"destination": "b"'),))
         self.tab.save_workflow_btn.click()

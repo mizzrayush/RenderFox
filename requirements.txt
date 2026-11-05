@@ -16,6 +16,9 @@ pyassimp==5.2.5
 # `every(0)` never returns. A release that changes any of those makes a saved schedule
 # silently mean something else.
 schedule==1.2.2
+# The Monitor pane takes CPU, memory and disk traffic from psutil, and six modules
+# already import it - it was never listed here, so a fresh install only worked by luck.
+psutil==6.0.0
 Pillow>=10.0.0
 scipy>=1.11.0
 requests>=2.31.0

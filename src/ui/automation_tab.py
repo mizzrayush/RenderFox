@@ -7,6 +7,7 @@ import json
 import sys
 import shutil
 import threading
+import time
 import subprocess
 import ast
 from datetime import datetime
@@ -23,8 +24,8 @@ from .icon_provider import get_icon
 
 # Import automation engine
 from ..features.automation_engine import (
-    AutomationEngine, FileWatcher, WorkflowStep, ActionRegistry
-)
+    AutomationEngine, FileWatcher, WorkflowStep, ActionRegistry, TaskStatus)
+import psutil
 
 
 BACKUP_SUBFOLDER = ".renderfox_backups"
@@ -62,7 +63,6 @@ class AutomationTab(QWidget):
         engine_processor.progress_updated.connect(self.on_batch_progress)
         engine_processor.batch_completed.connect(self.on_batch_completed_engine)
         
-        self.active_workflows = {}
         self.watch_requests = {}
         self._library = None
         self._task_rows = []
@@ -71,6 +71,12 @@ class AutomationTab(QWidget):
         self.current_workflow_id = None
         self._workflow_rows = []
         self._running_workflow = None
+        self._batch_run_name = None
+        self._problems = []
+        self._ps_process = psutil.Process()
+        self._io_sample = None
+        self._cpu_measured = False
+        self._process_keys = []
         self.init_ui()
         self.setup_connections()
         self.refresh_workflow_list()
@@ -737,20 +743,6 @@ class AutomationTab(QWidget):
         
         self.activity_list = QListWidget()
         
-        # Add sample activities
-        recent_activities = [
-            "Workflow 'Model Conversion' started",
-            "Task 'Daily Backup' completed successfully",
-            "New file detected: building.obj",
-            "Task 'Quality Check' failed - see logs",
-            "LOD generation completed for 5 models",
-            "Batch operation: 12/20 files processed"
-        ]
-        
-        for activity in recent_activities:
-            self.activity_list.addItem(activity)
-            
-        self.activity_list.clear() # Clear sample data
         activity_layout.addWidget(self.activity_list)
         activity_group.setLayout(activity_layout)
         overview_layout.addWidget(activity_group)
@@ -828,22 +820,12 @@ class AutomationTab(QWidget):
             "Process ID", "Name", "Progress", "Status", "Started", "ETA"
         ])
         
-        # Add sample processes
-        self.processes_table.setRowCount(3)
-        
-        sample_processes = [
-            ("WF001", "Model Conversion Pipeline", "65%", "Running", "14:30:15", "2 min"),
-            ("BT002", "Batch LOD Generation", "23%", "Running", "14:45:22", "8 min"),
-            ("TS003", "Scheduled Cleanup", "100%", "Completed", "14:00:00", "Done")
-        ]
-        
-        for row, (pid, name, progress, status, started, eta) in enumerate(sample_processes):
-            self.processes_table.setItem(row, 0, QTableWidgetItem(pid))
-            self.processes_table.setItem(row, 1, QTableWidgetItem(name))
-            self.processes_table.setItem(row, 2, QTableWidgetItem(progress))
-            self.processes_table.setItem(row, 3, QTableWidgetItem(status))
-            self.processes_table.setItem(row, 4, QTableWidgetItem(started))
-            self.processes_table.setItem(row, 5, QTableWidgetItem(eta))
+        self.processes_table.setRowCount(0)
+        self.processes_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.processes_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+
         
         layout.addWidget(self.processes_table)
         
@@ -873,10 +855,10 @@ class AutomationTab(QWidget):
         # Metrics summary
         metrics_layout = QGridLayout()
         
-        self.cpu_usage_label = QLabel("CPU Usage: 45%")
-        self.memory_usage_label = QLabel("Memory: 2.1 GB")
-        self.disk_io_label = QLabel("Disk I/O: 15 MB/s")
-        self.active_threads_label = QLabel("Active Threads: 8")
+        self.cpu_usage_label = QLabel("This app's CPU: not measured yet")
+        self.memory_usage_label = QLabel("This app's memory: not measured yet")
+        self.disk_io_label = QLabel("Disk traffic: not measured yet")
+        self.active_threads_label = QLabel("Threads alive: not counted yet")
         
         metrics_layout.addWidget(self.cpu_usage_label, 0, 0)
         metrics_layout.addWidget(self.memory_usage_label, 0, 1)
@@ -885,12 +867,6 @@ class AutomationTab(QWidget):
         
         layout.addLayout(metrics_layout)
         
-        # Performance history (placeholder)
-        history_label = QLabel("Performance history charts would be displayed here")
-        history_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        history_label.setStyleSheet("border: 1px dashed #ccc; padding: 50px;")
-        
-        layout.addWidget(history_label)
         
         return widget
         
@@ -902,10 +878,10 @@ class AutomationTab(QWidget):
         # Error summary
         summary_layout = QHBoxLayout()
         
-        self.errors_count_label = QLabel("Errors: 2")
+        self.errors_count_label = QLabel("Errors: 0")
         self.errors_count_label.setStyleSheet("color: #ff4757; font-weight: bold;")
         
-        self.warnings_count_label = QLabel("Warnings: 5")
+        self.warnings_count_label = QLabel("Warnings: 0")
         self.warnings_count_label.setStyleSheet("color: #ffa502; font-weight: bold;")
         
         self.clear_log_btn = QPushButton("Clear Log")
@@ -924,18 +900,210 @@ class AutomationTab(QWidget):
         # Error log display
         self.error_log_display = QPlainTextEdit()
         self.error_log_display.setReadOnly(True)
-        self.error_log_display.setPlainText("""[14:30:15] ERROR: Failed to convert model.obj - Invalid file format
-[14:25:22] WARNING: Large file detected (>100MB) - may affect performance
-[14:20:45] ERROR: Script execution failed - Permission denied
-[14:15:30] WARNING: Low disk space in output directory
-[14:10:12] WARNING: GPU memory usage above 90%
-[14:05:33] WARNING: Network connection unstable
-[14:00:01] WARNING: Scheduled task delayed due to system load""")
         
         layout.addWidget(self.error_log_display)
         
         return widget
         
+
+    @staticmethod
+    def _row(key, kind, ident, name, done, total, status, started_at, item,
+             stoppable, why_not):
+        return {'key': key, 'kind': kind, 'ident': ident, 'name': name,
+                'done': done, 'total': total, 'status': status,
+                'started_at': started_at, 'item': item,
+                'stoppable': stoppable, 'why_not': why_not}
+
+    def _process_rows(self):
+        engine = self.automation_engine
+        rows = []
+        for workflow_id, workflow in engine.workflows.items():
+            if workflow.status is not TaskStatus.RUNNING:
+                continue
+            rows.append(self._row('workflow:' + workflow_id, 'workflow',
+                                  workflow_id, workflow.name,
+                                  workflow.current_step, len(workflow.steps),
+                                  'Running', workflow.started_at, None, True, None))
+        processor = engine.batch_processor
+        batch = processor.current_batch
+        if batch:
+            label = 'Paused' if processor.is_paused else 'Running'
+            rows.append(self._row('batch', 'batch', 'batch',
+                                  self._batch_run_name or 'Batch',
+                                  batch.get('done', 0), batch.get('total', 0),
+                                  label, batch.get('started_at'),
+                                  batch.get('item'), True, None))
+        for task_id, task in engine.tasks.items():
+            if task.status is not TaskStatus.RUNNING:
+                continue
+            why = "'%s' runs one action, which cannot be cancelled here" % task.name
+            rows.append(self._row('task:' + task_id, 'task', task_id, task.name,
+                                  0, 1, 'Running', task.started_at,
+                                  task.task_type, False, why))
+        rows.sort(key=lambda one: (one['started_at'] or 0.0, one['name'].lower()))
+        return rows
+
+    @staticmethod
+    def _eta_text(row, now=None):
+        done = row['done']
+        total = row['total']
+        started = row['started_at']
+        if started is None or total <= 0 or done <= 0:
+            return 'unknown'
+        if done >= total:
+            return 'finishing'
+        elapsed = (time.time() if now is None else now) - started
+        if elapsed <= 0:
+            return 'unknown'
+        minutes, seconds = divmod(int(round(elapsed / done * (total - done))), 60)
+        return '%dm %02ds left' % (minutes, seconds)
+
+    @staticmethod
+    def _started_text(started_at):
+        if started_at is None:
+            return 'unknown'
+        return time.strftime('%H:%M:%S', time.localtime(started_at))
+
+    def rebuild_process_table(self):
+        chosen = None
+        position = self.processes_table.currentRow()
+        if position >= 0 and position < len(self._process_keys):
+            chosen = self._process_keys[position]
+        rows = self._process_rows()
+        self._process_keys = [row['key'] for row in rows]
+        table = self.processes_table
+        table.setRowCount(len(rows))
+        for where, row in enumerate(rows):
+            cells = [row['ident'][:8], row['name'],
+                     '%d/%d' % (row['done'], row['total']), row['status'],
+                     self._started_text(row['started_at']), self._eta_text(row)]
+            for column, text in enumerate(cells):
+                table.setItem(where, column, QTableWidgetItem(text))
+        if chosen in self._process_keys:
+            table.setCurrentCell(self._process_keys.index(chosen), 0)
+
+    def _selected_process(self):
+        position = self.processes_table.currentRow()
+        if position < 0 or position >= len(self._process_keys):
+            return None
+        wanted = self._process_keys[position]
+        for row in self._process_rows():
+            if row['key'] == wanted:
+                return row
+        return None
+
+    def kill_process(self):
+        row = self._selected_process()
+        if row is None:
+            QMessageBox.information(self, 'Kill Process',
+                                    'Nothing is running, so there is nothing to stop.')
+            return
+        if not row['stoppable']:
+            QMessageBox.warning(self, 'Kill Process', row['why_not'])
+            return
+        if row['kind'] == 'batch':
+            asked = self.automation_engine.stop_batch()
+            detail = 'the file in hand finishes first'
+        else:
+            asked = self.automation_engine.stop_workflow(row['ident'])
+            detail = 'the step in hand finishes first'
+        if not asked:
+            QMessageBox.warning(self, 'Kill Process',
+                                "'%s' had already finished when the click landed"
+                                % row['name'])
+            return
+        self._log_activity("Stop asked for '%s' - %s" % (row['name'], detail))
+        self.rebuild_process_table()
+
+    def show_process_details(self):
+        row = self._selected_process()
+        if row is None:
+            QMessageBox.information(self, 'Process Details',
+                                    'No run is selected and none is being reported.')
+            return
+        lines = ['Name: %s' % row['name'],
+                 'Kind: %s' % row['kind'],
+                 'Id: %s' % row['ident'],
+                 'Finished: %d of %d' % (row['done'], row['total']),
+                 'Status: %s' % row['status'],
+                 'Started: %s' % self._started_text(row['started_at']),
+                 'Estimated finish: %s' % self._eta_text(row)]
+        if row['item'] is not None:
+            lines.append('In hand: %s' % row['item'])
+        if not row['stoppable']:
+            lines.append('Stop: %s' % row['why_not'])
+        QMessageBox.information(self, 'Process Details', '\n'.join(lines))
+
+    def refresh_metrics(self):
+        try:
+            cpu = self._ps_process.cpu_percent(interval=None)
+            rss = self._ps_process.memory_info().rss
+            threads = threading.active_count()
+        except psutil.Error:
+            self._ps_process = psutil.Process()
+            self.cpu_usage_label.setText('This app\'s CPU: could not be read')
+            self.memory_usage_label.setText('This app\'s memory: could not be read')
+            self.active_threads_label.setText('Threads alive: could not be counted')
+            self.disk_io_label.setText('Disk traffic: could not be read')
+            return
+        if self._cpu_measured:
+            self.cpu_usage_label.setText('This app\'s CPU: %.1f%% of one core' % cpu)
+        else:
+            self._cpu_measured = True
+            self.cpu_usage_label.setText('This app\'s CPU: measuring')
+        self.memory_usage_label.setText('This app\'s memory: %.1f MB'
+                                        % (rss / 1024.0 / 1024.0))
+        self.active_threads_label.setText('Threads alive: %d' % threads)
+        self.disk_io_label.setText(self._disk_traffic_text())
+
+    def _disk_traffic_text(self):
+        counters = psutil.disk_io_counters()
+        if counters is None:
+            return 'Disk traffic: not reported by this system'
+        sample = (counters.read_bytes + counters.write_bytes, time.time())
+        previous = self._io_sample
+        self._io_sample = sample
+        if previous is None or sample[1] <= previous[1]:
+            return 'Disk traffic: measuring'
+        moved = sample[0] - previous[0]
+        if moved < 0:
+            moved = 0
+        rate = moved / (sample[1] - previous[1]) / 1024.0 / 1024.0
+        return 'Disk traffic: %.2f MB/s' % rate
+
+    def _record_problem(self, level, message):
+        self._problems.append((level, time.strftime('%H:%M:%S'), message))
+        if len(self._problems) > 500:
+            self._problems = self._problems[-500:]
+        self.render_problems()
+
+    def render_problems(self):
+        lines = ['[%s] %s: %s' % (stamp, level, text)
+                 for level, stamp, text in self._problems]
+        self.error_log_display.setPlainText('\n'.join(lines))
+        errors = sum(1 for one in self._problems if one[0] == 'ERROR')
+        self.errors_count_label.setText('Errors: %d' % errors)
+        self.warnings_count_label.setText('Warnings: %d' % (len(self._problems) - errors))
+
+    def clear_problem_log(self):
+        self._problems = []
+        self.render_problems()
+
+    def export_problem_log(self):
+        suggested = os.path.join(os.path.expanduser('~'), 'renderfox_automation_log.txt')
+        path, _chosen = QFileDialog.getSaveFileName(self, 'Export Automation Log', suggested,
+                                                    'Text files (*.txt);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as handle:
+                for level, stamp, text in self._problems:
+                    handle.write('[%s] %s: %s\n' % (stamp, level, text))
+        except OSError as error:
+            QMessageBox.warning(self, 'Export Log',
+                                'The log could not be written: %s' % error)
+            return
+        self._log_activity('Exported %d log line(s) to %s' % (len(self._problems), path))
 
     def setup_connections(self):
         """Setup signal connections."""
@@ -961,6 +1129,11 @@ class AutomationTab(QWidget):
         self.pause_batch_btn.clicked.connect(self.toggle_batch_pause)
         self.stop_batch_btn.clicked.connect(self.stop_batch_operation)
         self.preview_batch_btn.clicked.connect(self.preview_batch)
+        self.refresh_processes_btn.clicked.connect(self.rebuild_process_table)
+        self.kill_process_btn.clicked.connect(self.kill_process)
+        self.process_details_btn.clicked.connect(self.show_process_details)
+        self.clear_log_btn.clicked.connect(self.clear_problem_log)
+        self.export_log_btn.clicked.connect(self.export_problem_log)
         self.browse_source_btn.clicked.connect(self.browse_source_folder)
         self.browse_output_btn.clicked.connect(self.browse_output_folder)
         
@@ -1311,7 +1484,6 @@ class AutomationTab(QWidget):
         """The engine's worker has begun; note it and hand Stop to the user."""
         self._running_workflow = workflow_id
         name = self._workflow_name(workflow_id)
-        self.active_workflows[workflow_id] = name
         self._log_activity(f"Workflow '{name}' started")
         self.run_workflow_btn.setEnabled(False)
         self.save_workflow_btn.setEnabled(False)
@@ -1343,11 +1515,11 @@ class AutomationTab(QWidget):
         self._finish_run(workflow_id)
         self._log_activity(f"Workflow '{self._workflow_name(workflow_id)}' "
                            f"FAILED: {error or 'no reason given'}")
+        self._record_problem('ERROR', "workflow '%s' failed: %s" % (self._workflow_name(workflow_id), error or 'no reason given'))
         self.refresh_workflow_list()
 
     def _finish_run(self, workflow_id):
         """Give the controls back once a run is over, however it ended."""
-        self.active_workflows.pop(workflow_id, None)
         self._running_workflow = None
         self.run_workflow_btn.setEnabled(True)
         self.save_workflow_btn.setEnabled(True)
@@ -1369,11 +1541,14 @@ class AutomationTab(QWidget):
         else:
             reason = result.get('error') if isinstance(result, dict) else result
             self._log_activity(f"Task '{name}' FAILED: {reason or 'no reason given'}")
+            self._record_problem('ERROR', "task '%s' failed: %s" % (name, reason or 'no reason given'))
         self.refresh_task_table()
 
     def _log_activity(self, message):
         stamp = datetime.now().strftime("%H:%M:%S")
         self.activity_list.addItem(f"[{stamp}] {message}")
+        while self.activity_list.count() > 200:
+            self.activity_list.takeItem(0)
 
 
     def on_file_created(self, file_path):
@@ -1400,6 +1575,8 @@ class AutomationTab(QWidget):
         """Put a worker's action results in the same log as the events that caused them."""
         for line in outcomes:
             self.file_events_log.appendPlainText(f"    {line}")
+            if 'failed' in line:
+                self._record_problem('ERROR', 'watched file: %s' % line)
 
     def _auto_action_settings(self):
         """Snapshot the Auto Actions pane here so the worker thread never reads a widget."""
@@ -1763,6 +1940,7 @@ class AutomationTab(QWidget):
                 "files cannot run. Nothing was started - a batch that stops halfway "
                 "leaves you guessing which files it got to. Fix those (overwrite is the "
                 "usual one) or leave them out of the folder, then start again.")
+            self._record_problem('WARNING', 'batch not started: %d of %d file(s) cannot run' % (len(plan['blocked']), len(plan['ready']) + len(plan['blocked'])))
             return
         items = [item for item, _ in plan['ready']]
         operation = self._batch_operation(plan['action'], plan['output_dir'],
@@ -1772,6 +1950,7 @@ class AutomationTab(QWidget):
             QMessageBox.warning(self, 'Batch',
                                 'a batch is already running - wait for it, or stop it first')
             return
+        self._batch_run_name = '%s over %d file(s)' % (plan['action'], len(items))
         self._set_batch_running(True)
         self.batch_status_label.setText(
             f"Running {plan['action']} over {len(items)} file(s)...")
@@ -1825,6 +2004,10 @@ class AutomationTab(QWidget):
                 lines.append(f"  ok - {name}: {self._batch_verdict(record.get('result'))}")
             else:
                 lines.append(f"  failed - {name}: {record.get('error')}")
+        for record in summary.get('results') or []:
+            if not record.get('success'):
+                self._record_problem('ERROR', 'batch: %s - %s' % (
+                    os.path.basename(str(record.get('item'))), record.get('error')))
         total = summary.get('total') or 0
         ran = summary.get('ran', len(summary.get('results') or []))
         succeeded = summary.get('succeeded', 0)
@@ -1839,6 +2022,8 @@ class AutomationTab(QWidget):
             head = f'Finished {total} file(s): {succeeded} ok, {failed} failed'
         self.batch_status_label.setText(head)
         self.batch_log.appendPlainText('\n'.join(lines) + ('\n' if lines else '') + head)
+        if total - ran:
+            self._record_problem('WARNING', 'batch: %d file(s) never ran' % (total - ran))
 
     def browse_source_folder(self):
         """Put a picked folder where the batch reads its files from."""
@@ -2186,18 +2371,14 @@ class AutomationTab(QWidget):
         self.update_dashboard_metrics()
 
     def update_dashboard_metrics(self):
-        """Update dashboard status cards with real data."""
-        # Active Workflows
-        active_count = len(self.active_workflows)
-        if hasattr(self, 'active_workflows_label'):
-            self.active_workflows_label.setText(str(active_count))
-        
-        # Scheduled Tasks
-        task_count = len(self.automation_engine.tasks)
-        if hasattr(self, 'scheduled_tasks_label'):
-            self.scheduled_tasks_label.setText(str(task_count))
-        
-        # File Watchers
-        watcher_count = len(self.file_watcher.watched_directories)
-        if hasattr(self, 'file_watchers_label'):
-            self.file_watchers_label.setText(str(watcher_count))
+        """Every number the Monitor pane shows, read from live state."""
+        engine = self.automation_engine
+        running = sum(1 for workflow in engine.workflows.values()
+                      if workflow.status is TaskStatus.RUNNING)
+        self.active_workflows_label.setText(str(running))
+        self.scheduled_tasks_label.setText(
+            str(sum(1 for task in engine.tasks.values() if task.schedule_time)))
+        self.file_watchers_label.setText(str(len(self.file_watcher.watched_directories)))
+        self.completed_today_label.setText(str(engine.completed_today))
+        self.rebuild_process_table()
+        self.refresh_metrics()

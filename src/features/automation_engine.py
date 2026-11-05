@@ -439,6 +439,7 @@ class Workflow:
         self.modified_at = datetime.now()
         self.status = TaskStatus.PENDING
         self.current_step = 0
+        self.started_at = None
         self.error = None
 
     def add_step(self, step: WorkflowStep):
@@ -461,8 +462,17 @@ class Workflow:
             'modified_at': self.modified_at.isoformat() if self.modified_at else None,
             'status': self.status.value,
             'current_step': self.current_step,
+            'started_at': self.started_at,
             'error': self.error
         }
+
+    @staticmethod
+    def _stamp(value):
+        """A timestamp read back from disk, or this moment when the record carries none."""
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return datetime.now()
 
     @staticmethod
     def from_dict(data: Dict) -> 'Workflow':
@@ -476,13 +486,12 @@ class Workflow:
             workflow.add_step(WorkflowStep.from_dict(step_data))
         workflow.status = TaskStatus(data.get('status', 'pending'))
         workflow.current_step = data.get('current_step', 0)
+        saved_start = data.get('started_at')
+        if isinstance(saved_start, (int, float)):
+            workflow.started_at = saved_start
         workflow.error = data.get('error')
-        saved = data.get('modified_at')
-        if saved:
-            try:
-                workflow.modified_at = datetime.fromisoformat(saved)
-            except (TypeError, ValueError):
-                pass
+        workflow.created_at = Workflow._stamp(data.get('created_at'))
+        workflow.modified_at = Workflow._stamp(data.get('modified_at'))
         return workflow
 
 
@@ -1063,12 +1072,14 @@ class BatchProcessor(QObject):
         self.is_processing = True
         self._stop = False
         self._pause = False
-        self.current_batch = {'total': total, 'done': 0}
+        self.current_batch = {'total': total, 'done': 0, 'item': None,
+                                'started_at': time.time()}
         try:
             for index, item in enumerate(items):
                 self._hold()
                 if self._stop:
                     break
+                self.current_batch['item'] = str(item)
                 self.progress_updated.emit(index + 1, total, str(item))
                 try:
                     outcome = operation(item)
@@ -1082,6 +1093,7 @@ class BatchProcessor(QObject):
                                          'the action said no and gave no reason')})
                     else:
                         results.append({'item': item, 'success': True, 'result': outcome})
+                self.current_batch['done'] = index + 1
                 if progress_callback:
                     progress_callback(index + 1, total, item)
         finally:
@@ -1200,7 +1212,43 @@ class AutomationEngine(QObject):
         ActionRegistry.register_default_actions()
         self._load_workflows()
         self._load_tasks()
+        self._stats_lock = threading.Lock()
+        self._load_stats()
     
+    def _stats_file(self) -> str:
+        return os.path.join(app_data_dir(), 'automation_stats.json')
+
+    def _load_stats(self):
+        """Today's counters, or a fresh day when the file cannot be read."""
+        try:
+            with open(self._stats_file(), encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = None
+        self._stats = data if isinstance(data, dict) else {}
+
+    def _note_finished(self, success):
+        """Count one run that ended; two threads closing together lose neither."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        with self._stats_lock:
+            if self._stats.get('date') != today:
+                self._stats = {'date': today, 'completed': 0, 'failed': 0}
+            key = 'completed' if success else 'failed'
+            self._stats[key] = int(self._stats.get(key, 0)) + 1
+            try:
+                with open(self._stats_file(), 'w', encoding='utf-8') as handle:
+                    json.dump(self._stats, handle)
+            except OSError:
+                pass
+
+    @property
+    def completed_today(self):
+        """Runs that ended with what they were asked for, on this date only."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        if self._stats.get('date') != today:
+            return 0
+        return int(self._stats.get('completed', 0))
+
     def _tasks_file(self) -> str:
         return os.path.join(app_data_dir(), 'tasks.json')
 
@@ -1319,6 +1367,7 @@ class AutomationEngine(QObject):
         task.result = result
         task.error = None if success else str(result.get('error'))
         self._save_tasks()
+        self._note_finished(bool(success))
         self.task_completed.emit(task_id, success, result)
         return success
 
@@ -1476,6 +1525,7 @@ class AutomationEngine(QObject):
         workflow.status = TaskStatus.RUNNING
         workflow.error = None
         workflow.current_step = 0
+        workflow.started_at = time.time()
         self.workflow_started.emit(workflow_id)
 
         def progress(current, total, step_name):
@@ -1483,6 +1533,7 @@ class AutomationEngine(QObject):
 
         def completion(success, result):
             self._save_workflows()
+            self._note_finished(bool(success))
             if success:
                 self.workflow_completed.emit(workflow_id, result)
             else:
@@ -1572,7 +1623,9 @@ class AutomationEngine(QObject):
     def _run_batch(self, items: List[Any], operation: Callable):
         """The worker's whole job: run the batch, and never leave it claimed."""
         try:
-            self.batch_processor.process_batch(items, operation)
+            ran = self.batch_processor.process_batch(items, operation)
+            self._note_finished(bool(ran) and len(ran) == len(items)
+                                and all(one['success'] for one in ran))
         finally:
             self.batch_processor.is_processing = False
 
@@ -1595,6 +1648,19 @@ class AutomationEngine(QObject):
         self.scheduler.start_scheduler()
         # File watcher starts automatically when directories are added
     
+    def live_work(self):
+        """What a close would cut off, named the way the run was named to the user."""
+        running = []
+        for workflow in self.workflows.values():
+            if workflow.status is TaskStatus.RUNNING:
+                running.append("workflow '%s'" % workflow.name)
+        for task in self.tasks.values():
+            if task.status is TaskStatus.RUNNING:
+                running.append("task '%s'" % task.name)
+        if self.batch_processor.is_processing:
+            running.append('a batch of files')
+        return running
+
     def stop(self):
         """Stop automation engine, and wait for the work it started."""
         self.scheduler.stop_scheduler()

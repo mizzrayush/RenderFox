@@ -441,6 +441,21 @@ class MainWindow(QMainWindow):
             
             self.job_manager.stop_processing()
 
+        # Automation runs on its own threads: a close without this question would
+        # cut a batch mid-file, and stop() is what ends the scheduler's polling.
+        engine = self.automation_tab.automation_engine
+        live = engine.live_work()
+        if live:
+            reply = QMessageBox.question(
+                self, 'Exit RenderFox',
+                'Automation is still running:\n  %s\n\nExit anyway?' % '\n  '.join(live),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                event.ignore()
+                return
+        engine.stop()
+
         # Auto-save settings if enabled
         if hasattr(self, 'settings_tab') and hasattr(self.settings_tab, 'auto_save_workspace'):
             if self.settings_tab.auto_save_workspace.isChecked():

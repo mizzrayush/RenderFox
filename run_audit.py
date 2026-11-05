@@ -122,6 +122,12 @@ SUITES = [
         "description": "Repeats one registry action over a real folder of real files, requires a file the action refused to be counted as failed instead of done, checks Preview prints the exact call each file will get, and makes Start, Pause, Stop, Preview and both Browse buttons reach the engine or name why they cannot"
     },
     {
+        "id": "automation_monitor_contract",
+        "name": "Automation Monitor Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_automation_monitor_contract.py")],
+        "description": "Requires the Monitor pane to report only runs the engine says are happening - no invented activity lines, process rows, CPU figures or error counts - and makes Refresh, Kill, Details, Clear Log, Export Log and the close question reach the engine or name why they cannot"
+    },
+    {
         "id": "postprocessor_paths",
         "name": "Post-Processing Output Folder",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_postprocessor_paths.py")],
