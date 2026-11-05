@@ -146,6 +146,13 @@ SUITES = [
         "description": "Clicks every Point Clouds control and requires each verb to write the file it names, count the points off that file rather than off memory, chain the next verb onto it, refuse an impossible parameter by repeating the number typed, keep the progress dialog's maximum equal to the files actually written, and make Cancel and a second click reach the run in flight - including the two defects only a live run found: a verdict slot that raised on QProgressDialog.wasClosed and a finished signal from an old thread silencing a newer one"
     },
     {
+        "id": "preview_render_contract",
+        "name": "Preview Raster Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_preview_render_contract.py")],
+        "description": "Draws real frames with the app's own raster and requires the picture on disk to be the picture reported: every lamp knob monotone in the pixels, every camera knob visible, fit holding a 0.06-unit and an 8-unit model in one frame, the window floor and ceiling resampled and admitted in the note, transparency accounting for every pixel, and the four Open3D traps this machine punishes (engine head light on, fresh PinholeCameraIntrinsic, plain look-at extrinsic, window left open) pinned from the source as well as the frame",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
@@ -174,7 +181,8 @@ def run_suite(suite_info):
     env = os.environ.copy()
     env['QT_QPA_PLATFORM'] = 'offscreen'
     env['PYTHONIOENCODING'] = 'utf-8'
-    
+    budget = suite_info.get("timeout_seconds", 120)
+
     try:
         proc = subprocess.run(
             cmd,
@@ -184,7 +192,7 @@ def run_suite(suite_info):
             text=True,
             encoding='utf-8',
             errors='replace',
-            timeout=120
+            timeout=budget
         )
         elapsed = time.time() - start
         success = (proc.returncode == 0)
@@ -204,6 +212,18 @@ def run_suite(suite_info):
             "status": "PASS" if success else "FAIL",
             "elapsed_seconds": round(elapsed, 2),
             "output_tail": (proc.stdout or "")[-300:]
+        }
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - start
+        print(f"  Result: TIMEOUT after the {budget}s budget ({elapsed:.2f}s). Run the suite by "
+              f"hand before reading this as a defect - a busy machine and a real hang look alike "
+              f"in this report.")
+        return {
+            "id": suite_info["id"],
+            "name": name,
+            "status": "TIMEOUT",
+            "elapsed_seconds": round(elapsed, 2),
+            "error": f"exceeded its {budget}s budget"
         }
     except Exception as e:
         elapsed = time.time() - start
