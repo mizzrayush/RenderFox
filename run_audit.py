@@ -153,6 +153,13 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "ai_tagger_contract",
+        "name": "AI Asset Tagger Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_ai_tagger_contract.py")],
+        "description": "Requires the picture CLIP judges to be a frame the app really drew: the tagger's preview comes back as the file the software raster wrote (the asked size, more than one colour in it, gone again from the temp folder, in seconds rather than minutes), a tagging run is counted to open no OpenGL window at all because a second GL window in one process never answers and the worker blocked inside it takes the pane's bar with it, a draw the raster refuses is reported as refused so the geometry answers alone and `ai_powered` stays false instead of claiming a judgement that never happened, and the syntax tree of the module is read to prove no second renderer is left in it a conditional away",
+        "timeout_seconds": 180
+    },
+    {
         "id": "pipeline_contract",
         "name": "Pipeline Engine and Pane Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_pipeline_contract.py")],

@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Callable
 import logging
 from PIL import Image
-import io
 
 # CLIP Model imports (NEW!)
 try:
@@ -42,14 +41,6 @@ try:
 except ImportError:
     CLIP_AVAILABLE = False
     logging.warning("CLIP not available. Install with: pip install transformers torch")
-
-# Open3D import for fallback rendering
-try:
-    import open3d as o3d
-    OPEN3D_AVAILABLE = True
-except ImportError:
-    OPEN3D_AVAILABLE = False
-    logging.warning("Open3D not available. Install with: pip install open3d")
 
 logger = logging.getLogger(__name__)
 
@@ -152,99 +143,52 @@ class AIAssetTagger:
             self.use_clip = False
             logger.warning("⚠️ Falling back to geometric analysis only")
     
-    def _render_model_preview(self, mesh, resolution=(224, 224)):
-        """
-        Render a preview image of the 3D model for CLIP analysis.
-        
-        Args:
-            mesh: Trimesh object
-            resolution: Image resolution (width, height)
-            
-        Returns:
-            PIL Image object
-        """
-        # Try Trimesh (pyglet) rendering first
-        try:
-            # Render the mesh to an image
-            if isinstance(mesh, trimesh.Scene):
-                scene = mesh
-            else:
-                scene = mesh.scene()
-            
-            # Set up camera to view the entire model
-            scene.camera.fov = [60, 60]
-            
-            # Render to PNG bytes
-            png_data = scene.save_image(resolution=resolution, visible=True)
-            
-            # Convert to PIL Image
-            image = Image.open(io.BytesIO(png_data))
-            
-            return image
-            
-        except Exception as e:
-            logger.warning(f"Trimesh rendering failed (likely missing pyglet): {e}")
-            
-            # Fallback to Open3D if available
-            if OPEN3D_AVAILABLE:
-                logger.info("🔄 Attempting fallback rendering with Open3D...")
-                return self._render_with_open3d(mesh, resolution)
-            
-            return None
+    def _render_model_preview(self, model_path: str,
+                              resolution: Tuple[int, int] = (224, 224)) -> Optional[Image.Image]:
+        """Draw the asset with the raster this app already uses, away from the GUI thread.
 
-    def _render_with_open3d(self, mesh, resolution=(224, 224)):
+        `analyze_model` runs on the tagger's worker, and both pictures this method used to
+        answer with need a GL context that worker does not have. Measured on this machine:
+        trimesh's `scene.save_image` does render, on the main thread, in 0.58 s - but called
+        from another thread it answers in 0.06 s with `RuntimeError: EventLoop.run() must be
+        called from the same thread that imports pyglet.app`. So the fallback branch was not
+        a rare path in this app, it was the only path ever taken. The fallback opened an
+        Open3D `Visualizer`, and that window draws the first time a process opens one and
+        never answers again once another GL window has existed - the tagger's thread sat in
+        `poll_events` for over three minutes with the pane's bar still spinning, and a worker
+        blocked inside a native call answers no cancellation verb. The half that did work is
+        its own reason to leave: 2 colours over 224x224, a flat unlit silhouette, which is
+        the picture CLIP's category was a judgement about.
+        `generate_3d_thumbnail` is the frame the Library and Automation already write, drawn
+        by QPainter with no context, and what is handed back is the written file re-opened
+        from disk rather than what the caller hoped the draw produced.
         """
-        Render mesh using Open3D as fallback.
-        """
+        import tempfile
+
+        from ..utils.file_utils import get_temp_directory
+        from ..utils.thumbnail_renderer import generate_3d_thumbnail
+
+        side = max(int(resolution[0]), int(resolution[1]))
+        handle, out_path = tempfile.mkstemp(prefix='rfx_tagger_preview_', suffix='.png',
+                                            dir=get_temp_directory())
+        os.close(handle)
         try:
-            # Convert Trimesh to Open3D mesh
-            o3d_mesh = o3d.geometry.TriangleMesh()
-            
-            # Handle Scene objects by concatenating geometry first (already done in analyze_model via _as_trimesh)
-            # But if we got here with a Scene object that wasn't converted (unlikely due to _as_trimesh usage), handle it.
-            if isinstance(mesh, trimesh.Scene):
-                # We need a single mesh for simple Open3D rendering here
-                # Re-use _as_trimesh logic or assume it's already a Trimesh if passed from analyze_model
-                # For safety, just use the first geometry or merge
-                dump = mesh.dump(concatenate=True)
-                if isinstance(dump, list):
-                    # If multiple, just take first for preview
-                    vertices = dump[0].vertices
-                    faces = dump[0].faces
-                else:
-                    vertices = dump.vertices
-                    faces = dump.faces
-            else:
-                vertices = mesh.vertices
-                faces = mesh.faces
-            
-            o3d_mesh.vertices = o3d.utility.Vector3dVector(vertices)
-            o3d_mesh.triangles = o3d.utility.Vector3iVector(faces)
-            o3d_mesh.compute_vertex_normals()
-            o3d_mesh.paint_uniform_color([0.7, 0.7, 0.7])  # Grey color
-            
-            # Create visualizer
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(visible=False, width=resolution[0], height=resolution[1])
-            vis.add_geometry(o3d_mesh)
-            
-            # Update view
-            vis.poll_events()
-            vis.update_renderer()
-            
-            # Capture image
-            image_float = vis.capture_screen_float_buffer()
-            image_np = (np.asarray(image_float) * 255).astype(np.uint8)
-            
-            # Convert to PIL
-            image = Image.fromarray(image_np)
-            
-            vis.destroy_window()
-            return image
-            
-        except Exception as e:
-            logger.error(f"Open3D fallback rendering failed: {e}")
+            outcome = generate_3d_thumbnail(model_path, out_path, size=side) or {}
+            if not outcome.get('rendered'):
+                logger.warning(f"No preview of {os.path.basename(str(model_path))}: "
+                               f"{outcome.get('error', 'the raster drew no faces')}")
+                return None
+            with Image.open(out_path) as picture:
+                return picture.convert('RGB').copy()
+        except Exception as problem:
+            logger.error(f"Preview of {os.path.basename(str(model_path))} failed: "
+                         f"{type(problem).__name__}: {problem}")
             return None
+        finally:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
     
     def _clip_classify_category(self, image: Image.Image) -> Dict[str, float]:
         """
@@ -443,7 +387,7 @@ class AIAssetTagger:
                 'bounding_box_type': self._classify_bounding_box(mesh),
                 'tags': [],
                 'confidence': {},
-                'ai_powered': self.use_clip
+                'ai_powered': False
             }
             
             # AI-powered analysis using CLIP (NEW!)
@@ -451,15 +395,12 @@ class AIAssetTagger:
                 logger.info("🤖 Running AI analysis with CLIP...")
                 
                 # Render model preview for CLIP
-                # Note: _render_model_preview handles Scene objects internally if needed, 
-                # but we pass the single mesh here for consistency unless we want full scene rendering.
-                # For now, passing the mesh is safer as _render_model_preview expects a mesh or scene.
-                # If we passed the original loaded_obj (Scene), it might render better materials.
-                # Let's try to use the original object for rendering if it was a Scene, else the mesh.
-                render_obj = loaded_obj if isinstance(loaded_obj, trimesh.Scene) else mesh
-                preview_image = self._render_model_preview(render_obj)
+                preview_image = self._render_model_preview(model_path)
                 
                 if preview_image:
+                    # `ai_powered` is the claim that CLIP looked at a frame of this asset,
+                    # which is only true once there is a frame for it to have looked at.
+                    analysis['ai_powered'] = True
                     # Get AI category classification
                     ai_categories = self._clip_classify_category(preview_image)
                     
