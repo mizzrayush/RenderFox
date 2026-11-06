@@ -27,10 +27,8 @@ from typing import List, Dict, Optional, Tuple
 import trimesh
 import numpy as np
 import logging
-try:
-    import open3d as o3d
-except ImportError:
-    o3d = None
+
+from ..utils.thumbnail_renderer import generate_3d_thumbnail
 
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 
@@ -145,8 +143,6 @@ class AssetVersionControl:
             total, used, free = shutil.disk_usage(self.snapshots_dir)
             if free < file_size * 2:  # Ensure we have at least 2x file size available
                 raise IOError(f"Insufficient disk space. Need {file_size / 1024 / 1024:.1f} MB, but only {free / 1024 / 1024:.1f} MB available.")
-                logger.error(f"Model not found: {model_path}")
-                return None
             
             # Calculate file hash
             file_hash = self._calculate_file_hash(model_path)
@@ -170,7 +166,7 @@ class AssetVersionControl:
             shutil.copy2(model_path, snapshot_path)
             
             # Generate thumbnail (optional)
-            thumbnail_path = self._generate_thumbnail(mesh, model_path.stem, version_number)
+            thumbnail_path = self._generate_thumbnail(snapshot_path)
             
             # Get parent version for diff calculation
             parent_version = self._get_latest_version(str(model_path), branch)
@@ -632,44 +628,32 @@ class AssetVersionControl:
         
         return dict(row) if row else None
     
-    def _generate_thumbnail(self, mesh, model_name: str, version_number: int) -> Optional[str]:
-        """Generate thumbnail for version using Open3D."""
-        if o3d is None:
-            return None
-            
-        try:
-            # Create thumbnail path
-            thumb_name = f"{model_name}_v{version_number}.png"
-            thumb_path = self.thumbnails_dir / thumb_name
-            
-            # Convert Trimesh to Open3D
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(mesh.vertices)
-            
-            # Or better, use mesh if available
-            if hasattr(mesh, 'faces'):
-                o3d_mesh = o3d.geometry.TriangleMesh()
-                o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-                o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
-                o3d_mesh.compute_vertex_normals()
-                geometry = o3d_mesh
-            else:
-                geometry = pcd
+    def _generate_thumbnail(self, snapshot_path) -> Optional[str]:
+        """Draw the version's picture with the app's one raster, or record that there is none.
 
-            # Offscreen rendering
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(visible=False, width=640, height=480)
-            vis.add_geometry(geometry)
-            vis.poll_events()
-            vis.update_renderer()
-            vis.capture_screen_image(str(thumb_path))
-            vis.destroy_window()
-            
-            return str(thumb_path)
-            
-        except Exception as e:
-            logger.error(f"Error generating thumbnail: {e}")
+        The file is named for the snapshot it depicts, which is also how `create_branch`
+        points a new row at the source version's picture. The name this call used to build
+        came from the model's stem and its version number, so two files called `chair.obj`
+        in different folders both wrote `chair_v1.png`, and the second commit replaced the
+        first row's picture with the other chair's.
+
+        The window used to be opened here - `o3d.visualization.Visualizer` plus
+        `capture_screen_image` - on the caller's thread, which for the Versions pane's Commit
+        button is the interface thread, and its `destroy_window` sat after the capture, so any
+        raise in between left the window alive.
+
+        `rendered` is the raster's own verdict: a model it could not read still gets a file,
+        a wireframe badge that looks like a crate, so recording that path would tell the
+        timeline the version has a picture of the model when it has a picture of nothing.
+        """
+        thumb_path = self.thumbnails_dir / (Path(snapshot_path).stem + '.png')
+        outcome = generate_3d_thumbnail(str(snapshot_path), str(thumb_path), size=256) or {}
+        if not outcome.get('rendered'):
+            thumb_path.unlink(missing_ok=True)
+            logger.warning(f"No picture for {thumb_path.name}: "
+                           f"{outcome.get('error', 'the raster gave no verdict')}")
             return None
+        return str(thumb_path)
     
     def _calculate_diff(self, mesh, parent_version: Dict) -> Dict:
         """Calculate differences from parent version."""

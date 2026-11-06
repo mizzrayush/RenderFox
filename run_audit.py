@@ -202,6 +202,13 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "thumbnail_owner_contract",
+        "name": "One Picture Maker Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_thumbnail_owner_contract.py")],
+        "description": "Every picture the app writes comes from its one raster and nowhere else: the dead thumbnail thread and the grid widget that was its only caller stay deleted with nothing naming them, the five callers still own their verdict, a window opener appears only in the four modules that were built around one, a committed version records a picture of its own snapshot and no other model's, a file with nothing to draw is refused with its reason, and the Versions pane paints the file its row names - including the two different sentences for a version that never had a picture and a picture whose file went missing",
+        "timeout_seconds": 240
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

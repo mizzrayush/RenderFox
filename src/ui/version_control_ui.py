@@ -442,7 +442,18 @@ class VersionControlUI(QWidget):
         self.details_text.setReadOnly(True)
         self.details_text.setMaximumHeight(150)
         self.details_text.setPlaceholderText("Select a version to view details...")
-        details_layout.addWidget(self.details_text)
+
+        self.version_picture = QLabel("No version selected")
+        self.version_picture.setFixedSize(150, 150)
+        self.version_picture.setWordWrap(True)
+        self.version_picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.version_picture.setStyleSheet(
+            "background-color: #14151b; border-radius: 4px; border: 1px solid #232530;")
+
+        details_row = QHBoxLayout()
+        details_row.addWidget(self.version_picture)
+        details_row.addWidget(self.details_text, 1)
+        details_layout.addLayout(details_row)
         
         details_group.setLayout(details_layout)
         layout.addWidget(details_group)
@@ -571,6 +582,7 @@ class VersionControlUI(QWidget):
         
         if not selected_items:
             self.details_text.clear()
+            self._show_version_picture(None)
             self.restore_btn.setEnabled(False)
             self.tag_btn.setEnabled(False)
             self.compare_btn.setEnabled(False)
@@ -605,7 +617,40 @@ class VersionControlUI(QWidget):
             details += f"<p>• Watertight: {'✓ Yes' if version['is_watertight'] else '✗ No'}</p>"
             
             self.details_text.setHtml(details)
-    
+
+        self._show_version_picture(version)
+
+    def _show_version_picture(self, version):
+        """Paint the picture the selected row records, or say which kind of nothing there is.
+
+        Every row this backend writes carries a `thumbnail_path` (`version_control.py:193`,
+        `:702`, `:712`), and until this change nothing in `src/ui` read it - a grep over the
+        tree at HEAD returns the Library's own different column and a signal argument, no
+        widget - while this module's header promises a timeline with thumbnails; the row's own
+        picture belongs beside its numbers. The three refusals are three different facts: no row
+        is selected, the picture was never drawn, and it was drawn and the file has gone.
+
+        A refusal needs no call of its own to take the previous picture down. Measured here on
+        Qt 6.7.1: `setText` with a sentence clears the label's pixmap, `setText('')` does not,
+        and `setPixmap` clears the text - so the sentence *is* the withdrawal, and the only way
+        a picture comes back is the branch that paints one. The suite pins those three answers
+        instead of trusting them to stay.
+        """
+        if version is None:
+            self.version_picture.setText('No version selected')
+            return
+        path = version.get('thumbnail_path')
+        if not path:
+            self.version_picture.setText('This version has no picture')
+            return
+        picture = QPixmap(str(path))
+        if picture.isNull():
+            self.version_picture.setText('Its picture file could not be read')
+            return
+        self.version_picture.setPixmap(picture.scaled(
+            148, 148, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
     def commit_version(self):
         """Commit a new version."""
         if not self.current_model:
