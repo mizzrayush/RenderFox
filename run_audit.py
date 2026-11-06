@@ -174,6 +174,13 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "quality_analyzer_contract",
+        "name": "Quality Pane Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_quality_analyzer_contract.py")],
+        "description": "Double-clicks every fix row the Quality tab can produce and requires the file, the verb and the sentence to match: each of the seven one-click names calls the operation its row claims (recorded, not trusted) and leaves a file the app's own analyzer can score again, the two fixes the Pre-Processing pane owns say so by pane name instead of claiming nothing exists, an unknown name is refused by that name, a UV pack writes coordinates an atlas can use, the output file keeps a folder whose name contains a dot, the confirmation sentence names all seven filters auto_repair actually runs, Fix All marks only the rows auto_repair carried out, both reload prompts move the pane onto the file the fix wrote, a file the reader returns as a scene is still counted and stripped by texture rows, a file that lists a position twice is read whole by the engine and welded by the fix that says it welds, the analysis thread's real failure channel is the one wired, a file that cannot be opened says Error instead of grading an unread model F, every closure handed to the house Worker takes the progress_callback it is always given and every start has an error channel attached, and Export writes the HTML its button promises - the call that used to raise a TypeError, then a KeyError over its own CSS, and never wrote a file",
+        "timeout_seconds": 240
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

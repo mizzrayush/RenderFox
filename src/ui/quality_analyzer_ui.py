@@ -19,30 +19,82 @@ from typing import Optional, Dict
 
 from ..features.quality_analyzer import QualityAnalyzer
 from .unified_viewer import UnifiedOpen3DViewer
-from ..processing.mesh_processor import MeshProcessor
+from ..processing.mesh_processor import MeshProcessor, MeshUV
 from ..utils.worker import Worker
 from PyQt6.QtCore import QThreadPool
 from PyQt6.QtWidgets import QMessageBox
 
 logger = logging.getLogger(__name__)
 
+# Every fix name the analyzer promises as one-click, and the verb on the app's one
+# operation router that carries it out. Keyed by QualityAnalyzer.ONE_CLICK_FIXES, which
+# test_quality_analyzer_contract checks name-for-name, so a promise cannot outlive a verb.
+FIX_VERBS = {
+    'repair_mesh': ('repair', {'operation': 'auto'}),
+    'merge_vertices': ('repair', {'operation': 'remove_duplicates'}),
+    'remove_degenerate_faces': ('repair', {'operation': 'remove_degenerate'}),
+    'fix_normals': ('repair', {'operation': 'fix_normals'}),
+    'remesh': ('remesh', {'method': 'uniform'}),
+    'generate_uvs': ('uv', {'method': 'trivial', 'layout': 'Basic'}),
+    'pack_uvs': ('uv', {'method': 'trivial', 'layout': 'Space-optimizing'}),
+}
+
+
+def fix_output_path(model_path: str, fix_action: str) -> str:
+    """The file this fix writes: beside the model, named for the fix, extension kept."""
+    root, ext = os.path.splitext(model_path)
+    return f"{root}_{fix_action}{ext}"
+
+
+# auto_repair (mesh_processor.py:811) runs seven pymeshlab filters; this sentence names
+# every one of them, and the contract suite reads the engine's source to keep it true.
+FIX_ALL_ASK = ("This runs the app's full auto-repair: weld duplicate vertices, drop null, "
+               "folded and duplicate faces, re-orient faces coherently, close holes and "
+               "drop unreferenced vertices. The result is written to a new file beside "
+               "this one; the original is not touched. Continue?")
+
+
+def apply_fix_action(processor: MeshProcessor, model_path: str, fix_action: str,
+                     output_path: Optional[str] = None) -> Dict:
+    """Run one analyzer fix name on the backend that actually does it.
+
+    Returns the engine's own dict. A name with no verb here, or one another pane owns,
+    comes back as a refusal that says so - never as a success the run did not earn.
+    """
+    if fix_action in QualityAnalyzer.OWNED_ELSEWHERE:
+        return {'success': False, 'error': QualityAnalyzer.OWNED_ELSEWHERE[fix_action]}
+
+    verb = FIX_VERBS.get(fix_action)
+    if not verb:
+        return {'success': False,
+                'error': f"no backend is registered for fix '{fix_action}'"}
+
+    method, kwargs = verb
+    target = output_path or fix_output_path(model_path, fix_action)
+    if method == 'uv':
+        return MeshUV.parametrize(model_path, target, **kwargs)
+    return getattr(processor, method)(model_path, target, **kwargs)
+
 
 class QualityAnalysisWorker(SafeWorker):
-    """Background worker for quality analysis."""
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
-    
+    """Background worker for quality analysis.
+
+    `analysis_done` rather than `finished`: SafeWorker is a QThread, and a subclass
+    signal named `finished` shadows the one Qt itself emits. The failure channel is
+    SafeWorker's own `error_occurred`, which `run()` emits when `safe_run` raises -
+    a second `error` signal here would be a channel nothing emits.
+    """
+    analysis_done = pyqtSignal(dict)
+
     def __init__(self, model_path: str, target_platform: str):
         super().__init__()
         self.model_path = model_path
         self.target_platform = target_platform
         self.analyzer = QualityAnalyzer()
-        self.processor = MeshProcessor()
-        self.threadpool = QThreadPool()
     
     def safe_run(self):
         result = self.analyzer.analyze_quality(self.model_path, self.target_platform)
-        self.finished.emit(result)
+        self.analysis_done.emit(result)
 
 
 class ComparisonDialog(QDialog):
@@ -87,15 +139,21 @@ class ComparisonDialog(QDialog):
         if self.original_path and os.path.exists(self.original_path):
             self.original_viewer.load_from_file(self.original_path)
             # Analyze metrics
-            stats1 = self.analyzer.analyze_quality(self.original_path)
-            self.update_info(self.original_info, stats1['metrics'])
+            self.update_info(self.original_info,
+                             self.analyzer.analyze_quality(self.original_path))
             
         if self.current_path and os.path.exists(self.current_path):
             self.current_viewer.load_from_file(self.current_path)
-            stats2 = self.analyzer.analyze_quality(self.current_path)
-            self.update_info(self.current_info, stats2['metrics'])
+            self.update_info(self.current_info,
+                             self.analyzer.analyze_quality(self.current_path))
             
-    def update_info(self, label, metrics):
+    def update_info(self, label, analysis):
+        """Paint what the analyzer measured, or the reason it measured nothing."""
+        if analysis.get('error'):
+            label.setText(f"Could not be analyzed: {analysis['error']}")
+            return
+
+        metrics = analysis.get('metrics', {})
         text = (f"<b>Polygons:</b> {metrics.get('polygon_count', 0):,}<br>"
                 f"<b>Vertices:</b> {metrics.get('vertex_count', 0):,}<br>"
                 f"<b>Watertight:</b> {'Yes' if metrics.get('is_watertight') else 'No'}<br>"
@@ -312,14 +370,14 @@ class QualityAnalyzerUI(QWidget):
         return panel
     
     def set_model(self, model_path: str):
-        if self.original_model_path is None:
-            self.original_model_path = model_path
         """
         Set the current model to analyze.
         
         Args:
             model_path: Path to the 3D model file
         """
+        if self.original_model_path is None:
+            self.original_model_path = model_path
         self.current_model_path = model_path
         self.analyze_btn.setEnabled(True)
         self.analysis_result = None
@@ -363,14 +421,21 @@ class QualityAnalyzerUI(QWidget):
         
         # Start analysis in background
         self.worker = QualityAnalysisWorker(self.current_model_path, target_platform)
-        self.worker.finished.connect(self.on_analysis_complete)
-        self.worker.error.connect(self.on_analysis_error)
+        self.worker.analysis_done.connect(self.on_analysis_complete)
+        self.worker.error_occurred.connect(self.on_analysis_error)
         self.worker.start()
         
         logger.info(f"Starting quality analysis for {Path(self.current_model_path).name}")
     
     def on_analysis_complete(self, result: Dict):
         """Handle analysis completion."""
+        # analyze_quality catches its own failures and returns {'error': ...} with a
+        # score of 0. That is not a model that scored badly, it is a model the app never
+        # read, so it goes to the failure handler instead of being painted as a verdict.
+        if result.get('error'):
+            self.on_analysis_error(result['error'])
+            return
+
         self.analysis_result = result
         
         # Re-enable controls
@@ -404,28 +469,31 @@ class QualityAnalyzerUI(QWidget):
         self.issues_list.clear()
         issues = result.get('issues', [])
         for issue in issues:
-            title = issue.get('type', 'Issue').replace('_', ' ').title()
-            description = issue.get('message', '')
+            # An issue that is a bare sentence is a bug in whoever produced it, but this
+            # loop is a Qt slot: raising here loses the rest of the list silently.
+            fields = issue if hasattr(issue, 'get') else {'type': 'issue', 'message': str(issue)}
+            title = fields.get('type', 'Issue').replace('_', ' ').title()
+            description = fields.get('message', '')
             item = QListWidgetItem(f"• {title}: {description}")
             item.setData(Qt.ItemDataRole.UserRole, issue)
-            
+
             # Color code by severity
-            if issue.get('severity') == 'critical':
+            if fields.get('severity') == 'critical':
                 item.setForeground(QColor("#ff4757"))
-            elif issue.get('severity') == 'high':  # Changed from warning to match analyzer
+            elif fields.get('severity') == 'high':  # Changed from warning to match analyzer
                 item.setForeground(QColor("#ffa502"))
-            elif issue.get('severity') == 'medium':
+            elif fields.get('severity') == 'medium':
                 item.setForeground(QColor("#ffa502"))
             else:
                 item.setForeground(QColor("#747d8c"))
-            
+
             self.issues_list.addItem(item)
         
         # Update suggestions list
         self.suggestions_list.clear()
         suggestions = result.get('suggestions', [])
         for suggestion in suggestions:
-            title = suggestion.get('fix_action', 'Fix').replace('_', ' ').title()
+            title = (suggestion.get('fix_action') or 'Manual check').replace('_', ' ').title()
             description = suggestion.get('description', '')
             # Add title to suggestion dict for apply_fix usage
             suggestion['title'] = title
@@ -516,38 +584,26 @@ class QualityAnalyzerUI(QWidget):
         
         if not suggestion:
             return
-            
+
         fix_action = suggestion.get('fix_action')
         title = suggestion.get('title')
-        
+
         logger.info(f"Applying fix: {title} ({fix_action})")
-        
+
+        if not fix_action:
+            # A row the analyzer wrote as advice, not as something a verb can do.
+            QMessageBox.warning(self, "No One-Click Fix",
+                                suggestion.get('description', 'Manual fix required'))
+            return
+
         if not self.current_model_path:
             return
 
-        # Map action to processor method
-        # Supported: repair_mesh, merge_vertices, remove_degenerate_faces, remesh
-        
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         
-        def worker_func(processor, path, action):
-            root, ext = os.path.splitext(path)
-            output_path = f"{root}_{action}{ext}"
-            result = {'success': False, 'error': 'Not implemented'}
-            
-            if action == 'repair_mesh':
-                result = processor.repair(path, output_path, operation='auto')
-            elif action == 'merge_vertices':
-                result = processor.repair(path, output_path, operation='remove_duplicates')
-            elif action == 'remove_degenerate_faces':
-                result = processor.repair(path, output_path, operation='remove_degenerate')
-            elif action == 'remesh':
-                result = processor.remesh(path, output_path, method='uniform')
-            else:
-                return {'success': False, 'error': f"Fix '{action}' not supported automatically yet."}
-                
-            return result
+        def worker_func(processor, path, action, progress_callback=None):
+            return apply_fix_action(processor, path, action)
 
         worker = Worker(worker_func, self.processor, self.current_model_path, fix_action)
         
@@ -569,19 +625,26 @@ class QualityAnalyzerUI(QWidget):
                 QMessageBox.warning(self, "Fix Failed", result.get('error', 'Unknown error'))
                 
         worker.signals.result.connect(on_result)
+        worker.signals.error.connect(self.on_fix_failed)
         self.threadpool.start(worker)
+
+    def on_fix_failed(self, error):
+        """Report what the fix thread died with, and stop the bar that was spinning."""
+        kind, value, _traceback = error
+        self.progress_bar.setVisible(False)
+        QMessageBox.warning(self, "Fix Failed",
+                            f"The fix stopped before it wrote anything: "
+                            f"{kind.__name__}: {value}")
+
     def fix_all_issues(self):
-        """Apply all fix suggestions."""
+        """Apply the auto-repair every suggestion here leans on."""
         logger.info("Applying all fixes...")
-        
-        # For now, we'll just run auto-repair as a catch-all
-        # Running multiple fixes sequentially is complex without a proper pipeline
-        
+
         if not self.current_model_path:
             return
-            
-        reply = QMessageBox.question(self, "Fix All", 
-                                   "This will run an auto-repair sequence (Close Holes, Remove Duplicates, Remove Degenerate). Continue?",
+
+        reply = QMessageBox.question(self, "Fix All",
+                                   FIX_ALL_ASK,
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                                    
         if reply != QMessageBox.StandardButton.Yes:
@@ -590,9 +653,9 @@ class QualityAnalyzerUI(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         
-        def worker_func(processor, path):
-            output_path = path.replace('.', '_fixed_all.')
-            return processor.repair(path, output_path, operation='auto')
+        def worker_func(processor, path, progress_callback=None):
+            return apply_fix_action(processor, path, 'repair_mesh',
+                                    fix_output_path(path, 'fixed_all'))
             
         worker = Worker(worker_func, self.processor, self.current_model_path)
         
@@ -600,13 +663,22 @@ class QualityAnalyzerUI(QWidget):
             self.progress_bar.setVisible(False)
             if result['success']:
                 output_path = result['output_path']
-                QMessageBox.information(self, "Success", f"Auto-repair complete!\nSaved to: {output_path}")
+                # The engine's own sentences: what it removed, not what it was asked to.
+                steps = '\n'.join(result.get('operations') or [])
+                QMessageBox.information(self, "Success",
+                                        f"Auto-repair complete!\nSaved to: {output_path}"
+                                        + (f"\n\n{steps}" if steps else ""))
                 
-                # Mark all as applied (visual only)
+                # Mark only the rows auto_repair carried out; a UV or remesh suggestion
+                # is not done because a hole got closed, and stays in the list unmarked.
                 for i in range(self.suggestions_list.count()):
                     item = self.suggestions_list.item(i)
                     suggestion = item.data(Qt.ItemDataRole.UserRole)
-                    item.setText(f"{suggestion['title']} (Applied)")
+                    if not suggestion:
+                        continue
+                    if suggestion.get('fix_action') not in QualityAnalyzer.FIX_ALL_COVERS:
+                        continue
+                    item.setText(f"{suggestion.get('title', 'Fix')} (Applied)")
                     item.setForeground(QColor("#2ed573"))
                 
                 self.fix_all_btn.setEnabled(False)
@@ -621,7 +693,9 @@ class QualityAnalyzerUI(QWidget):
                 QMessageBox.warning(self, "Error", result.get('error', 'Unknown error'))
                 
         worker.signals.result.connect(on_result)
+        worker.signals.error.connect(self.on_fix_failed)
         self.threadpool.start(worker)
+
     def show_comparison(self):
         """Show before/after comparison."""
         if not self.current_model_path:
@@ -632,21 +706,26 @@ class QualityAnalyzerUI(QWidget):
         dialog = ComparisonDialog(original, self.current_model_path, self.analyzer, self)
         dialog.exec()
     def export_report(self):
-        """Export quality report to HTML."""
+        """Export the analysis on screen as an HTML report."""
         if not self.analysis_result or not self.current_model_path:
             return
-        
+
         output_path = Path(self.current_model_path).with_suffix('.quality_report.html')
-        
+
         try:
+            # batch shape: the report reads {model path: analysis}, not one analysis.
             self.analyzer.export_quality_report(
-                self.analysis_result,
-                str(output_path),
-                self.current_model_path
-            )
-            logger.info(f"Quality report exported to: {output_path}")
+                {self.current_model_path: self.analysis_result}, str(output_path))
         except Exception as e:
+            QMessageBox.warning(self, "Export Failed",
+                                f"No report was written to {output_path}: "
+                                f"{type(e).__name__}: {e}")
             logger.error(f"Failed to export report: {e}")
+            return
+
+        QMessageBox.information(self, "Report Exported",
+                                f"Quality report written to: {output_path}")
+        logger.info(f"Quality report exported to: {output_path}")
 
 
 if __name__ == "__main__":

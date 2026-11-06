@@ -71,7 +71,25 @@ class QualityAnalyzer:
             'requires_watertight': True
         }
     }
-    
+
+    # The fix names the Quality pane applies with one double-click. The pane builds its
+    # dispatch table from this tuple, so a name cannot be promised here and refused there.
+    ONE_CLICK_FIXES = ('repair_mesh', 'merge_vertices', 'remove_degenerate_faces',
+                       'fix_normals', 'remesh', 'generate_uvs', 'pack_uvs')
+    # Two of the nine names have a real backend, but in another pane, behind controls this
+    # list has no room for. They say where to go instead of pretending not to exist.
+    OWNED_ELSEWHERE = {
+        'generate_lods': 'LOD levels are written by the Pre-Processing pane, which owns '
+                         'the level-count controls this fix needs',
+        'resize_texture': 'texture resolution is rewritten by the Pre-Processing pane\'s '
+                          'texture optimizer, which owns the quality and format controls '
+                          'this fix needs',
+    }
+    # The subset of the above that auto_repair (mesh_processor.py:811) provably runs: weld
+    # duplicate vertices, drop null/folded/duplicate faces. Fix All marks only these rows,
+    # so a suggestion it did not carry out still stands in the list.
+    FIX_ALL_COVERS = ('repair_mesh', 'merge_vertices', 'remove_degenerate_faces')
+
     def __init__(self):
         """Initialize Quality Analyzer."""
         self.issue_fixes = self._load_fix_mappings()
@@ -109,8 +127,12 @@ class QualityAnalyzer:
                     return {
                         'score': 0,
                         'grade': 'F',
-                        'issues': ['Empty scene (no geometry found)'],
-                        'suggestions': ['Check model export settings'],
+                        'issues': [{'severity': 'critical', 'type': 'empty_scene',
+                                    'message': 'Empty scene (no geometry found)'}],
+                        'suggestions': [{'issue_type': 'empty_scene',
+                                         'description': 'Check model export settings',
+                                         'one_click': False, 'other_pane': None,
+                                         'priority': 'critical'}],
                         'metrics': {},
                         'standards_compliance': {}
                     }
@@ -485,8 +507,8 @@ class QualityAnalyzer:
                     'issue_type': issue['type'],
                     'fix_action': fix_type,
                     'description': self.issue_fixes.get(fix_type, 'Manual fix required'),
-                    'one_click': fix_type in ['repair_mesh', 'merge_vertices', 'generate_lods', 
-                                              'remove_degenerate_faces', 'fix_normals'],
+                    'one_click': fix_type in self.ONE_CLICK_FIXES,
+                    'other_pane': self.OWNED_ELSEWHERE.get(fix_type),
                     'priority': issue['severity']
                 }
                 suggestions.append(suggestion)
@@ -551,7 +573,8 @@ class QualityAnalyzer:
             'remove_degenerate_faces': 'Remove zero-area triangles',
             'fix_normals': 'Recalculate and fix face normals',
             'generate_uvs': 'Generate UV coordinates automatically',
-            'normalize_uvs': 'Scale UVs to fit within 0-1 range',
+            'pack_uvs': 'Re-project UVs into one atlas with a border, replacing the '
+                        'coordinates that lie outside [0, 1]',
             'generate_lods': 'Generate LOD levels for better performance',
             'remesh': 'Remesh to improve triangle quality',
             'resize_texture': 'Resize textures to target resolution'
@@ -599,7 +622,11 @@ class QualityAnalyzer:
             results: Results from batch_analyze()
             output_path: Path to save HTML report
         """
-        html = """
+        # The style block is kept as a literal and the count is substituted outside it:
+        # this template used to end in `.format(len(results))`, and every CSS rule in it
+        # is a brace, so the call raised KeyError: ' font-family' before the first line
+        # was written. The report had never existed.
+        head = """
         <!DOCTYPE html>
         <html>
         <head>
@@ -627,17 +654,23 @@ class QualityAnalyzer:
             </style>
         </head>
         <body>
+        """
+        html = head + f"""
             <div class="header">
-                <h1>🎯 Quality Analysis Report</h1>
-                <p>Total models analyzed: {}</p>
+                <h1>Quality Analysis Report</h1>
+                <p>Total models analyzed: {len(results)}</p>
             </div>
-        """.format(len(results))
+        """
         
         for model_path, analysis in results.items():
+            model_name = Path(model_path).name
             if 'error' in analysis:
+                # The count above already includes this model, so the report says what
+                # happened to it instead of ending up with fewer cards than it promised.
+                html += (f'<div class="model-card"><h2>{model_name}</h2>'
+                         f'<p>Could not be analyzed: {analysis["error"]}</p></div>')
                 continue
             
-            model_name = Path(model_path).name
             score = analysis['score']
             grade = analysis['grade']
             issues = analysis.get('issues', [])
@@ -664,7 +697,7 @@ class QualityAnalyzer:
                         <strong>Vertices:</strong> {metrics.get('vertex_count', 0):,}
                     </div>
                     <div class="metric">
-                        <strong>Watertight:</strong> {'✅ Yes' if metrics.get('is_watertight') else '❌ No'}
+                        <strong>Watertight:</strong> {'Yes' if metrics.get('is_watertight') else 'No'}
                     </div>
                 </div>
                 
@@ -677,7 +710,7 @@ class QualityAnalyzer:
                     message = issue.get('message', '')
                     html += f'<div class="issue {severity}"><strong>{severity.upper()}:</strong> {message}</div>'
             else:
-                html += '<p style="color: #27ae60;">✅ No issues detected! Model is production-ready.</p>'
+                html += '<p style="color: #27ae60;">No issues detected against these checks.</p>'
             
             html += "</div>"
         

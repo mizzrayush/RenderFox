@@ -1431,12 +1431,28 @@ class MeshUV:
     }
 
     @staticmethod
+    def read_unprocessed(mesh_path: str):
+        """The one mesh in a file, exactly as it is stored.
+
+        A textured .obj written by PyMeshLab names a material sidecar, and this reader
+        hands such a file back as a scene - so counting texture coordinates or painting
+        over them has to reach inside it first, or the answer is about the wrapper.
+        """
+        mesh = trimesh.load(mesh_path, process=False)
+        if isinstance(mesh, trimesh.Scene):
+            meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            if not meshes:
+                raise ValueError('File contains no triangle mesh')
+            mesh = trimesh.util.concatenate(meshes)
+        return mesh
+
+    @staticmethod
     def uv_rows(mesh_path: str) -> Optional[int]:
         """Texture-coordinate rows in the file as an exporter would read it, or None."""
         if not TRIMESH_AVAILABLE:
             return None
         try:
-            mesh = trimesh.load(mesh_path, process=False)
+            mesh = MeshUV.read_unprocessed(mesh_path)
         except Exception:
             return None
         coords = getattr(mesh.visual, 'uv', None)
@@ -1454,7 +1470,7 @@ class MeshUV:
             return {'success': False, 'error': 'Trimesh not available'}
         try:
             before = MeshUV.uv_rows(mesh_path)
-            mesh = trimesh.load(mesh_path, process=False)
+            mesh = MeshUV.read_unprocessed(mesh_path)
             mesh.visual = trimesh.visual.TextureVisuals()
             mesh.export(output_path)
             after = MeshUV.uv_rows(output_path)
