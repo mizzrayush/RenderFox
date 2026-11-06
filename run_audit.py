@@ -191,7 +191,14 @@ SUITES = [
         "id": "run_teardown_contract",
         "name": "Run Teardown Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_run_teardown_contract.py")],
-        "description": "Asks the two close-over-a-live-run questions in a process that never starts a run, so a defect that Qt otherwise answers with an access violation or a fail-fast arrives as a named test: a runner with nothing connected silences to nothing rather than raising out of closeEvent, and every run a pane keeps is filed in the bucket its shutdown_runs drains and emptied by it - both of the Diagnostics lists included",
+        "description": "Asks the close-over-a-live-run questions where nothing enters a C++ frame, so a defect Qt otherwise answers with an access violation or a fail-fast arrives as a named test: a runner with nothing connected silences to nothing rather than raising out of closeEvent, every run a pane keeps is filed in the bucket its shutdown_runs drains and emptied by it - both of the Diagnostics lists included - and the Automation pane's plain worker is filed, joined, silenced and pruned by the pane that started it",
+        "timeout_seconds": 180
+    },
+    {
+        "id": "download_teardown_contract",
+        "name": "AI Model Manager Teardown Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_download_teardown_contract.py")],
+        "description": "The two holders the widget-tree walk cannot reach, asked against a fake hub that records instead of downloading: the manager's own QThread is held, silenced and released by the dialog that started it - a stop asked at the step boundary means the second step never starts - the way out of the dialog is done() rather than a caller that remembers to ask, and the Settings pane opens the manager as its own child and keeps it, so the close walk can see a run that lives in a dialog",
         "timeout_seconds": 180
     },
     {

@@ -1727,6 +1727,26 @@ class AutomationEngine(QObject):
         self.task_completed.emit(task_id, success, result)
         return success
 
+    def run_task(self, task_id: str) -> bool:
+        """Start one task on a worker thread the close can wait for.
+
+        `execute_task` is the whole verb, and a run begun off the interface belongs in the
+        same list every other run this engine starts is in: `stop` joins exactly
+        `_worker_threads`, and `live_work` is what the close asks before it cuts anything
+        off. Claimed here rather than on the thread for the reason `run_batch` gives - the
+        button can be pressed twice before a thread has had a chance to run. A disabled task
+        is refused by `execute_task` before it claims any status, so this claims none either:
+        a run that never started must not be left looking, to `live_work` and to the row,
+        like it is still going.
+        """
+        task = self.tasks.get(task_id)
+        if task is None or task.status is TaskStatus.RUNNING:
+            return False
+        if task.enabled:
+            task.status = TaskStatus.RUNNING
+        self._spawn(self.execute_task, (task_id,))
+        return True
+
     def schedule_task(self, task_id: str, schedule_time: str) -> bool:
         """Put an existing task on the scheduler and remember when it is due."""
         task = self.tasks.get(task_id)

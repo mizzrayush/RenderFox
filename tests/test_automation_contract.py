@@ -586,11 +586,18 @@ class AutomationTabCase(unittest.TestCase):
         self.assertIn('is not a file', missing)
 
     def test_23_results_from_the_worker_land_in_the_log(self):
-        """The worker may not touch the log; it emits, and the slot writes."""
+        """The worker may not touch the log; it emits, and the slot writes.
+
+        The run is also filed in the list the pane's own close waits on: a thread started
+        beside it is a run no close can ever join, and its action would keep copying files
+        after the window was gone.
+        """
         self.tab.auto_import_cb.setChecked(False)
         self.tab.auto_backup_cb.setChecked(True)
         source = self.write('threaded.obj')
         self.tab._run_auto_actions(source)
+        self.assertEqual(1, len(self.tab._action_threads),
+                         'the Auto Actions worker was started where no list holds it')
         self.assertTrue(self.spin(lambda log: 'auto backup' in log), msg=self.log())
 
     def test_24_timestamped_lines_survive_the_datetime_import(self):

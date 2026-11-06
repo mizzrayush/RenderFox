@@ -806,10 +806,15 @@ class TestAllTabsHeadless(unittest.TestCase):
         trusting it.
         """
         from PyQt6.QtWidgets import QWidget
+        from src.features.model_downloader import ModelDownloaderDialog
         from src.ui.texture_generator import TextureGeneratorDialog
 
         TextureGeneratorDialog(self.window.rendering_tab)
         TextureGeneratorDialog(self.window)
+        # The AI Model Manager, parented the way the Settings pane parents it. Parentless, it
+        # is a run the tree cannot see: nothing above it holds the `QThread` inside, so the
+        # close never asks and the reference dies with the local it was made in.
+        ModelDownloaderDialog(self.window.settings_tab, auto_start=False)
 
         holders = [pane for pane in [self.window] + self.window.findChildren(QWidget)
                    if hasattr(pane, 'shutdown_runs')]
@@ -819,6 +824,9 @@ class TestAllTabsHeadless(unittest.TestCase):
         self.assertEqual(2, len(dialogs),
                          'the two dialogs were not both found as children of this window, so '
                          'the test cannot ask the walk a question about its scope')
+        managers = [pane for pane in holders if isinstance(pane, ModelDownloaderDialog)]
+        self.assertEqual(1, len(managers),
+                         'the downloader dialog is not in the tree, so no close can reach it')
 
         asked = []
         originals = {}
@@ -841,7 +849,8 @@ class TestAllTabsHeadless(unittest.TestCase):
         missing = sorted({type(pane).__name__ for pane in holders if pane not in asked})
         self.assertEqual([], missing, 'the close never asked these holders: ' + ', '.join(missing))
         for expected in ('QualityAnalyzerUI', 'UnifiedOpen3DViewer', 'MeshToolsTab',
-                         'TextureGeneratorDialog', 'ModelTab'):
+                         'TextureGeneratorDialog', 'ModelTab', 'ModelDownloaderDialog',
+                         'AutomationTab'):
             self.assertIn(expected, asked_names, f'{expected} is not reached by the close')
         self.assertEqual(2, sum(1 for pane in asked if pane in dialogs),
                          'a holder parented to the window instead of to a tab page was left '

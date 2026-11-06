@@ -706,10 +706,15 @@ class SettingsTab(QWidget):
         layout.addLayout(buttons_layout)
     
     def download_ai_models(self):
-        """Open the AI Model Manager dialog."""
+        """Open the AI Model Manager dialog.
+
+        The dialog is parented so the window's close walk reaches it, and it is kept on the
+        pane rather than in a local: a download that outlasted the dialog's own stop waits
+        inside `thread`, and the reference that holds it has to outlive the call.
+        """
         from ..features.model_downloader import ModelDownloaderDialog
-        dialog = ModelDownloaderDialog(auto_start=False)
-        dialog.exec()
+        self.model_manager = ModelDownloaderDialog(self, auto_start=False)
+        self.model_manager.exec()
 
     def browse_ai_model(self):
         """Browse for local AI model file."""

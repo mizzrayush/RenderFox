@@ -25,6 +25,7 @@ from .icon_provider import get_icon
 # Import automation engine
 from ..features.automation_engine import (
     AutomationEngine, FileWatcher, WorkflowStep, ActionRegistry, TaskStatus)
+from ..utils.run_teardown import drain, silence
 import psutil
 
 
@@ -65,6 +66,7 @@ class AutomationTab(QWidget):
         
         self.watch_requests = {}
         self._library = None
+        self._action_threads = []
         self._task_rows = []
         self.current_task_id = None
         self._rebuilding_list = False
@@ -1606,8 +1608,37 @@ class AutomationTab(QWidget):
         settings = self._auto_action_settings()
         if not any(settings.values()):
             return
-        threading.Thread(target=self._emit_auto_actions, args=(file_path, settings),
-                         daemon=True).start()
+        self._spawn_action_run(file_path, settings)
+
+    def _spawn_action_run(self, file_path, settings):
+        """Start an Auto Actions worker in the list this pane's close waits on.
+
+        The watcher fires on every file it sees, so a list nobody prunes grows for the life
+        of the session; the finished half is dropped each time a new run is filed.
+        """
+        self._action_threads = [one for one in self._action_threads if one.is_alive()]
+        thread = threading.Thread(target=self._emit_auto_actions, args=(file_path, settings),
+                                  daemon=True)
+        self._action_threads.append(thread)
+        thread.start()
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Join the Auto Actions workers this pane started, and take the log off them.
+
+        A plain thread is not a `QObject`, so there is nothing on it to disconnect and no
+        verb on it to ask; the run's only way into the interface is this pane's own
+        `auto_actions_finished`, and that is the channel `silence` takes off here. Dropping
+        one of these while it runs does not end the process - measured, the worker keeps
+        going and its emit raises `RuntimeError: wrapped C/C++ object of type AutomationTab
+        has been deleted` inside the thread - so what the wait protects is the verdict and
+        the file operation behind it: an action cut off mid-copy leaves a backup that is not
+        the model its name claims. A worker that outlasts the wait stays in the list,
+        because a run no object holds is a run no close can ever wait for. Returns the runs
+        still owed.
+        """
+        owed = drain(self._action_threads, timeout_ms)
+        silence(self)
+        return len(owed)
 
     def _emit_auto_actions(self, file_path, settings):
         try:
@@ -2273,13 +2304,13 @@ class AutomationTab(QWidget):
             + (f"on the schedule {spec}." if spec else "and only when you press Run Now."))
 
     def run_task_now(self):
-        """Run the selected task on a worker thread; the verdict comes back by signal."""
+        """Run the selected task on an engine worker thread; the verdict comes back by signal."""
         task_id = self._selected_task_id()
         if task_id is None:
             QMessageBox.warning(self, "Warning", "Select a task in the list first.")
             return
-        threading.Thread(target=self.automation_engine.execute_task,
-                         args=(task_id,), daemon=True).start()
+        if not self.automation_engine.run_task(task_id):
+            QMessageBox.warning(self, "Warning", "That task is already running.")
 
 
     def add_watch_folder(self):

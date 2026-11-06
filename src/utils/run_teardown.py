@@ -13,6 +13,8 @@ adds later - and a forgotten one is exactly the one that arrives after the windo
 gone.
 """
 
+import threading
+
 from PyQt6.QtCore import QObject, QThread
 
 # Qt's own housekeeping. `finished` is deliberately NOT here: a pane connects its own
@@ -99,14 +101,20 @@ def ask_to_stop(runner) -> bool:
 def wait_for_runs(runners, timeout_ms: int = 5000, pool=None):
     """Split the runners into the ones that ended and the ones that did not.
 
-    Threads are waited on one at a time. A pool is waited on as a pool, because that is
-    the question `QThreadPool` answers - and a caller that hands over pool work with no
-    pool cannot be told it finished, so that work comes back as still running.
+    Threads are waited on one at a time, and both kinds are asked: a `QThread` answers
+    `wait`, and a plain `threading.Thread` - which is what the Automation pane's Auto
+    Actions worker is - answers `join`, in seconds rather than milliseconds. A pool is
+    waited on as a pool, because that is the question `QThreadPool` answers - and a caller
+    that hands over pool work with no pool cannot be told it finished, so that work comes
+    back as still running.
     """
     ended, running = [], []
     for runner in list(runners):
         if isinstance(runner, QThread):
             (ended if runner.wait(timeout_ms) else running).append(runner)
+        elif isinstance(runner, threading.Thread):
+            runner.join(timeout_ms / 1000)
+            (running if runner.is_alive() else ended).append(runner)
         elif pool is not None:
             (ended if pool.waitForDone(timeout_ms) else running).append(runner)
         else:

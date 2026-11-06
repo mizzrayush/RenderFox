@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
+from ..utils.run_teardown import drain_attributes
+
 class ModelDownloaderThread(QThread):
     progress_update = pyqtSignal(int, str)
     finished = pyqtSignal()
@@ -19,6 +21,16 @@ class ModelDownloaderThread(QThread):
         super().__init__()
         self.download_sd = download_sd
         self.download_clip = download_clip
+        self._stop_requested = False
+
+    def request_stop(self):
+        """Give up at the next step boundary.
+
+        One `hf_hub_download` call cannot be interrupted from outside, so this is the only
+        stop a close can ask of a download: the step already in flight runs to its end and
+        the step after it is never started.
+        """
+        self._stop_requested = True
 
     def run(self):
         try:
@@ -31,7 +43,7 @@ class ModelDownloaderThread(QThread):
             if total_steps == 0:
                 self.finished.emit()
                 return
-            
+
             if getattr(sys, 'frozen', False):
                 base_dir = os.path.dirname(os.path.abspath(sys.executable))
             else:
@@ -40,7 +52,7 @@ class ModelDownloaderThread(QThread):
             current_step = 0
             
             # 1. Download Stable Diffusion 1.5 (Single File)
-            if self.download_sd:
+            if self.download_sd and not self._stop_requested:
                 self.progress_update.emit(int((current_step / total_steps) * 100), "Downloading Stable Diffusion 1.5...")
                 
                 sd_dir = os.path.join(base_dir, "ai_models", "sd-v1-5")
@@ -61,7 +73,7 @@ class ModelDownloaderThread(QThread):
                 current_step += 1
 
             # 2. Download OpenAI CLIP (Repo Snapshot)
-            if self.download_clip:
+            if self.download_clip and not self._stop_requested:
                 self.progress_update.emit(int((current_step / total_steps) * 100), "Downloading OpenAI CLIP Model...")
                 
                 clip_dir = os.path.join(base_dir, "OPENai Clip")
@@ -85,7 +97,11 @@ class ModelDownloaderThread(QThread):
                     allow_patterns=allow_patterns
                 )
                 current_step += 1
-            
+
+            if self._stop_requested:
+                self.progress_update.emit(0, "Download stopped.")
+                return
+
             self.progress_update.emit(100, "All downloads complete!")
             self.finished.emit()
             
@@ -93,8 +109,9 @@ class ModelDownloaderThread(QThread):
             self.error_occurred.emit(str(e))
 
 class ModelDownloaderDialog(QDialog):
-    def __init__(self, auto_start=True):
-        super().__init__()
+    def __init__(self, parent=None, auto_start=True):
+        super().__init__(parent)
+        self.thread = None
         self.setWindowTitle("AI Model Manager")
         self.setFixedSize(400, 250)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
@@ -184,3 +201,29 @@ class ModelDownloaderDialog(QDialog):
         self.chk_clip.setEnabled(True)
         if self.auto_start:
             self.reject()
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Ask the download to give up at its next step, silence it, and wait.
+
+        `progress_update` writes the bar and the status label, `finished` paints the
+        completion text and re-enables the buttons, and `error_occurred` opens a message box
+        against this dialog - so a step that answers after the dialog is gone writes widgets
+        Qt has destroyed. One `hf_hub_download` call cannot be interrupted from outside, so
+        the wait can legitimately time out; what then matters is that `thread` keeps the
+        reference, because dropping the last one of a running `QThread` was measured here to
+        end the process at the drop itself (`0xc0000409`, which Git Bash reports as exit 127),
+        while dropping a finished one survived. Returns the downloads still owed.
+        """
+        return len(drain_attributes(self, ('thread',), timeout_ms))
+
+    def done(self, result):
+        """Stop the download on the way out, whichever way the dialog was closed.
+
+        `accept()` and `reject()` both funnel through `done()`, and the Close button, the
+        title-bar cross, Escape, and the completion and error paths each take one of those
+        two - so this is the one place that can catch a run still in flight. The caller in
+        Settings keeps the dialog referenced after `exec()` returns, so a download that
+        outlasted the wait is still held here, and the window's close asks it again.
+        """
+        self.shutdown_runs()
+        super().done(result)

@@ -594,6 +594,39 @@ class TaskPaneCase(unittest.TestCase):
         self.assertEqual(self.tab.automation_engine.tasks[self.tab.current_task_id].status,
                          TaskStatus.COMPLETED)
 
+    def test_17b_run_now_files_its_thread_where_the_close_waits(self):
+        """A task begun from the pane is joined only if the engine was told about it.
+
+        `engine.stop()` joins exactly `_worker_threads`, and the window's close calls it
+        before it destroys anything; a thread started beside that list keeps writing files
+        after the window is gone, and `live_work` - the question the close asks the user -
+        would not have named it. The command sleeps, so the run is certainly still in flight
+        when the filing is read, and a second press meets a task the engine already holds.
+        """
+        engine = self.tab.automation_engine
+        self.fill(name='Sleeper', schedule='Hourly', action_id='system.run_command')
+        self.tab.task_actions_edit.setPlainText(
+            json.dumps({'command': f'"{sys.executable}" -c "import time; time.sleep(3)"'}))
+        self.tab.save_task_btn.click()
+        self.tab.scheduled_tasks_table.selectRow(0)
+        task_id = self.tab.current_task_id
+
+        self.tab.run_now_btn.click()
+        self.assertEqual(1, len(engine._worker_threads),
+                         'Run Now started a thread no code can join')
+        self.assertEqual(["task 'Sleeper'"], engine.live_work(),
+                         'the close asks `live_work` before it cuts anything off, and it is '
+                         'being told nothing is running')
+        self.popups.clear()
+        self.tab.run_now_btn.click()
+        self.assertEqual(1, len(engine._worker_threads),
+                         'a second press started a second thread for the same task')
+        self.assertTrue(any(kind == 'warning' for kind, _ in self.popups),
+                        f'the refused press said nothing: {self.popups}')
+        self.assertTrue(self.spin(
+            lambda: engine.tasks[task_id].status is TaskStatus.COMPLETED),
+                        f'the task never finished: {self.activity()}')
+
     def test_18_a_failing_action_is_reported_as_a_failure(self):
         gone = os.path.join(self.work, 'not_here.obj')
         self.fill(name='Copy of nothing',
@@ -622,6 +655,9 @@ class TaskPaneCase(unittest.TestCase):
         self.assertTrue(self.spin(lambda: 'disabled' in ' '.join(self.activity())),
                         self.activity())
         self.assertIsNone(self.tab.automation_engine.next_run(task_id))
+        self.assertEqual([], self.tab.automation_engine.live_work(),
+                         'the refused run left its task in `live_work`, so the next close asks '
+                         'the user whether to cut off something that never started')
 
     def test_21_enable_and_disable_move_the_row_and_the_schedule(self):
         self.fill(schedule='Hourly')
