@@ -42,6 +42,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -59,6 +60,7 @@ from src.features.performance_analyzer import (
     LIMITS, SCORE_WEIGHTS, BenchmarkHistory, BenchmarkRunner, BottleneckDetector,
     FunctionProfiler, OptimizationSuggester, PerformanceAnalyzer, PerformanceLogger,
     PerformanceMetrics, PerformanceMonitor, ProfileResult, benchmark_engine, data_dir)
+from src.features import performance_analyzer as ANALYZER
 from src.utils.frame_clock import FrameClock, shared_clock
 
 PANE = os.path.join(ROOT, 'src', 'ui', 'performance_tab.py')
@@ -163,6 +165,14 @@ class Test01LiveSample(unittest.TestCase):
         self.assertIsNone(sample.gpu_load_percent)
         self.assertIsNone(sample.gpu_memory_percent)
         self.assertIn('GPU reader', sample.not_read['gpu_load_percent'])
+        # The sentence has to name the absence. A monitor that reached for a reader it was
+        # never given gets a `TypeError` from the call, and that reads as a broken adapter.
+        for field in ('gpu_load_percent', 'gpu_memory_percent'):
+            reason = sample.not_read[field]
+            self.assertIn('not given a GPU reader', reason,
+                          f'{field} was explained as {reason!r}')
+            self.assertNotIn('raised', reason,
+                             'no reader was reported as a reader that failed')
         self.assertNotIn(0.0, (sample.gpu_load_percent, sample.gpu_memory_percent),
                          'an unread adapter was reported as an idle one')
 
@@ -217,6 +227,70 @@ class Test01LiveSample(unittest.TestCase):
         self.assertEqual(1, len(self.monitor.metrics_history))
         self.assertEqual(1, len(seen), 'the pane is never told a sample happened')
         self.assertIn('not_read', seen[0], 'the dictionary painted has no room for reasons')
+
+
+class Test10bCpuPriming(unittest.TestCase):
+    """The prime is one call nobody can see in the figure it protects.
+
+    `psutil.cpu_percent(interval=None)` answers 0.0 on the very first call in a process and
+    the share of the time since its previous call on every one after. So a monitor that
+    forgets to prime reports "0.0 % busy" for a machine it measured for no time at all, and
+    the number is a float, in range, and wrong. This class hands the module a psutil that
+    behaves exactly as its own documentation says - silence first, a figure afterwards - so
+    the prime is proved by the reading it makes possible rather than by grepping the call.
+    """
+
+    class _Psutil:
+        def __init__(self):
+            self.system_reads = 0
+            self.process_reads = 0
+
+        def cpu_percent(self, interval=None):
+            self.system_reads += 1
+            return 0.0 if self.system_reads == 1 else 42.0
+
+        def virtual_memory(self):
+            return SimpleNamespace(percent=20.0, used=4 * 1024 ** 3, available=8 * 1024 ** 3)
+
+        def Process(self, pid):
+            outer = self
+
+            class _Process:
+                def cpu_percent(self, interval=None):
+                    outer.process_reads += 1
+                    return 0.0 if outer.process_reads == 1 else 17.0
+
+                def memory_info(self):
+                    return SimpleNamespace(rss=300 * 1024 ** 2)
+
+            return _Process()
+
+    def setUp(self):
+        self.fake = Test10bCpuPriming._Psutil()
+        self.real = ANALYZER.psutil
+        ANALYZER.psutil = self.fake
+        self.monitor = PerformanceMonitor(clock=FrameClock())
+
+    def tearDown(self):
+        self.monitor.stop_monitoring()
+        ANALYZER.psutil = self.real
+
+    def test_10b_starting_the_monitor_primes_the_machine_reader(self):
+        self.monitor.start_monitoring(interval_ms=1000)
+        time.sleep(0.02)
+        sample = self.monitor.sample()
+        self.assertGreaterEqual(self.fake.system_reads, 2,
+                                'the sample was the first call, so it covered nothing')
+        self.assertEqual(42.0, sample.cpu_percent,
+                         'the figure reported was psutil\'s meaningless first answer')
+
+    def test_10c_starting_the_monitor_primes_this_process_reader(self):
+        self.monitor.start_monitoring(interval_ms=1000)
+        time.sleep(0.02)
+        sample = self.monitor.sample()
+        self.assertGreaterEqual(self.fake.process_reads, 2,
+                                'this process was never primed before it was read')
+        self.assertEqual(17.0, sample.process_cpu_percent)
 
 
 class Test11GpuReader(unittest.TestCase):
@@ -1050,6 +1124,26 @@ class Test85TheWords(unittest.TestCase):
         self.assertIn('BenchmarkRunner.describe(', source(DIAG_FILE),
                       'the Diagnostics pane is wording a benchmark sentence itself')
 
+    def test_91b_the_alias_verb_that_no_pane_could_call_is_gone(self):
+        """`run(kind)` is the only door to the work; an alias beside it is a second name.
+
+        The runner used to hold `run_cpu_benchmark`, whose name matched the pane button's
+        own method, which is how it looked used. Every call site in the app resolves to
+        `engine.run(` or `engine.run_all(`, and the CPU button reaches the same work
+        through `start_benchmark('cpu')`, so the alias only offered a second way to time
+        one machine - and the second way had no progress argument, no record flag and no
+        test.
+        """
+        self.assertNotIn('def run_cpu_benchmark', code_of(ENGINE_FILE),
+                         'a second name for the cpu work is back, and nothing calls it')
+        self.assertNotIn('benchmark.run_cpu', source(PANE),
+                         'the pane reached around the engine again')
+        for call in ('engine.run(', 'engine.run_all('):
+            self.assertIn(call, source(PANE), f'{call} is how the pane times work')
+        self.assertIn('def run_gpu_benchmark', code_of(ENGINE_FILE),
+                      'the gpu verb answers the label the Geometry button used to carry; '
+                      'test_79 is what keeps it honest')
+
 
 class Test92PerformanceAnalyzer(unittest.TestCase):
     """The object the pane asks, which must never invent a field it was not given."""
@@ -1188,18 +1282,24 @@ class Test97PerformancePane(unittest.TestCase):
         return engine
 
     def spy_progress_bar(self):
-        """Record every value the pane delivers to the bar, in order.
+        """Record every value the pane delivers to the bar, and the range it landed in.
 
-        The bar is read at the end of a run, by which time `finish_benchmark` has
-        stamped it full - so what the engine reported mid-run can only be proved by
-        watching the calls as they arrive.
+        The bar is read at the end of a run, by which time `finish_benchmark` has stamped
+        it full - so what the engine reported mid-run, and the range that report arrived
+        in, can only be proved by watching the calls as they come in. Qt throws away the
+        number while minimum equals maximum, and the bar keeps looking exactly as it did.
         """
-        painted = []
+        class Painted(list):
+            """The values in order, and beside each one the maximum the bar had then."""
+
+        painted = Painted()
+        painted.ranges = []
         bar = self.tab.benchmark_progress
         real = bar.setValue
 
         def record(value):
             painted.append(value)
+            painted.ranges.append(bar.maximum())
             real(value)
 
         bar.setValue = record
@@ -1271,6 +1371,9 @@ class Test97PerformancePane(unittest.TestCase):
                          self.tab.performance_analyzer.benchmark.gave_a_progress_callback,
                          'the engine was given no way to report progress')
         self.assertIn(37, painted, 'what the engine reported never reached the bar')
+        self.assertEqual([100] * len(painted), painted.ranges,
+                         'a percentage was reported into a bar whose maximum was 0, and Qt '
+                         'throws those away while `finish_benchmark` fixes the range later')
         self.assertEqual(0, painted[0], 'the bar was not emptied before the work started')
         self.assertEqual(100, painted[-1], 'the run did not end with a full bar')
         self.assertEqual((0, 100), (self.tab.benchmark_progress.minimum(),
@@ -1334,6 +1437,8 @@ class Test97PerformancePane(unittest.TestCase):
                          'the four kinds were started with no way to report progress')
         self.assertEqual(0, painted[0], 'the bar was not emptied before the four kinds')
         self.assertIn(37, painted, 'what the run reported never reached the bar')
+        self.assertEqual([100] * len(painted), painted.ranges,
+                         'the four kinds reported progress into a bar that discarded it')
 
     def test_106_the_pane_holds_no_number_and_no_verdict_of_its_own(self):
         """The engine owns the figures and the words; the pane only paints them."""
@@ -1357,6 +1462,42 @@ class Test97PerformancePane(unittest.TestCase):
             for claim in RATINGS:
                 self.assertNotIn(claim, ast.unparse(body),
                                  f'{name} grades this machine as {claim!r}')
+
+    def test_106b_the_detect_button_works_on_a_thread_that_can_take_the_callback(self):
+        """The house `Worker` always passes `progress_callback`; this button's function takes it.
+
+        Two of the pane's four worker functions had no test reaching them at all, and the
+        sweep found it by mutating the wrong one. Pressing Detect is the only way the
+        adapter row is ever filled, so a signature it cannot honour has to show up here as
+        a failed test rather than as a panel that says nothing.
+        """
+        self.tab.detect_gpu_btn.setEnabled(True)
+        self.tab.gpu_info_display.setPlainText('')
+        self.tab.detect_gpu_hardware()
+        self.assertFalse(self.tab.detect_gpu_btn.isEnabled(),
+                         'the button was left clickable during its own run')
+        self.assertTrue(self.pump(
+            until=lambda: (self.tab.gpu_info_display.toPlainText() != ''
+                           and self.tab.detect_gpu_btn.isEnabled())))
+        text = self.tab.gpu_info_display.toPlainText()
+        self.assertNotIn('Machine reader failed', text,
+                         f'the adapter worker died instead of answering: {text}')
+        self.assertNotIn('Asking Windows', text, 'the placeholder never left the panel')
+        self.assertTrue(text.strip(), 'an empty panel is not an adapter report')
+
+    def test_106c_the_storage_rows_are_filled_on_a_thread_that_can_take_the_callback(self):
+        """The same signature rule on the volume reader, whose answer the Storage rows show."""
+        self.tab.storage_total_label.setText('-')
+        self.tab.refresh_storage_info()
+        self.assertTrue(self.pump(
+            until=lambda: isinstance(self.tab.storage_info, dict)
+                          and self.tab.storage_total_label.text() != '-'))
+        shown = ' | '.join(label.text() for label in (
+            self.tab.storage_total_label, self.tab.storage_used_label,
+            self.tab.storage_free_label, self.tab.storage_type_label))
+        self.assertNotIn('reader failed', shown,
+                         f'the volume worker died instead of answering: {shown}')
+        self.assertIn('GB', self.tab.storage_total_label.text())
 
 
 class Test107MetricsShape(unittest.TestCase):

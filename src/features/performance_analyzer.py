@@ -1000,11 +1000,8 @@ class BenchmarkRunner:
                        if per_second else {},
         }
 
-    # The verbs the panes call, kept as the four kinds above so there is one engine
-    # and one set of names for it.
-    def run_cpu_benchmark(self, duration: float = 2.0) -> Dict[str, Any]:
-        return self.cpu_benchmark(duration=duration)
-
+    # The one verb that is not a kind, kept because it answers the label the Geometry
+    # button used to carry. The kinds themselves are reached only through `run`/`run_all`.
     def run_gpu_benchmark(self) -> Dict[str, Any]:
         return self._refusal(
             'gpu', 'there is no GPU benchmark to run: the work this app can time is '
