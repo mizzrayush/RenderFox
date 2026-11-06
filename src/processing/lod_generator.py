@@ -283,6 +283,17 @@ class LODGenerator:
             print(f"Warning: Post-processing failed: {str(e)}")
             return mesh
     
+    @property
+    def lod_ratios(self) -> List[float]:
+        """The fraction of the faces each level is aimed at, in level order.
+
+        Public because a caller has to be able to say what it asked for before it reports
+        what it got: the Pipeline's Generate LOD node names these numbers next to the face
+        counts it measured off each written file, and a list it could not read would have to
+        be re-derived by guessing at `_get_lod_ratios`'s branches.
+        """
+        return self._get_lod_ratios()
+
     def _get_lod_ratios(self) -> List[float]:
         """Get the reduction ratios for each LOD level."""
         # Use custom ratios if provided and length matches levels

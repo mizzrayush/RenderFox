@@ -2722,15 +2722,23 @@ class LibraryTab(QWidget):
         self.model_selected.emit(model_path)
     
     def _open_in_pipeline(self, model_path: str, dialog):
-        """Open in Pipeline tab."""
-        dialog.close()
-        # Get main window
-        parent = self.parent()
-        while parent and not hasattr(parent, 'pipeline_tab'):
-            parent = parent.parent()
-        
-        if parent:
-            parent.tab_widget.setCurrentWidget(parent.pipeline_tab)
+        """Hand the file to the Pipeline pane as a Load node it can be wired from.
+
+        This button says "Use in Pipeline" and used to only switch tabs, which left the
+        person on an empty graph with a path nowhere in it. The pane now takes the file,
+        puts the matching Load node on the canvas, and says what to do next.
+        """
+        dialog.accept()
+        main_window = self.window()
+        pipeline_tab = getattr(main_window, 'pipeline_tab', None)
+        if pipeline_tab is None or not hasattr(main_window, 'tab_widget'):
+            return
+        main_window.tab_widget.setCurrentWidget(pipeline_tab)
+        if not hasattr(pipeline_tab, 'accept_model_file'):
+            QMessageBox.warning(self, "Pipeline cannot take this file",
+                                "The Pipeline pane has no handoff in this build.")
+            return
+        pipeline_tab.accept_model_file(model_path)
     
     def _open_in_batch_operations(self, model_path: str, dialog):
         """Hand the file to Automation's Batch Operations pane.

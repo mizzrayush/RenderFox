@@ -153,6 +153,13 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "pipeline_contract",
+        "name": "Pipeline Engine and Pane Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_pipeline_contract.py")],
+        "description": "Runs the 26 node types on the real backends and requires every verdict on screen to be the engine's own: files that exist and measure back, the four source and three destination refusals named, extremes passed to the filter instead of clamped by the widget, a stop that says where it stopped, a pipeline file loaded without being rewritten, and a pane that builds a control for every knob, holds its worker, and never computes a number of its own",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

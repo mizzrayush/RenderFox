@@ -87,7 +87,7 @@ class MainWindow(QMainWindow):
         self.performance_tab = PerformanceTab()
         self.diagnostics_tab = DiagnosticsTab()
         self.scripting_tab = ScriptingTab(main_window=self)
-        self.pipeline_tab = PipelineEditorTab(self.job_manager)
+        self.pipeline_tab = PipelineEditorTab()
         self.animation_tab = AnimationTab()
         self.rendering_tab = RenderingTab()
         self.settings_tab = SettingsTab()

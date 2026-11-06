@@ -435,10 +435,19 @@ class MeshSimplifier:
 
     @staticmethod
     def planar_simplify(mesh_path: str, output_path: str, target_faces: int,
-                        angle_threshold: float = 1.0) -> Dict[str, Any]:
-        """Collapse aggressively on flat regions, keeping faces that span sharp angles."""
+                        angle_threshold: float = 1.0, preserve_border: bool = False,
+                        preserve_normal: bool = False,
+                        preserve_topology: bool = False) -> Dict[str, Any]:
+        """Collapse aggressively on flat regions, keeping faces that span sharp angles.
+
+        The three `preserve_*` flags go to the same quadric filter this calls; they are here
+        because the filter takes them and the Simplify node offers them, and a knob that was
+        accepted and dropped on the way down is the thing a person cannot see.
+        """
         return MeshSimplifier.simplify_quadric(
             mesh_path, output_path, target_faces,
+            preserve_boundary=preserve_border, preserve_normal=preserve_normal,
+            preserve_topology=preserve_topology,
             planar=True,
             planar_weight=MeshSimplifier._angle_to_planar_weight(angle_threshold),
         )
@@ -1025,71 +1034,275 @@ class MeshTransformer:
             return {'success': False, 'error': str(e)}
 
     @staticmethod
-    def scale(mesh_path: str, output_path: str, scale_factor: float) -> Dict[str, Any]:
-        """Scale mesh uniformly."""
+    def _vector(value, what: str) -> np.ndarray:
+        """One float or three, as a length-3 array. A wrong shape names what it got."""
+        if value is None:
+            raise ValueError(f'{what} is missing')
+        try:
+            if np.isscalar(value):
+                return np.full(3, float(value))
+            parts = [float(v) for v in value]
+        except TypeError:
+            raise ValueError(f'{what} must be a number or three numbers, got {value!r}')
+        except (ValueError, IndexError):
+            raise ValueError(f'{what} must be a number or three numbers, got {value!r}')
+        if len(parts) == 1:
+            return np.full(3, parts[0])
+        if len(parts) != 3:
+            raise ValueError(f'{what} needs 3 numbers, got {len(parts)}: {parts}')
+        return np.array(parts, dtype=float)
+
+    @staticmethod
+    def scale(mesh_path: str, output_path: str, scale_factor: float,
+              origin: List[float] = (0.0, 0.0, 0.0)) -> Dict[str, Any]:
+        """Scale a mesh by one factor or one per axis, about a point that stays put.
+
+        `scale_factor` takes a number (uniform) or three numbers (per axis) - trimesh
+        broadcasts a length-3 array over the vertices, which is what measured the extents
+        of a unit box to [2, 1, 3] from [2, 2, 2]. `origin` is the anchor: without it the
+        scale also moves the model, which is the usual way a pipeline loses its place.
+        """
         if not TRIMESH_AVAILABLE:
             return {'success': False, 'error': 'Trimesh not available'}
-        
+
         try:
+            factors = MeshTransformer._vector(scale_factor, 'scale factor')
+            anchor = MeshTransformer._vector(origin, 'scale origin')
             mesh = trimesh.load(mesh_path)
-            mesh.apply_scale(scale_factor)
+            before = [float(x) for x in mesh.extents]
+            mesh.vertices = (np.asarray(mesh.vertices, dtype=float) - anchor) * factors + anchor
             mesh.export(output_path)
-            
+
             return {
                 'success': True,
                 'scale_factor': scale_factor,
+                'applied_factors': [float(x) for x in factors],
+                'origin': [float(x) for x in anchor],
+                'extents_before': before,
+                'extents_after': [float(x) for x in mesh.extents],
                 'output_path': output_path
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
     @staticmethod
-    def center(mesh_path: str, output_path: str) -> Dict[str, Any]:
-        """Center mesh at origin."""
+    def center(mesh_path: str, output_path: str, mode: str = 'mass',
+               axes: List[bool] = (True, True, True)) -> Dict[str, Any]:
+        """Move a chosen centre of the mesh onto the origin, on the axes asked for.
+
+        The three modes are three different points and all three are what a modeller means
+        by "centre": `mass` is the surface centroid (what this method used to do), `bounds`
+        is the middle of the bounding box, and `vertices` is the mean of the vertex
+        positions - a scanned model with one dense patch and a sparse one puts those three
+        in different places.
+        """
         if not TRIMESH_AVAILABLE:
             return {'success': False, 'error': 'Trimesh not available'}
-        
+
+        modes = ('mass', 'bounds', 'vertices')
+        if mode not in modes:
+            return {'success': False,
+                    'error': f'Unknown centering mode: {mode}. Supported: {", ".join(modes)}'}
+        try:
+            wanted = MeshTransformer._vector(
+                [1.0 if (flag is True or (isinstance(flag, str) and flag.lower() in ('1', 'true')))
+                 else 0.0 for flag in axes], 'center axes')
+        except (TypeError, ValueError):
+            return {'success': False, 'error': f'center axes must be three flags, got {axes!r}'}
+
         try:
             mesh = trimesh.load(mesh_path)
-            centroid = mesh.centroid
-            mesh.vertices -= centroid
+            if mode == 'mass':
+                centre = np.asarray(mesh.centroid, dtype=float)
+            elif mode == 'bounds':
+                bounds = np.asarray(mesh.bounds, dtype=float)
+                centre = (bounds[0] + bounds[1]) / 2.0
+            else:
+                centre = np.asarray(mesh.vertices, dtype=float).mean(axis=0)
+
+            shift = centre * wanted
+            mesh.vertices -= shift
             mesh.export(output_path)
-            
+
             return {
                 'success': True,
-                'original_center': tuple(centroid),
+                'mode': mode,
+                'axes': [bool(x) for x in wanted],
+                'original_center': tuple(centre),
+                'moved': [float(x) for x in shift],
                 'output_path': output_path
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
     @staticmethod
-    def rotate(mesh_path: str, output_path: str, rotation: List[float]) -> Dict[str, Any]:
-        """Rotate mesh using Euler angles (degrees)."""
+    def rotate(mesh_path: str, output_path: str, rotation: List[float],
+               origin: List[float] = (0.0, 0.0, 0.0)) -> Dict[str, Any]:
+        """Rotate mesh using Euler angles (degrees) about a point.
+
+        `origin` is the pivot. Without it a 90-degree turn moves a model that was standing
+        at x=5 over to z=-5, which is why a pipeline's "rotate" step used to need a "center"
+        step bolted in front of it.
+        """
         if not TRIMESH_AVAILABLE:
             return {'success': False, 'error': 'Trimesh not available'}
         
         try:
+            angles = MeshTransformer._vector(rotation, 'rotation')
+            pivot = MeshTransformer._vector(origin, 'rotation origin')
             mesh = trimesh.load(mesh_path)
+            centre_before = [float(x) for x in mesh.centroid]
             
             # Create rotation matrix from Euler angles
             # rotation is [x, y, z] in degrees
             matrix = trimesh.transformations.compose_matrix(
-                angles=np.radians(rotation),
+                angles=np.radians(angles),
                 translate=None,
                 scale=None
             )
             
+            mesh.apply_translation(-pivot)
             mesh.apply_transform(matrix)
+            mesh.apply_translation(pivot)
             mesh.export(output_path)
             
             return {
                 'success': True,
-                'rotation': rotation,
+                'rotation': [float(x) for x in angles],
+                'origin': [float(x) for x in pivot],
+                'centroid_before': centre_before,
+                'centroid_after': [float(x) for x in mesh.centroid],
+                'extents_after': [float(x) for x in mesh.extents],
                 'output_path': output_path
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def align_to_plane(mesh_path: str, output_path: str, axis: str = 'z',
+                       face: str = 'min', offset: float = 0.0) -> Dict[str, Any]:
+        """Sit the chosen side of the model on a plane at `offset` along `axis`.
+
+        This is the step that puts an asset on the ground of a scene, or its back against a
+        wall, without guessing which axis a given exporter calls up.
+        """
+        if not TRIMESH_AVAILABLE:
+            return {'success': False, 'error': 'Trimesh not available'}
+
+        axes = {'x': 0, 'y': 1, 'z': 2}
+        faces = ('min', 'max', 'center')
+        key = str(axis).lower()
+        chosen = str(face).lower()
+        if key not in axes:
+            return {'success': False,
+                    'error': f'Unknown align axis: {axis}. Supported: {", ".join(sorted(axes))}'}
+        if chosen not in faces:
+            return {'success': False,
+                    'error': f'Unknown align face: {face}. Supported: {", ".join(faces)}'}
+        try:
+            shift = float(offset)
+        except (TypeError, ValueError):
+            return {'success': False, 'error': f'align offset must be a number, got {offset!r}'}
+
+        try:
+            mesh = trimesh.load(mesh_path)
+            bounds = np.asarray(mesh.bounds, dtype=float)
+            index = axes[key]
+            if chosen == 'min':
+                current = bounds[0][index]
+            elif chosen == 'max':
+                current = bounds[1][index]
+            else:
+                current = (bounds[0][index] + bounds[1][index]) / 2.0
+
+            move = np.zeros(3)
+            move[index] = shift - current
+            mesh.vertices += move
+            mesh.export(output_path)
+
+            after = np.asarray(mesh.bounds, dtype=float)
+            return {
+                'success': True,
+                'axis': key,
+                'face': chosen,
+                'offset': shift,
+                'moved': [float(x) for x in move],
+                'bound_after': float(after[1 if chosen == 'max' else 0][index]),
+                'extents_after': [float(x) for x in mesh.extents],
+                'output_path': output_path
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def mirror(mesh_path: str, output_path: str, axis: str = 'x', weld: bool = False,
+               weld_threshold: float = 0.001) -> Dict[str, Any]:
+        """Add the mirrored half of the model, optionally welding the seam it creates.
+
+        The mirrored copy has its face order flipped as well as its positions negated;
+        without that the half that was pointing outward points inward and every game engine
+        in the world culls it. `weld` goes through the one welder this app has
+        (`MeshRepairer.remove_duplicate_vertices`), whose threshold is a fraction of the
+        bounding diagonal, so 0.001 means "vertices within a tenth of a percent of the
+        model's size are the same vertex".
+        """
+        if not TRIMESH_AVAILABLE:
+            return {'success': False, 'error': 'Trimesh not available'}
+
+        axes = {'x': 0, 'y': 1, 'z': 2}
+        key = str(axis).lower()
+        if key not in axes:
+            return {'success': False,
+                    'error': f'Unknown mirror axis: {axis}. Supported: {", ".join(sorted(axes))}'}
+
+        try:
+            mesh = trimesh.load(mesh_path)
+            before_faces = int(len(mesh.faces))
+            flipped = mesh.copy()
+            sign = np.ones(3)
+            sign[axes[key]] = -1.0
+            flipped.vertices = np.asarray(flipped.vertices, dtype=float) * sign
+            # negating one axis reverses the winding of every triangle; reversing the index
+            # order puts it back, and the volume sign below is how that is checked.
+            flipped.faces = np.asarray(flipped.faces)[:, ::-1]
+            joined = trimesh.util.concatenate([mesh, flipped])
+            joined.export(output_path)
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+        verdict = {
+            'success': True,
+            'axis': key,
+            'welded': bool(weld),
+            'faces_before': before_faces,
+            'faces_after': int(len(joined.faces)),
+            'watertight': bool(joined.is_watertight),
+            'winding_consistent': bool(joined.is_winding_consistent),
+            'volume': float(joined.volume),
+            'output_path': output_path,
+        }
+        if not weld:
+            return verdict
+
+        welded = MeshRepairer.remove_duplicate_vertices(output_path, output_path,
+                                                       threshold=weld_threshold)
+        if not welded.get('success'):
+            verdict['success'] = False
+            verdict['error'] = ('the mirrored halves were written but the seam did not weld: '
+                                + str(welded.get('error')))
+            return verdict
+        try:
+            check = trimesh.load(output_path)
+            verdict.update({'faces_after': int(len(check.faces)),
+                            'vertices_after': int(len(check.vertices)),
+                            'watertight': bool(check.is_watertight),
+                            'volume': float(check.volume),
+                            'welded_vertices': welded.get('removed')})
+        except Exception as e:
+            verdict['success'] = False
+            verdict['error'] = f'the welded file could not be read back: {e}'
+        return verdict
+
 
     @staticmethod
     def auto_align(mesh_path: str, output_path: str) -> Dict[str, Any]:
@@ -1173,6 +1386,167 @@ class MeshTransformer:
             }
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+
+class MeshUV:
+    """The two texture-coordinate parametrizations this build can actually run.
+
+    Measured on pymeshlab 2025.7 with `tools/probe_backend_safety.py` and a per-parameter
+    probe, not read out of the MeshLab menus:
+
+    * `compute_texcoord_parametrization_triangle_trivial_per_wedge` takes `textdim`,
+      `border` and `method` (whose only values are 'Basic' and 'Space-optimizing' - the
+      binding answers "Enum 'Wrap' not found. Possible values are 'Basic';
+      'Space-optimizing';"). `textdim` and `border` are not cosmetic: on a 2x3x4 box the UV
+      extent goes 0.9961 -> 0.8750 when `border` goes 2 -> 64 at textdim 512, and the
+      filter raises "Texture Dimension has an incorrect value" for 0 and
+      "Inter-Triangle border has an incorrect value" for a negative border.
+    * `compute_texcoord_parametrization_flat_plane_per_wedge` takes neither - it answers
+      "Parameter textdim not found" - so the size knobs are reported as not applied.
+    * `generate_voronoi_atlas_parametrization` runs and writes **no** texture coordinates
+      (0 wedge rows), so it is not offered as a method.
+    * `compute_texcoord_parametrization_harmonic` refuses a closed mesh with "can be
+      applied only on meshes that have a boundary", so it is not offered either.
+    * `meshing_tex_remove` and `compute_texcoord_parametrization_simple_symmetric_per_wedge`
+      do not exist in this build; removal goes through trimesh, which writes 0 `vt` lines
+      for a box that had 36.
+    """
+
+    METHODS = ('trivial', 'flat_plane')
+    LAYOUTS = ('Basic', 'Space-optimizing')
+    # Named here so a caller that was offered one of them by an older build gets this
+    # sentence rather than a silent fallback.
+    NOT_AVAILABLE = {
+        'smart': 'no smart-project unwrap exists in pymeshlab 2025.7; the two parametrizers '
+                 'here are trivial and flat_plane',
+        'cube': 'the only box-style parametrizer, generate_voronoi_atlas_parametrization, '
+                'runs but writes 0 texture coordinates in this build',
+        'sphere': 'compute_texcoord_parametrization_harmonic is the closest thing to a '
+                  'spherical unwrap and it refuses any mesh without a boundary',
+        'cylinder': 'no cylindrical parametrizer exists in pymeshlab 2025.7',
+        'voronoi': 'generate_voronoi_atlas_parametrization runs but writes 0 texture '
+                   'coordinates in this build',
+        'harmonic': 'compute_texcoord_parametrization_harmonic refuses a closed mesh ("can '
+                    'be applied only on meshes that have a boundary")',
+    }
+
+    @staticmethod
+    def uv_rows(mesh_path: str) -> Optional[int]:
+        """Texture-coordinate rows in the file as an exporter would read it, or None."""
+        if not TRIMESH_AVAILABLE:
+            return None
+        try:
+            mesh = trimesh.load(mesh_path, process=False)
+        except Exception:
+            return None
+        coords = getattr(mesh.visual, 'uv', None)
+        if coords is None:
+            return 0
+        try:
+            return int(len(coords))
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def strip(mesh_path: str, output_path: str) -> Dict[str, Any]:
+        """Write the mesh back with its texture coordinates gone, and count what was lost."""
+        if not TRIMESH_AVAILABLE:
+            return {'success': False, 'error': 'Trimesh not available'}
+        try:
+            before = MeshUV.uv_rows(mesh_path)
+            mesh = trimesh.load(mesh_path, process=False)
+            mesh.visual = trimesh.visual.TextureVisuals()
+            mesh.export(output_path)
+            after = MeshUV.uv_rows(output_path)
+            if before is None or after is None:
+                return {'success': False,
+                        'error': 'the texture coordinates could not be counted on both '
+                                 'sides of the write'}
+            return {'success': True, 'uv_rows_before': before, 'uv_rows_after': after,
+                    'output_path': output_path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def parametrize(mesh_path: str, output_path: str, method: str = 'trivial',
+                    texture_size: int = 2048, border_pixels: int = 2,
+                    layout: str = 'Basic') -> Dict[str, Any]:
+        """Generate texture coordinates with one of the two methods that produce them.
+
+        Every MeshSet here is brand new. Reusing one across calls is what made the older
+        parametrization code crash the process on a mesh that already had wedges.
+        """
+        if not PYMESHLAB_AVAILABLE:
+            return {'success': False, 'error': 'PyMeshLab not available'}
+
+        chosen = str(method).lower()
+        if chosen not in MeshUV.METHODS:
+            hint = MeshUV.NOT_AVAILABLE.get(chosen)
+            return {'success': False,
+                    'error': f'Unknown UV method: {method}. Supported here: '
+                             f'{", ".join(MeshUV.METHODS)}.'
+                             + (f' {chosen} is not offered because {hint}.' if hint else '')}
+
+        try:
+            size = int(texture_size)
+            border = int(border_pixels)
+        except (TypeError, ValueError):
+            return {'success': False,
+                    'error': f'texture size and border must be whole numbers, got '
+                             f'{texture_size!r} and {border_pixels!r}'}
+        if chosen == 'trivial':
+            # pymeshlab segfaults on nothing here, it raises - but only after it has done
+            # the work, so the bounds are checked first and said in the app's own words.
+            if size < 1:
+                return {'success': False,
+                        'error': f'texture size must be 1 or more; {size} is refused by the '
+                                 f'filter as "Texture Dimension has an incorrect value"'}
+            if border < 0:
+                return {'success': False,
+                        'error': f'border pixels cannot be negative ({border})'}
+            wanted_layout = str(layout)
+            if wanted_layout not in MeshUV.LAYOUTS:
+                return {'success': False,
+                        'error': f'Unknown UV layout: {layout}. The filter takes exactly: '
+                                 f'{", ".join(MeshUV.LAYOUTS)}'}
+        else:
+            wanted_layout = str(layout)
+            if wanted_layout not in MeshUV.LAYOUTS:
+                wanted_layout = 'Basic'
+
+        try:
+            before = MeshUV.uv_rows(mesh_path)
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(mesh_path)
+            faces = ms.current_mesh().face_number()
+            ignored = []
+            if chosen == 'trivial':
+                ms.apply_filter(
+                    'compute_texcoord_parametrization_triangle_trivial_per_wedge',
+                    textdim=size, border=border, method=wanted_layout)
+            else:
+                ms.apply_filter('compute_texcoord_parametrization_flat_plane_per_wedge')
+                ignored = ['texture_size', 'border_pixels']
+            ms.save_current_mesh(output_path)
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+        after = MeshUV.uv_rows(output_path)
+        verdict = {
+            'success': True,
+            'method': chosen,
+            'layout': wanted_layout if chosen == 'trivial' else None,
+            'faces': int(faces),
+            'uv_rows_before': before,
+            'uv_rows_written': after,
+            'knobs_not_applied': ignored,
+            'output_path': output_path,
+        }
+        if not after:
+            verdict['success'] = False
+            verdict['error'] = (f'{chosen} ran and the file it wrote has no texture '
+                                f'coordinates in it')
+        return verdict
 
 
 class MeshProcessor(QObject):
@@ -1384,15 +1758,31 @@ class MeshProcessor(QObject):
         """Transform mesh."""
         if operation == 'scale':
             scale_factor = kwargs.get('scale_factor', 1.0)
-            return self.transformer.scale(mesh_path, output_path, scale_factor)
+            origin = kwargs.get('origin', (0.0, 0.0, 0.0))
+            return self.transformer.scale(mesh_path, output_path, scale_factor, origin)
         elif operation == 'rotate':
             rotation = kwargs.get('rotation', [0, 0, 0])
-            return self.transformer.rotate(mesh_path, output_path, rotation)
+            origin = kwargs.get('origin', (0.0, 0.0, 0.0))
+            return self.transformer.rotate(mesh_path, output_path, rotation, origin)
         elif operation == 'translate':
             translation = kwargs.get('translation', [0, 0, 0])
             return self.transformer.translate(mesh_path, output_path, translation)
         elif operation == 'center':
-            return self.transformer.center(mesh_path, output_path)
+            return self.transformer.center(mesh_path, output_path,
+                                          mode=kwargs.get('mode', 'mass'),
+                                          axes=kwargs.get('axes', (True, True, True)))
+        elif operation == 'align':
+            return self.transformer.align_to_plane(
+                mesh_path, output_path,
+                axis=kwargs.get('axis', 'z'),
+                face=kwargs.get('face', 'min'),
+                offset=kwargs.get('offset', 0.0))
+        elif operation == 'mirror':
+            return self.transformer.mirror(
+                mesh_path, output_path,
+                axis=kwargs.get('axis', 'x'),
+                weld=bool(kwargs.get('weld', False)),
+                weld_threshold=float(kwargs.get('weld_threshold', 0.001)))
         elif operation == 'normalize':
             target_size = kwargs.get('target_size', 1.0)
             return self.transformer.normalize_scale(mesh_path, output_path, target_size)

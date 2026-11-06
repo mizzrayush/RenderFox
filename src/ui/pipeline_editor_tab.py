@@ -1,30 +1,85 @@
 """
-Pipeline Editor Tab - Visual node-based pipeline creation and editing.
+Pipeline Editor Tab - build a node pipeline, run it, and read what every node answered.
+
+Nothing in this file performs work. It edits a `Pipeline`, hands that pipeline to
+`PipelineEngine.execute_pipeline` on a worker thread, and prints the dict the call
+answered with: one row per node, its status, and the numbers it measured off the files it
+wrote. A node's border colour here and its row in the results table are the same fact,
+taken from the same run, so nothing on screen can claim a step ran that did not.
 """
 
-import os
-import json
-from typing import Dict, List, Optional, Tuple
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QPushButton,
-    QLabel, QLineEdit, QTextEdit, QScrollArea, QGroupBox,
-    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsEllipseItem,
-    QGraphicsRectItem, QGraphicsLineItem, QGraphicsTextItem, QGraphicsPathItem,
-    QMenu, QFileDialog, QMessageBox, QToolBar, QListWidget, QListWidgetItem,
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QPushButton, QLabel, QLineEdit,
+    QTextEdit, QScrollArea, QGroupBox, QGraphicsView, QGraphicsScene, QGraphicsItem,
+    QGraphicsPathItem, QFileDialog, QMessageBox, QListWidget, QListWidgetItem,
     QFormLayout, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QColorDialog,
-    QFrame, QStyle, QApplication
+    QFrame, QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PyQt6.QtCore import Qt, QPointF, QRectF, QSizeF, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QThread
 from PyQt6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QFont, QLinearGradient,
-    QPainterPath, QPolygonF, QPalette, QAction, QIcon
+    QPen, QBrush, QColor, QFont, QFontMetrics, QPainter, QPainterPath
 )
 
 from ..processing.pipeline_engine import (
-    PipelineEngine, Pipeline, PipelineNode, PipelineConnection,
-    NodeDefinition, NODE_DEFINITIONS, NodeCategory, ParameterType,
+    NODE_DEFINITIONS, ParameterType, STATUSES, NodeCategory, NodeDefinition,
+    Pipeline, PipelineConnection, PipelineEngine, PipelineNode, definition_not_backed,
     get_nodes_by_category
 )
+from ..utils.file_utils import get_temp_directory
+from .icon_provider import get_icon
+
+
+# ============================================================================
+# THE ONE SET OF COLOURS, KEYED BY THE ENGINE'S OWN STATUS WORDS
+# ============================================================================
+
+STATUS_COLORS = {
+    'done': '#27AE60',
+    'refused': '#E67E22',
+    'invalid': '#F1C40F',
+    'failed': '#E74C3C',
+    'stopped': '#95A5A6',
+    'skipped': '#7F8C8D',
+    'running': '#3498DB',
+}
+NOT_RUN_COLOR = '#5D6D7E'
+WIRE_COLOR = '#3498DB'
+BODY_COLOR = '#252830'
+EDGE_COLOR = '#4A4F5C'
+TEXT_COLOR = '#D5D8DF'
+DETAIL_COLOR = '#9AA3B2'
+
+# A definition's min/max seeds these boxes, it does not gate the backend: `coerce()` keeps
+# the full range and the handler answers what it does with an extreme. Clamping here would
+# hide the difference between "not supported" and "not allowed to ask".
+NUMBER_LIMIT = 1e12
+INT_LIMIT = 2 ** 31 - 1
+
+# `.ply` is left out on purpose: it holds either kind, and the Library only ever indexes
+# meshes, so a handed-over .ply is opened by Load Model and the person moves it to a cloud
+# node if they meant otherwise.
+CLOUD_SUFFIXES = ('.pcd', '.xyz', '.xyzn', '.xyzrgb', '.pts', '.las')
+
+
+def _as_float(value: Any) -> Tuple[float, str]:
+    """The number a stored knob means, or 0.0 plus the sentence saying it is a guess."""
+    try:
+        return float(str(value).strip()), ''
+    except (TypeError, ValueError):
+        return 0.0, (f"this node carries {value!r} where a number belongs. The box shows 0 "
+                     f"so you can type the number you meant; the run will not happen until "
+                     f"you do.")
+
+
+def _as_int(value: Any) -> Tuple[int, str]:
+    try:
+        return int(str(value).strip()), ''
+    except (TypeError, ValueError):
+        return 0, (f"this node carries {value!r} where a whole number belongs. The box shows "
+                   f"0 so you can type the number you meant.")
 
 
 # ============================================================================
@@ -32,511 +87,411 @@ from ..processing.pipeline_engine import (
 # ============================================================================
 
 class NodeGraphicsItem(QGraphicsItem):
-    """Visual representation of a pipeline node."""
-    
-    WIDTH = 200
-    HEIGHT = 80
-    HEADER_HEIGHT = 30
-    
+    """One node on the canvas. Its border and status word are the run's answer, or say
+    that no run has answered it yet."""
+
+    WIDTH = 210
+    HEIGHT = 92
+    HEADER_HEIGHT = 26
+    RADIUS = 6
+
     def __init__(self, node: PipelineNode, definition: NodeDefinition):
         super().__init__()
         self.node = node
         self.definition = definition
-        
-        # Visual properties
+        self.status = ''
+        self.detail = ''
+        self.wires: List[QGraphicsPathItem] = []
+
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setAcceptHoverEvents(True)
-        
+        self.setToolTip(definition.description)
         self.is_hovered = False
-        self.is_executing = False
-        self.is_completed = False
-        self.is_failed = False
-        
-        # Connection points
-        self.input_point = QPointF(0, self.HEIGHT / 2)
-        self.output_point = QPointF(self.WIDTH, self.HEIGHT / 2)
-        
-        # Set position
-        self.setPos(node.position[0], node.position[1])
-    
+        self.port_in = QPointF(0, self.HEADER_HEIGHT + (self.HEIGHT - self.HEADER_HEIGHT) / 2)
+        self.port_out = QPointF(self.WIDTH, self.HEADER_HEIGHT + (self.HEIGHT - self.HEADER_HEIGHT) / 2)
+        try:
+            self.setPos(float(node.position[0]), float(node.position[1]))
+        except (TypeError, ValueError, IndexError):
+            self.setPos(0, 0)
+
     def boundingRect(self) -> QRectF:
-        """Return bounding rectangle."""
-        return QRectF(0, 0, self.WIDTH, self.HEIGHT)
-    
+        return QRectF(-2, -2, self.WIDTH + 4, self.HEIGHT + 4)
+
+    def set_result(self, status: str, detail: str) -> None:
+        """Take the verdict the engine just sent for this node."""
+        self.status = status
+        self.detail = detail or ''
+        self.update()
+
     def paint(self, painter: QPainter, option, widget=None):
-        """Paint the node."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # Determine colors
-        base_color = QColor(self.definition.color)
-        
-        if self.is_failed:
-            border_color = QColor("#E74C3C")
-            border_width = 3
-        elif self.is_executing:
-            border_color = QColor("#F39C12")
-            border_width = 3
-        elif self.is_completed:
-            border_color = QColor("#27AE60")
+        accent = QColor(self.definition.color)
+        if not accent.isValid():
+            accent = QColor(WIRE_COLOR)
+
+        if self.status:
+            border = QColor(STATUS_COLORS.get(self.status, NOT_RUN_COLOR))
             border_width = 3
         elif self.isSelected():
-            border_color = QColor("#3498DB")
-            border_width = 3
+            border, border_width = accent, 3
         elif self.is_hovered:
-            border_color = base_color.lighter(120)
-            border_width = 2
+            border, border_width = accent, 2
         else:
-            border_color = base_color
-            border_width = 2
-        
-        # Draw shadow
-        shadow_rect = QRectF(3, 3, self.WIDTH, self.HEIGHT)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 50)))
+            border, border_width = QColor(EDGE_COLOR), 1
+
+        body = QRectF(0, 0, self.WIDTH, self.HEIGHT)
+        painter.setBrush(QBrush(QColor(BODY_COLOR)))
+        painter.setPen(QPen(border, border_width))
+        painter.drawRoundedRect(body, self.RADIUS, self.RADIUS)
+
+        header = QPainterPath()
+        header.addRoundedRect(QRectF(0, 0, self.WIDTH, self.HEADER_HEIGHT + self.RADIUS),
+                              self.RADIUS, self.RADIUS)
+        header.addRect(QRectF(0, self.HEADER_HEIGHT, self.WIDTH, self.RADIUS))
+        painter.setBrush(QBrush(accent))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(shadow_rect, 8, 8)
-        
-        # Draw main body
-        body_rect = QRectF(0, 0, self.WIDTH, self.HEIGHT)
-        gradient = QLinearGradient(0, 0, 0, self.HEIGHT)
-        gradient.setColorAt(0, QColor("#2C3E50"))
-        gradient.setColorAt(1, QColor("#34495E"))
-        painter.setBrush(QBrush(gradient))
-        painter.setPen(QPen(border_color, border_width))
-        painter.drawRoundedRect(body_rect, 8, 8)
-        
-        # Draw header
-        header_rect = QRectF(0, 0, self.WIDTH, self.HEADER_HEIGHT)
-        header_gradient = QLinearGradient(0, 0, 0, self.HEADER_HEIGHT)
-        header_gradient.setColorAt(0, base_color)
-        header_gradient.setColorAt(1, base_color.darker(120))
-        painter.setBrush(QBrush(header_gradient))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(header_rect, 8, 8)
-        
-        # Draw header bottom border
-        painter.setPen(QPen(base_color.darker(150), 1))
-        painter.drawLine(0, self.HEADER_HEIGHT, self.WIDTH, self.HEADER_HEIGHT)
-        
-        # Draw vector icon
-        from .icon_provider import get_icon
-        icon = get_icon(self.definition.icon, color="#ffffff", size=16)
-        pix = icon.pixmap(16, 16)
-        if not pix.isNull():
-            painter.drawPixmap(10, int((self.HEADER_HEIGHT - 16) / 2), pix)
-        
-        # Draw title
-        painter.setPen(QPen(Qt.GlobalColor.white))
-        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        painter.drawText(QRectF(32, 0, self.WIDTH - 40, self.HEADER_HEIGHT),
-                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                        self.definition.name)
-        
-        # Draw parameter count
-        param_count = len(self.node.parameters)
-        painter.setFont(QFont("Segoe UI", 8))
-        painter.setPen(QPen(QColor("#BDC3C7")))
-        param_text = f"{param_count} params"
-        painter.drawText(QRectF(10, self.HEADER_HEIGHT + 5, self.WIDTH - 20, 20),
-                        Qt.AlignmentFlag.AlignLeft, param_text)
-        
-        # Draw category badge
-        painter.setFont(QFont("Segoe UI", 7))
-        category_text = self.definition.category.value.upper()
-        painter.drawText(QRectF(10, self.HEIGHT - 20, self.WIDTH - 20, 15),
-                        Qt.AlignmentFlag.AlignLeft, category_text)
-        
-        # Draw connection points
-        connection_color = QColor("#3498DB")
-        
-        # Input point
-        painter.setBrush(QBrush(connection_color))
-        painter.setPen(QPen(Qt.GlobalColor.white, 2))
-        painter.drawEllipse(self.input_point, 6, 6)
-        
-        # Output point
-        painter.setBrush(QBrush(connection_color))
-        painter.setPen(QPen(Qt.GlobalColor.white, 2))
-        painter.drawEllipse(self.output_point, 6, 6)
-        
-        # Status indicator
-        if self.is_executing:
-            painter.setBrush(QBrush(QColor("#F39C12")))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(self.WIDTH - 15, 15), 5, 5)
-        elif self.is_completed:
-            painter.setBrush(QBrush(QColor("#27AE60")))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(self.WIDTH - 15, 15), 5, 5)
-        elif self.is_failed:
-            painter.setBrush(QBrush(QColor("#E74C3C")))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(self.WIDTH - 15, 15), 5, 5)
-    
+        painter.drawPath(header)
+
+        icon = get_icon(self.definition.icon, color='#FFFFFF', size=14)
+        pix = icon.pixmap(14, 14)
+        if pix is not None and not pix.isNull():
+            painter.drawPixmap(8, int((self.HEADER_HEIGHT - 14) / 2), pix)
+
+        painter.setPen(QPen(QColor('#FFFFFF')))
+        painter.setFont(QFont('Segoe UI', 9, QFont.Weight.Bold))
+        name = QFontMetrics(QFont('Segoe UI', 9, QFont.Weight.Bold)).elidedText(
+            self.definition.name, Qt.TextElideMode.ElideRight, self.WIDTH - 32)
+        painter.drawText(QRectF(28, 0, self.WIDTH - 32, self.HEADER_HEIGHT),
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+
+        status_word = self.status if self.status else 'not run'
+        painter.setFont(QFont('Segoe UI', 8, QFont.Weight.Bold))
+        painter.setPen(QPen(QColor(STATUS_COLORS.get(self.status, NOT_RUN_COLOR))))
+        painter.drawText(QRectF(9, self.HEADER_HEIGHT + 3, self.WIDTH - 18, 14),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         status_word)
+
+        detail = self.detail or 'Double-click a node in the palette, then press Run.'
+        painter.setFont(QFont('Segoe UI', 8))
+        painter.setPen(QPen(QColor(DETAIL_COLOR)))
+        painter.drawText(QRectF(9, self.HEADER_HEIGHT + 19, self.WIDTH - 18, 42),
+                         Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap, detail)
+
+        painter.setFont(QFont('Segoe UI', 7))
+        painter.setPen(QPen(QColor(EDGE_COLOR)))
+        painter.drawText(QRectF(9, self.HEIGHT - 14, self.WIDTH - 18, 12),
+                         Qt.AlignmentFlag.AlignLeft,
+                         f"{self.definition.category.value.upper()} - "
+                         f"{len(self.node.parameters)} knob(s) set")
+
+        for port in (self.port_in, self.port_out):
+            painter.setBrush(QBrush(QColor(BODY_COLOR)))
+            painter.setPen(QPen(QColor(WIRE_COLOR), 2))
+            painter.drawEllipse(port, 6, 6)
+
     def hoverEnterEvent(self, event):
-        """Handle hover enter."""
         self.is_hovered = True
         self.update()
         super().hoverEnterEvent(event)
-    
+
     def hoverLeaveEvent(self, event):
-        """Handle hover leave."""
         self.is_hovered = False
         self.update()
         super().hoverLeaveEvent(event)
-    
+
     def itemChange(self, change, value):
-        """Handle item changes."""
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
-            # Update node position
-            pos = value
-            self.node.position = (pos.x(), pos.y())
-        
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            # The model, not the widget, is where a node's position is kept: a saved file
+            # that lost the layout would reopen as a pile in one corner.
+            self.node.position = (self.pos().x(), self.pos().y())
+            for wire in self.wires:
+                wire.update_path()
         return super().itemChange(change, value)
-    
-    def get_input_scene_pos(self) -> QPointF:
-        """Get input connection point in scene coordinates."""
-        return self.mapToScene(self.input_point)
-    
-    def get_output_scene_pos(self) -> QPointF:
-        """Get output connection point in scene coordinates."""
-        return self.mapToScene(self.output_point)
+
+    def port_in_scene(self) -> QPointF:
+        return self.mapToScene(self.port_in)
+
+    def port_out_scene(self) -> QPointF:
+        return self.mapToScene(self.port_out)
 
 
 class ConnectionGraphicsItem(QGraphicsPathItem):
-    """Visual representation of a connection between nodes."""
-    
-    def __init__(self, connection: PipelineConnection, 
+    """A wire. It registers itself with both node items so dragging either one redraws it."""
+
+    def __init__(self, connection: PipelineConnection,
                  from_item: NodeGraphicsItem, to_item: NodeGraphicsItem):
         super().__init__()
         self.connection = connection
         self.from_item = from_item
         self.to_item = to_item
-        
-        # Visual properties
-        # Use a gradient pen for a "premium" look
-        gradient = QLinearGradient(0, 0, 100, 0)  # Will be updated in paint
-        gradient.setColorAt(0, QColor("#3498DB"))
-        gradient.setColorAt(1, QColor("#2ECC71"))
-        
-        self.pen = QPen(QBrush(gradient), 3)
-        self.pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        self.pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        self.setPen(self.pen)
-        
-        self.setZValue(-1)  # Draw behind nodes
-        
+        pen = QPen(QColor(WIRE_COLOR))
+        pen.setWidth(2)
+        self.setPen(pen)
+        self.setZValue(-1)
+        from_item.wires.append(self)
+        to_item.wires.append(self)
         self.update_path()
-    
-    def update_path(self):
-        """Update the connection path."""
-        start = self.from_item.get_output_scene_pos()
-        end = self.to_item.get_input_scene_pos()
-        
-        # Create curved path
+
+    def detach(self) -> None:
+        for item in (self.from_item, self.to_item):
+            if self in item.wires:
+                item.wires.remove(self)
+
+    def update_path(self) -> None:
+        start = self.from_item.port_out_scene()
+        end = self.to_item.port_in_scene()
+        reach = max(abs(end.x() - start.x()) * 0.5, 50.0)
+        if abs(end.x() - start.x()) < 100 and abs(end.y() - start.y()) > 50:
+            reach = max(reach, 100.0)
         path = QPainterPath()
         path.moveTo(start)
-        
-        # Calculate control points for bezier curve
-        dx = end.x() - start.x()
-        dy = end.y() - start.y()
-        
-        # Adjust control point offset based on distance
-        # Use a smoother curvature logic
-        control_offset_x = max(abs(dx) * 0.5, 50)
-        control_offset_y = 0  # Keep control points horizontally aligned with ports
-        
-        # If nodes are close horizontally but far vertically, increase offset to avoid "S" shape being too tight
-        if abs(dx) < 100 and abs(dy) > 50:
-             control_offset_x = 100
-        
-        # Improved Bezier Logic (Smoother)
-        ctrl1 = QPointF(start.x() + control_offset_x, start.y() + control_offset_y)
-        ctrl2 = QPointF(end.x() - control_offset_x, end.y() - control_offset_y)
-        
-        path.cubicTo(ctrl1, ctrl2, end)
-        
+        path.cubicTo(QPointF(start.x() + reach, start.y()),
+                     QPointF(end.x() - reach, end.y()), end)
         self.setPath(path)
-        
-        # Update gradient for the pen based on start/end points
-        gradient = QLinearGradient(start, end)
-        gradient.setColorAt(0, QColor("#3498DB"))  # Blue at start
-        gradient.setColorAt(1, QColor("#2ECC71"))  # Green at end
-        self.pen.setBrush(QBrush(gradient))
-        self.setPen(self.pen)
+
+
+class PendingWireItem(QGraphicsPathItem):
+    """The dashed line followed by the port while a wire is being dragged."""
+
+    def __init__(self, start: QPointF):
+        super().__init__()
+        self.start = start
+        pen = QPen(QColor(WIRE_COLOR))
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self.setPen(pen)
+        self.setZValue(1)
+        self.update_to(start)
+
+    def __init__(self, start: QPointF):
+        super().__init__()
+        self.start = start
+        pen = QPen(QColor(WIRE_COLOR))
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self.setPen(pen)
+        self.setZValue(1)
+        self.update_to(start)
+
+    def update_to(self, point: QPointF) -> None:
+        reach = max(abs(point.x() - self.start.x()) * 0.5, 40.0)
+        path = QPainterPath()
+        path.moveTo(self.start)
+        path.cubicTo(QPointF(self.start.x() + reach, self.start.y()),
+                     QPointF(point.x() - reach, point.y()), point)
+        self.setPath(path)
 
 
 # ============================================================================
-# PIPELINE GRAPHICS VIEW
+# CANVAS
 # ============================================================================
 
 class PipelineGraphicsView(QGraphicsView):
-    """Graphics view for the pipeline editor."""
-    
-    node_selected = pyqtSignal(PipelineNode, NodeDefinition)
-    nodes_deleted = pyqtSignal(list)  # List of node IDs
-    connection_created = pyqtSignal(str, str)  # from_node_id, to_node_id
-    
-    def __init__(self):
-        super().__init__()
-        
-        self.scene = QGraphicsScene()
-        self.scene.setSceneRect(-5000, -5000, 10000, 10000)
-        self.setScene(self.scene)
-        
-        # View settings
+    """The canvas: drag nodes, wheel-zoom, middle-drag pan, port to port for a wire."""
+
+    node_selected = pyqtSignal(str)
+    nodes_deleted = pyqtSignal(list)
+    wires_deleted = pyqtSignal(list)
+    connection_created = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.graph = QGraphicsScene(self)
+        self.graph.setSceneRect(-4000, -4000, 8000, 8000)
+        self.setScene(self.graph)
+
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        
-        # Background
-        self.setBackgroundBrush(QBrush(QColor("#1E1E1E")))
-        
-        # Node and connection tracking
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setBackgroundBrush(QBrush(QColor('#1E2126')))
+
         self.node_items: Dict[str, NodeGraphicsItem] = {}
-        self.connection_items: List[ConnectionGraphicsItem] = []
-        
-        # Connection drawing state
-        self.temp_connection_line: Optional[QGraphicsLineItem] = None
-        self.connection_start_node: Optional[str] = None
-    
+        self.wire_items: List[ConnectionGraphicsItem] = []
+        self._pending: Optional[PendingWireItem] = None
+        self._pending_from: Optional[str] = None
+
+    # ---- the model on screen ----
+
+    def add_node_item(self, node: PipelineNode, definition: NodeDefinition) -> None:
+        item = NodeGraphicsItem(node, definition)
+        self.graph.addItem(item)
+        self.node_items[node.id] = item
+
+    def add_wire_item(self, connection: PipelineConnection) -> bool:
+        source = self.node_items.get(connection.from_node)
+        target = self.node_items.get(connection.to_node)
+        if source is None or target is None:
+            return False
+        item = ConnectionGraphicsItem(connection, source, target)
+        self.graph.addItem(item)
+        self.wire_items.append(item)
+        return True
+
+    def set_node_result(self, node_id: str, status: str, detail: str) -> None:
+        item = self.node_items.get(node_id)
+        if item is not None:
+            item.set_result(status, detail)
+
+    def clear_all(self) -> None:
+        for wire in self.wire_items:
+            wire.detach()
+        self.wire_items.clear()
+        self.node_items.clear()
+        self._pending = None
+        self._pending_from = None
+        self.graph.clear()
+
+    # ---- zoom ----
+
     def wheelEvent(self, event):
-        """Handle mouse wheel for zooming."""
-        zoom_factor = 1.15
-        
-        if event.angleDelta().y() > 0:
-            self.scale(zoom_factor, zoom_factor)
-        else:
-            self.scale(1 / zoom_factor, 1 / zoom_factor)
-    
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        if 0.2 <= self.transformer().m11() * factor <= 4.0:
+            self.scale(factor, factor)
+        event.accept()
+
+    def fit_all(self) -> None:
+        bounds = self.graph.itemsBoundingRect()
+        if not bounds.isEmpty():
+            self.fitInView(bounds, Qt.AspectRatioMode.KeepAspectRatio)
+
+    # ---- port to port ----
+
+    def _port_hit(self, viewport_pos, item: NodeGraphicsItem, port: QPointF) -> bool:
+        scene_pos = self.mapToScene(viewport_pos)
+        return (scene_pos - item.mapToScene(port)).manhattanLength() < 24
+
     def mousePressEvent(self, event):
-        """Handle mouse press."""
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             super().mousePressEvent(event)
             return
-            
         if event.button() == Qt.MouseButton.LeftButton:
-            # Check if we clicked on an output port
             item = self.itemAt(event.pos())
-            if isinstance(item, NodeGraphicsItem):
-                # Check distance to output port
-                # We need scene pos for distance check
-                scene_pos = self.mapToScene(event.pos())
-                output_pos = item.get_output_scene_pos()
-                
-                # Simple distance check (radius 10)
-                dist = (scene_pos - output_pos).manhattanLength()
-                if dist < 20:
-                    # Start connection
-                    self.connection_start_node = item.node.id
-                    self.temp_connection_line = QGraphicsLineItem(
-                        output_pos.x(), output_pos.y(),
-                        scene_pos.x(), scene_pos.y()
-                    )
-                    self.temp_connection_line.setPen(QPen(QColor("#3498DB"), 2, Qt.PenStyle.DashLine))
-                    self.scene.addItem(self.temp_connection_line)
-                    return # Consume event
-
+            if isinstance(item, NodeGraphicsItem) and self._port_hit(event.pos(), item,
+                                                                    item.port_out):
+                self._pending_from = item.node.id
+                self._pending = PendingWireItem(item.port_out_scene())
+                self._pending.update_to(self.mapToScene(event.pos()))
+                self.graph.addItem(self._pending)
+                event.accept()
+                return
         super().mousePressEvent(event)
-    
+
     def mouseMoveEvent(self, event):
-        """Handle mouse move."""
-        if self.temp_connection_line:
-            scene_pos = self.mapToScene(event.pos())
-            line = self.temp_connection_line.line()
-            line.setP2(scene_pos)
-            self.temp_connection_line.setLine(line)
-            
+        if self._pending is not None:
+            self._pending.update_to(self.mapToScene(event.pos()))
+            event.accept()
+            return
         super().mouseMoveEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
-        """Handle mouse release."""
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
-            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            self.viewport().unsetCursor()
             super().mouseReleaseEvent(event)
             return
-
-        if self.temp_connection_line:
-            # Finish connection
-            scene_pos = self.mapToScene(event.pos())
-            
-            # Check if we released on an input port
-            # We need to find items at this position
-            items = self.scene.items(scene_pos)
-            target_node_id = None
-            
-            for item in items:
-                if isinstance(item, NodeGraphicsItem):
-                    # Check input port
-                    input_pos = item.get_input_scene_pos()
-                    dist = (scene_pos - input_pos).manhattanLength()
-                    if dist < 20:
-                        target_node_id = item.node.id
-                        break
-            
-            if target_node_id and target_node_id != self.connection_start_node:
-                # Create connection
-                # We need to signal the parent to create the connection in the engine
-                # But for now we just emit a signal or call a method on parent?
-                # The view doesn't have reference to engine directly usually.
-                # Let's emit a signal.
-                self.connection_created.emit(self.connection_start_node, target_node_id)
-            
-            # Cleanup
-            self.scene.removeItem(self.temp_connection_line)
-            self.temp_connection_line = None
-            self.connection_start_node = None
+        if self._pending is not None:
+            target_id = None
+            for item in self.graph.items(self.mapToScene(event.pos())):
+                if (isinstance(item, NodeGraphicsItem)
+                        and self._port_hit(event.pos(), item, item.port_in)):
+                    target_id = item.node.id
+                    break
+            if target_id and target_id != self._pending_from:
+                self.connection_created.emit(self._pending_from, target_id)
+            self.graph.removeItem(self._pending)
+            self._pending = None
+            self._pending_from = None
+            event.accept()
             return
-
         super().mouseReleaseEvent(event)
-    
+
     def keyPressEvent(self, event):
-        """Handle key press."""
-        if event.key() == Qt.Key.Key_Delete:
-            # Delete selected nodes
-            selected_items = self.scene.selectedItems()
-            node_ids = []
-            
-            for item in selected_items:
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            node_ids, wire_pairs = [], []
+            for item in self.graph.selectedItems():
                 if isinstance(item, NodeGraphicsItem):
                     node_ids.append(item.node.id)
-            
+                elif isinstance(item, ConnectionGraphicsItem):
+                    wire_pairs.append((item.connection.from_node, item.connection.to_node))
+            if wire_pairs:
+                self.wires_deleted.emit(wire_pairs)
             if node_ids:
                 self.nodes_deleted.emit(node_ids)
-        
+            if node_ids or wire_pairs:
+                event.accept()
+                return
         super().keyPressEvent(event)
-    
-    def add_node_item(self, node: PipelineNode, definition: NodeDefinition):
-        """Add a node to the view."""
-        item = NodeGraphicsItem(node, definition)
-        self.scene.addItem(item)
-        self.node_items[node.id] = item
-        
-        # Connect selection signal
-        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-    
-    def remove_node_item(self, node_id: str):
-        """Remove a node from the view."""
-        if node_id in self.node_items:
-            item = self.node_items[node_id]
-            self.scene.removeItem(item)
-            del self.node_items[node_id]
-    
-    def add_connection_item(self, connection: PipelineConnection):
-        """Add a connection to the view."""
-        from_item = self.node_items.get(connection.from_node)
-        to_item = self.node_items.get(connection.to_node)
-        
-        if from_item and to_item:
-            conn_item = ConnectionGraphicsItem(connection, from_item, to_item)
-            self.scene.addItem(conn_item)
-            self.connection_items.append(conn_item)
-    
-    def update_connections(self):
-        """Update all connection paths."""
-        for conn_item in self.connection_items:
-            conn_item.update_path()
-    
-    def clear_all(self):
-        """Clear all items."""
-        self.scene.clear()
-        self.node_items.clear()
-        self.connection_items.clear()
 
 
 # ============================================================================
-# NODE PALETTE
+# PALETTE
 # ============================================================================
 
 class NodePaletteWidget(QWidget):
-    """Widget displaying available nodes organized by category."""
-    
-    node_double_clicked = pyqtSignal(str)  # definition_id
-    
-    def __init__(self):
-        super().__init__()
-        self.init_ui()
-    
-    def init_ui(self):
-        """Initialize UI."""
+    """Every node type this build has, grouped, searchable, double-click to add."""
+
+    node_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Search box
-        search_layout = QHBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search nodes...")
+        self.search_box.setPlaceholderText('Search nodes')
+        self.search_box.setClearButtonEnabled(True)
         self.search_box.textChanged.connect(self.filter_nodes)
-        search_layout.addWidget(self.search_box)
-        layout.addLayout(search_layout)
-        
-        # Category tabs
+        layout.addWidget(self.search_box)
+
+        self.groups: List[Tuple[QGroupBox, QListWidget]] = []
         for category in NodeCategory:
-            group = QGroupBox(category.value.title() + " Nodes")
-            group_layout = QVBoxLayout()
-            
-            list_widget = QListWidget()
-            list_widget.itemDoubleClicked.connect(self.on_node_double_clicked)
-            
-            # Add nodes for this category
-            from .icon_provider import get_icon
-            nodes = get_nodes_by_category(category)
-            for node_def in nodes:
-                item = QListWidgetItem(node_def.name)
-                item.setIcon(get_icon(node_def.icon, color="#8c93a8", size=16))
-                item.setData(Qt.ItemDataRole.UserRole, node_def.id)
-                item.setToolTip(node_def.description)
-                list_widget.addItem(item)
-            
-            group_layout.addWidget(list_widget)
+            group = QGroupBox(f'{category.value.title()} nodes')
+            group_layout = QVBoxLayout(group)
+            group_layout.setContentsMargins(4, 4, 4, 4)
+            listing = QListWidget()
+            listing.setAlternatingRowColors(True)
+            listing.itemDoubleClicked.connect(
+                lambda item: self.node_requested.emit(item.data(Qt.ItemDataRole.UserRole)))
+            for definition in get_nodes_by_category(category):
+                entry = QListWidgetItem(definition.name)
+                entry.setIcon(get_icon(definition.icon, color='#8C93A8', size=14))
+                entry.setData(Qt.ItemDataRole.UserRole, definition.id)
+                entry.setToolTip(f'{definition.description}\n\nid: {definition.id}')
+                entry.setTextAlignment(Qt.AlignmentFlag.AlignLeft
+                                       | Qt.AlignmentFlag.AlignVCenter)
+                listing.addItem(entry)
             group.setLayout(group_layout)
             layout.addWidget(group)
-        
-        layout.addStretch()
-    
-    def filter_nodes(self, text: str):
-        """Filter nodes based on search text."""
-        search_text = text.lower().strip()
-        
-        # Iterate through all group boxes (categories)
-        layout = self.layout()
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            widget = item.widget()
-            
-            if isinstance(widget, QGroupBox):
-                # Find the list widget inside the group box
-                list_widget = widget.findChild(QListWidget)
-                if not list_widget:
-                    continue
-                
-                visible_count = 0
-                # Filter items
-                for j in range(list_widget.count()):
-                    list_item = list_widget.item(j)
-                    item_text = list_item.text().lower()
-                    
-                    if not search_text or search_text in item_text:
-                        list_item.setHidden(False)
-                        visible_count += 1
-                    else:
-                        list_item.setHidden(True)
-                
-                # Hide group if no items visible
-                if visible_count > 0:
-                    widget.show()
-                else:
-                    widget.hide()
-    
-    def on_node_double_clicked(self, item: QListWidgetItem):
-        """Handle node double click."""
-        definition_id = item.data(Qt.ItemDataRole.UserRole)
-        self.node_double_clicked.emit(definition_id)
+            self.groups.append((group, listing))
+
+        layout.addStretch(1)
+
+    def filter_nodes(self, text: str) -> None:
+        wanted = text.lower().strip()
+        for group, listing in self.groups:
+            shown = 0
+            for row in range(listing.count()):
+                item = listing.item(row)
+                hit = not wanted or wanted in item.text().lower() or wanted in str(
+                    item.data(Qt.ItemDataRole.UserRole)).lower()
+                item.setHidden(not hit)
+                if hit:
+                    shown += 1
+            group.setVisible(shown > 0)
+
+    def select_definition(self, definition_id: str) -> None:
+        """Highlight a node type in the list, so a refusal says which row was meant."""
+        for group, listing in self.groups:
+            for row in range(listing.count()):
+                item = listing.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == definition_id:
+                    listing.setCurrentRow(row)
+                    group.show()
+                    return
 
 
 # ============================================================================
@@ -544,558 +499,804 @@ class NodePaletteWidget(QWidget):
 # ============================================================================
 
 class PropertiesPanel(QWidget):
-    """Panel for editing node properties."""
-    
-    parameter_changed = pyqtSignal(str, str, object)  # node_id, param_name, value
-    
-    def __init__(self):
-        super().__init__()
-        self.current_node: Optional[PipelineNode] = None
-        self.current_definition: Optional[NodeDefinition] = None
+    """Every knob of one node, as the box its type asks for, typed straight into the node.
+
+    Values are written into `node.parameters` as they change, and out-of-range numbers are
+    passed on rather than clamped - the handler is what answers for an extreme, so the run
+    can report that answer instead of this widget guessing it.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.node: Optional[PipelineNode] = None
+        self.definition: Optional[NodeDefinition] = None
         self.widgets: Dict[str, QWidget] = {}
-        
-        self.init_ui()
-    
-    def init_ui(self):
-        """Initialize UI."""
+        self._frozen = True
+
         layout = QVBoxLayout(self)
-        
-        # Title
-        title_label = QLabel("Properties")
-        title_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-        layout.addWidget(title_label)
-        
-        # Scroll area for parameters
+        layout.setContentsMargins(8, 8, 8, 8)
+        self.title = QLabel('No node selected')
+        self.title.setFont(QFont('Segoe UI', 11, QFont.Weight.Bold))
+        self.title.setWordWrap(True)
+        layout.addWidget(self.title)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        
-        self.params_widget = QWidget()
-        self.params_layout = QFormLayout(self.params_widget)
-        scroll.setWidget(self.params_widget)
-        
-        layout.addWidget(scroll)
-        
-        # Show empty state
-        self.show_empty_state()
-    
-    def show_empty_state(self):
-        """Show empty state."""
-        self.clear_parameters()
-        label = QLabel("No node selected")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #7F8C8D;")
-        self.params_layout.addRow(label)
-    
-    def clear_parameters(self):
-        """Clear all parameter widgets."""
-        while self.params_layout.count():
-            item = self.params_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.widgets.clear()
-    
-    def load_node(self, node: PipelineNode, definition: NodeDefinition):
-        """Load a node for editing."""
-        self.current_node = node
-        self.current_definition = definition
-        self.clear_parameters()
-        
-        # Node info header
-        info_label = QLabel(definition.name)
-        info_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        self.params_layout.addRow(info_label)
-        
-        desc_label = QLabel(definition.description)
-        desc_label.setWordWrap(True)
-        desc_label.setStyleSheet("color: #95A5A6;")
-        self.params_layout.addRow(desc_label)
-        
-        # Add separator
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        self.params_layout.addRow(line)
-        
-        # Create widgets for each parameter
+        self.form_host = QWidget()
+        self.form = QFormLayout(self.form_host)
+        self.form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        scroll.setWidget(self.form_host)
+        layout.addWidget(scroll, 1)
+
+        self.notes = QLabel('')
+        self.notes.setWordWrap(True)
+        self.notes.setStyleSheet('color: #E0A800;')
+        layout.addWidget(self.notes)
+
+        self.summary = QLabel('')
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet('color: #9AA3B2;')
+        layout.addWidget(self.summary)
+
+    # ---- building the rows ----
+
+    def show_empty(self, message: str = 'No node selected') -> None:
+        self._frozen = True
+        self.node = None
+        self.definition = None
+        self._clear_form()
+        self.title.setText(message)
+        self._row(QLabel('Double-click a node in the palette on the left, then click it here '
+                         'to set its knobs.'))
+        self.notes.setText('')
+        self.summary.setText('')
+        self._frozen = False
+
+    def load_node(self, node: PipelineNode, definition: NodeDefinition,
+                  stale: List[str]) -> None:
+        self._frozen = True
+        self.node = node
+        self.definition = definition
+        self._clear_form()
+        self.title.setText(definition.name)
+        self._row(QLabel(definition.description), wrap=True)
+
+        reason = definition_not_backed(definition)
+        if reason:
+            warning = QLabel(reason)
+            warning.setWordWrap(True)
+            warning.setStyleSheet('color: #E74C3C;')
+            self._row(warning)
+
+        notes: List[str] = []
         for param in definition.parameters:
-            widget = self.create_parameter_widget(param)
-            if widget:
-                label = QLabel(param.name + ("*" if param.required else ""))
-                label.setToolTip(param.description)
-                self.params_layout.addRow(label, widget)
-                self.widgets[param.name] = widget
-    
-    def create_parameter_widget(self, param) -> Optional[QWidget]:
-        """Create appropriate widget for parameter type."""
-        widget = None
-        current_value = self.current_node.parameters.get(param.name, param.default)
-        
-        if param.type == ParameterType.STRING:
-            widget = QLineEdit()
-            widget.setText(str(current_value) if current_value else "")
-            widget.textChanged.connect(
-                lambda v: self.on_parameter_changed(param.name, v)
-            )
-        
-        elif param.type == ParameterType.INT:
-            widget = QSpinBox()
-            if param.min_value is not None:
-                widget.setMinimum(int(param.min_value))
-            if param.max_value is not None:
-                widget.setMaximum(int(param.max_value))
-            widget.setValue(int(current_value) if current_value else 0)
-            widget.valueChanged.connect(
-                lambda v: self.on_parameter_changed(param.name, v)
-            )
-        
-        elif param.type == ParameterType.FLOAT:
-            widget = QDoubleSpinBox()
-            if param.min_value is not None:
-                widget.setMinimum(param.min_value)
-            if param.max_value is not None:
-                widget.setMaximum(param.max_value)
-            widget.setValue(float(current_value) if current_value else 0.0)
-            widget.setDecimals(3)
-            widget.valueChanged.connect(
-                lambda v: self.on_parameter_changed(param.name, v)
-            )
-        
-        elif param.type == ParameterType.BOOL:
-            widget = QCheckBox()
-            widget.setChecked(bool(current_value) if current_value else False)
-            widget.stateChanged.connect(
-                lambda v: self.on_parameter_changed(param.name, widget.isChecked())
-            )
-        
-        elif param.type == ParameterType.ENUM:
-            widget = QComboBox()
-            widget.addItems([str(opt) for opt in param.options])
-            if current_value:
-                index = widget.findText(str(current_value))
-                if index >= 0:
-                    widget.setCurrentIndex(index)
-            widget.currentTextChanged.connect(
-                lambda v: self.on_parameter_changed(param.name, v)
-            )
-        
-        elif param.type == ParameterType.FILE:
-            container = QWidget()
-            h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(0, 0, 0, 0)
-            
-            line_edit = QLineEdit()
-            line_edit.setText(str(current_value) if current_value else "")
-            
-            browse_btn = QPushButton("Browse...")
-            browse_btn.clicked.connect(
-                lambda: self.browse_file(param.name, line_edit)
-            )
-            
-            h_layout.addWidget(line_edit)
-            h_layout.addWidget(browse_btn)
-            widget = container
-        
-        elif param.type == ParameterType.FOLDER:
-            container = QWidget()
-            h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(0, 0, 0, 0)
-            
-            line_edit = QLineEdit()
-            line_edit.setText(str(current_value) if current_value else "")
-            
-            browse_btn = QPushButton("Browse...")
-            browse_btn.clicked.connect(
-                lambda: self.browse_folder(param.name, line_edit)
-            )
-            
-            h_layout.addWidget(line_edit)
-            h_layout.addWidget(browse_btn)
-            widget = container
-        
+            widget = self._widget_for(param, notes)
+            if widget is not None:
+                label = QLabel(param.name + (' *' if param.required else ''))
+                label.setToolTip(self._tooltip_for(param))
+                self.form.addRow(label, widget)
+
+        for name in stale:
+            self._stale_row(name)
+
+        self.notes.setText('\n'.join(notes))
+        set_count = sum(1 for param in definition.parameters
+                        if param.name in node.parameters)
+        self.summary.setText(f'{set_count} of {len(definition.parameters)} knobs typed in. '
+                              f'Everything else runs on the value the node ships with.')
+        self._frozen = False
+
+    def _clear_form(self) -> None:
+        self.widgets.clear()
+        while self.form.count():
+            slot = self.form.takeAt(0)
+            widget = slot.widget() if slot is not None else None
+            if widget is None:
+                continue
+            widget.hide()
+            widget.deleteLater()
+
+    def _row(self, widget: QWidget, wrap: bool = False) -> None:
+        if wrap:
+            widget.setWordWrap(True)
+        self.form.addRow(widget)
+
+    def _tooltip_for(self, param) -> str:
+        bounds = ''
+        if param.min_value is not None or param.max_value is not None:
+            bounds = (f"\n\nThe node suggests {param.min_value} to {param.max_value}. "
+                      f"Anything you type is passed to the backend as it stands.")
+        options = f"\n\nOptions: {', '.join(str(o) for o in param.options)}" \
+            if param.options else ''
+        return f'{param.description}{options}{bounds}'
+
+    # ---- one widget per knob type ----
+
+    def _widget_for(self, param, notes: List[str]) -> Optional[QWidget]:
+        stored = self.node.parameters.get(param.name, param.default)
+        kind = param.type
+
+        if kind == ParameterType.BOOL:
+            box = QCheckBox()
+            box.setChecked(stored if isinstance(stored, bool) else
+                           str(stored).strip().lower() in ('true', '1', 'yes', 'on'))
+            box.toggled.connect(lambda value: self._commit(param.name, bool(value)))
+            return self._wrap(param.name, box)
+
+        if kind == ParameterType.ENUM:
+            return self._enum_widget(param, stored, notes)
+
+        if kind in (ParameterType.FILE, ParameterType.FOLDER):
+            return self._path_widget(param, stored)
+
+        if kind == ParameterType.COLOR:
+            return self._color_widget(param, stored, notes)
+
+        if kind == ParameterType.VECTOR3:
+            return self._vector_widget(param, stored, notes)
+
+        if kind == ParameterType.INT:
+            box = QSpinBox()
+            box.setRange(-INT_LIMIT, INT_LIMIT)
+            value, note = _as_int(stored)
+            if note:
+                notes.append(f'{param.name}: {note}')
+            box.setValue(value)
+            box.valueChanged.connect(lambda value: self._commit(param.name, int(value)))
+            return self._wrap(param.name, box)
+
+        if kind == ParameterType.FLOAT:
+            box = QDoubleSpinBox()
+            box.setRange(-NUMBER_LIMIT, NUMBER_LIMIT)
+            box.setDecimals(6)
+            value, note = _as_float(stored)
+            if note:
+                notes.append(f'{param.name}: {note}')
+            box.setValue(value)
+            box.valueChanged.connect(lambda value: self._commit(param.name, float(value)))
+            return self._wrap(param.name, box)
+
+        box = QLineEdit('' if stored is None else str(stored))
+        box.textChanged.connect(lambda text: self._commit(param.name, text))
+        return self._wrap(param.name, box)
+
+    def _enum_widget(self, param, stored, notes: List[str]) -> QWidget:
+        box = QComboBox()
+        named = [str(option) for option in param.options]
+        text = '' if stored is None else str(stored).strip()
+        if text and text not in named:
+            box.addItem(text)
+            notes.append(f'{param.name}: this file asks for {text!r}, which the node does not '
+                         f'offer ({", ".join(named) if named else "nothing"}). It stays so you '
+                         f'can see it; the run will refuse by name.')
+        box.addItems(named)
+        if text:
+            box.setCurrentIndex(box.findText(text))
+        box.currentTextChanged.connect(lambda text: self._commit(param.name, text))
+        return self._wrap(param.name, box)
+
+    def _path_widget(self, param, stored) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        line = QLineEdit('' if stored is None else str(stored))
+        line.setPlaceholderText('D:\\...' if param.type == ParameterType.FILE
+                                else 'folder path')
+        line.textChanged.connect(lambda text: self._commit(param.name, text))
+        row.addWidget(line, 1)
+        button = QPushButton('Browse')
+        button.clicked.connect(lambda: self._browse(param.name, param.type, line))
+        row.addWidget(button)
+        host = QWidget()
+        host.setLayout(row)
+        return self._wrap(param.name, host)
+
+    def _color_widget(self, param, stored, notes: List[str]) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        line = QLineEdit('' if stored is None else str(stored))
+        line.textChanged.connect(lambda text: self._commit(param.name, text))
+        row.addWidget(line, 1)
+        swatch = QPushButton()
+        swatch.setFixedWidth(28)
+        swatch.setToolTip('Pick the colour')
+        swatch.clicked.connect(lambda: self._pick_colour(param.name, line, swatch))
+        row.addWidget(swatch)
+        self._paint_swatch(line.text(), swatch)
+        if stored is not None and not QColor(line.text()).isValid():
+            notes.append(f'{param.name}: {stored!r} is not a colour this node can use. The '
+                         f'box keeps it so you can fix it.')
+        host = QWidget()
+        host.setLayout(row)
+        return self._wrap(param.name, host)
+
+    def _vector_widget(self, param, stored, notes: List[str]) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        parts: List[Any] = []
+        if isinstance(stored, (list, tuple)):
+            parts = list(stored)
+        elif isinstance(stored, str):
+            chunks = [chunk for chunk in stored.replace(';', ',').replace(' ', ',').split(',')
+                      if chunk]
+            parts = chunks
+        if stored is not None and len(parts) != 3:
+            notes.append(f'{param.name}: this node carries {stored!r}, which is not three '
+                         f'numbers. The boxes start at 0 so you can type them.')
+        boxes = []
+        for axis in range(3):
+            box = QDoubleSpinBox()
+            box.setRange(-NUMBER_LIMIT, NUMBER_LIMIT)
+            box.setDecimals(6)
+            value = 0.0
+            if axis < len(parts):
+                value, note = _as_float(parts[axis])
+                if note:
+                    notes.append(f'{param.name} [{("X", "Y", "Z")[axis]}]: {note}')
+            box.setValue(value)
+            box.setToolTip(('X' if axis == 0 else 'Y' if axis == 1 else 'Z')
+                           + ' of ' + param.name)
+            row.addWidget(box, 1)
+            boxes.append(box)
+
+        def commit(*_args):
+            self._commit(param.name, [float(box.value()) for box in boxes])
+
+        for box in boxes:
+            box.valueChanged.connect(commit)
+        host = QWidget()
+        host.setLayout(row)
+        return self._wrap(param.name, host)
+
+    def _stale_row(self, name: str) -> None:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        text = QLabel(f'{name}: {self.node.parameters.get(name)!r}')
+        text.setWordWrap(True)
+        row.addWidget(text, 1)
+        button = QPushButton('Remove')
+        button.setToolTip('This file names a knob no handler reads. Delete it from the node.')
+        button.clicked.connect(lambda: self.remove_stale(name))
+        row.addWidget(button)
+        host = QWidget()
+        host.setLayout(row)
+        label = QLabel('no longer a knob')
+        label.setStyleSheet('color: #E74C3C;')
+        self.form.addRow(label, host)
+
+    def _wrap(self, name: str, widget: QWidget) -> QWidget:
+        self.widgets[name] = widget
         return widget
-    
-    def on_parameter_changed(self, param_name: str, value):
-        """Handle parameter value change."""
-        if self.current_node:
-            self.current_node.parameters[param_name] = value
-            self.parameter_changed.emit(self.current_node.id, param_name, value)
-    
-    def browse_file(self, param_name: str, line_edit: QLineEdit):
-        """Browse for file."""
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select File")
-        if file_path:
-            line_edit.setText(file_path)
-            self.on_parameter_changed(param_name, file_path)
-    
-    def browse_folder(self, param_name: str, line_edit: QLineEdit):
-        """Browse for folder."""
-        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if folder_path:
-            line_edit.setText(folder_path)
-            self.on_parameter_changed(param_name, folder_path)
+
+    # ---- writing ----
+
+    def _commit(self, name: str, value: Any) -> None:
+        if self._frozen or self.node is None:
+            return
+        if value == '' or value is None:
+            self.node.parameters.pop(name, None)
+        else:
+            self.node.parameters[name] = value
+
+    def remove_stale(self, name: str) -> None:
+        if self.node is not None:
+            self.node.parameters.pop(name, None)
+        self.reload()
+
+    def reload(self) -> None:
+        if self.node is not None and self.definition is not None:
+            stale = [name for name in sorted(self.node.parameters)
+                     if name not in {param.name for param in self.definition.parameters}]
+            self.load_node(self.node, self.definition, stale)
+
+    # ---- dialogs ----
+
+    def _browse(self, name: str, kind: ParameterType, line: QLineEdit) -> None:
+        if kind == ParameterType.FILE:
+            path, _ = QFileDialog.getOpenFileName(self, 'Choose the file')
+        else:
+            path = QFileDialog.getExistingDirectory(self, 'Choose the folder')
+        if path:
+            line.setText(path.replace('\\', '/'))
+
+    def _pick_colour(self, name: str, line: QLineEdit, swatch: QPushButton) -> None:
+        picked = QColorDialog.getColor(QColor(line.text()) if QColor(line.text()).isValid()
+                                       else QColor('#FFFFFF'), self, 'Pick the colour')
+        if picked.isValid():
+            line.setText(picked.name().upper())
+            self._paint_swatch(line.text(), swatch)
+
+    @staticmethod
+    def _paint_swatch(text: str, swatch: QPushButton) -> None:
+        colour = QColor(text)
+        if colour.isValid():
+            swatch.setStyleSheet(f'background-color: {colour.name()}; border: 1px solid '
+                                 f'#4A4F5C;')
+        else:
+            swatch.setStyleSheet('background-color: transparent; border: 1px dashed #E74C3C;')
 
 
 # ============================================================================
-# MAIN PIPELINE EDITOR TAB
+# THE RUN
+# ============================================================================
+
+class PipelineRunThread(QThread):
+    """Run one pipeline on its own thread and carry its answers back to the pane.
+
+    `execute_pipeline` is Qt-free and calls `log`/`node_hook` from this thread, so they are
+    wired to signals here - the only way a long node reaches the screen without the pane
+    freezing, and without a Qt object being touched from two threads at once. Staging lives
+    under the app's temp folder and is left in place, because the files the run reports are
+    staging paths and deleting them would point the report at nothing.
+    """
+
+    log_line = pyqtSignal(str)
+    node_state = pyqtSignal(str, str, str, str)
+    run_finished = pyqtSignal(dict)
+
+    def __init__(self, pipeline: Pipeline, parent=None):
+        super().__init__(parent)
+        self.pipeline = pipeline
+        self.engine = PipelineEngine(staging_root=get_temp_directory())
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        """Ask for a stop. The node running now finishes the file it is on first."""
+        self._stop_requested = True
+
+    def run(self) -> None:
+        result = self.engine.execute_pipeline(
+            self.pipeline, should_cancel=lambda: self._stop_requested,
+            log=self.log_line.emit, node_hook=self.node_state.emit)
+        self.run_finished.emit(result)
+
+
+# ============================================================================
+# THE PANE
 # ============================================================================
 
 class PipelineEditorTab(QWidget):
-    """Main pipeline editor tab with visual node editor."""
-    
-    def __init__(self, job_manager=None):
-        super().__init__()
-        self.job_manager = job_manager
-        self.current_pipeline: Optional[Pipeline] = None
-        self.current_file_path: Optional[str] = None
-        
-        # Initialize pipeline engine
-        self.engine = PipelineEngine(job_manager)
-        self.engine.log_message.connect(self.add_log_message)
-        self.engine.node_started.connect(self.on_node_started)
-        self.engine.node_completed.connect(self.on_node_completed)
-        self.engine.node_failed.connect(self.on_node_failed)
-        self.engine.pipeline_completed.connect(self.on_pipeline_completed)
-        
+    """Node graph on the left, the run's own answers on the bottom, its knobs on the right."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pipeline = self._new_pipeline()
+        self.file_path: Optional[str] = None
+        self._workers: List[PipelineRunThread] = []
+        self._active_thread: Optional[PipelineRunThread] = None
         self.init_ui()
-        self.create_new_pipeline()
-    
-    def init_ui(self):
-        """Initialize UI."""
+
+    @staticmethod
+    def _new_pipeline() -> Pipeline:
+        return Pipeline(id=str(uuid.uuid4()), name='New Pipeline')
+
+    # ---- layout ----
+
+    def init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        
-        # Toolbar
-        toolbar = self.create_toolbar()
-        layout.addWidget(toolbar)
-        
-        # Main splitter
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left: Node palette
-        self.node_palette = NodePaletteWidget()
-        self.node_palette.node_double_clicked.connect(self.add_node_from_palette)
-        self.node_palette.setMaximumWidth(250)
-        main_splitter.addWidget(self.node_palette)
-        
-        # Center: Graphics view
-        center_widget = QWidget()
-        center_layout = QVBoxLayout(center_widget)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Pipeline info
-        info_layout = QHBoxLayout()
-        self.pipeline_name_edit = QLineEdit()
-        self.pipeline_name_edit.setPlaceholderText("Pipeline Name")
-        self.pipeline_name_edit.textChanged.connect(self.on_pipeline_name_changed)
-        info_layout.addWidget(QLabel("Name:"))
-        info_layout.addWidget(self.pipeline_name_edit)
-        center_layout.addLayout(info_layout)
-        
-        self.graphics_view = PipelineGraphicsView()
-        self.graphics_view.node_selected.connect(self.on_node_selected)
-        self.graphics_view.nodes_deleted.connect(self.delete_nodes)
-        self.graphics_view.connection_created.connect(self.on_connection_created)
-        center_layout.addWidget(self.graphics_view)
-        
-        # Log output
-        log_group = QGroupBox("Execution Log")
-        log_layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._toolbar())
+
+        self.summary_label = QLabel('Ready. Nothing has run yet, so nothing is claimed.')
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.palette = NodePaletteWidget()
+        self.palette.node_requested.connect(self.add_node_from_palette)
+        self.palette.setMaximumWidth(260)
+        splitter.addWidget(self.palette)
+
+        centre = QWidget()
+        centre_layout = QVBoxLayout(centre)
+        centre_layout.setContentsMargins(0, 0, 0, 0)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel('Pipeline'))
+        self.name_edit = QLineEdit(self.pipeline.name)
+        self.name_edit.setPlaceholderText('Name this pipeline')
+        self.name_edit.textChanged.connect(lambda text: setattr(self.pipeline, 'name', text))
+        name_row.addWidget(self.name_edit, 1)
+        self.node_count_label = QLabel('0 nodes, 0 wires')
+        name_row.addWidget(self.node_count_label)
+        centre_layout.addLayout(name_row)
+
+        self.view = PipelineGraphicsView()
+        self.view.node_selected.connect(self.on_node_selected)
+        self.view.nodes_deleted.connect(self.delete_nodes)
+        self.view.wires_deleted.connect(self.delete_wires)
+        self.view.connection_created.connect(self.on_connection_created)
+        centre_layout.addWidget(self.view, 3)
+
+        results = QGroupBox('What each node answered')
+        results_layout = QVBoxLayout(results)
+        results_layout.setContentsMargins(4, 4, 4, 4)
+        self.results_table = QTableWidget(0, 5)
+        self.results_table.setHorizontalHeaderLabels(
+            ['#', 'Node', 'Status', 'What ran, in the numbers it measured', 'node id'])
+        self.results_table.setColumnHidden(4, True)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        header = self.results_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        results_layout.addWidget(self.results_table)
+        centre_layout.addWidget(results, 2)
+
+        log_box = QGroupBox('Execution Log')
+        log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(4, 4, 4, 4)
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(150)
+        self.log_output.setFont(QFont('Consolas', 9))
+        self.log_output.setMaximumHeight(140)
         log_layout.addWidget(self.log_output)
-        log_group.setLayout(log_layout)
-        center_layout.addWidget(log_group)
-        
-        main_splitter.addWidget(center_widget)
-        
-        # Right: Properties panel
-        self.properties_panel = PropertiesPanel()
-        self.properties_panel.parameter_changed.connect(self.on_parameter_changed)
-        self.properties_panel.setMaximumWidth(300)
-        main_splitter.addWidget(self.properties_panel)
-        
-        # Set splitter proportions
-        main_splitter.setSizes([250, 700, 300])
-        
-        layout.addWidget(main_splitter)
-    
-    def create_toolbar(self) -> QToolBar:
-        """Create toolbar."""
-        toolbar = QToolBar()
-        toolbar.setMovable(False)
-        
-        from .icon_provider import get_icon
-        # File actions
-        new_action = QAction("New", self)
-        new_action.setIcon(get_icon("add"))
-        new_action.triggered.connect(self.create_new_pipeline)
-        toolbar.addAction(new_action)
-        
-        open_action = QAction("Open", self)
-        open_action.setIcon(get_icon("folder"))
-        open_action.triggered.connect(self.open_pipeline)
-        toolbar.addAction(open_action)
-        
-        save_action = QAction("Save", self)
-        save_action.setIcon(get_icon("backup"))
-        save_action.triggered.connect(self.save_pipeline)
-        toolbar.addAction(save_action)
-        
-        save_as_action = QAction("Save As", self)
-        save_as_action.setIcon(get_icon("backup"))
-        save_as_action.triggered.connect(self.save_pipeline_as)
-        toolbar.addAction(save_as_action)
-        
-        toolbar.addSeparator()
-        
-        # Execution actions
-        self.run_btn = QPushButton("Run Pipeline")
-        self.run_btn.setIcon(get_icon("play"))
-        self.run_btn.setProperty("primary", "true")
-        self.run_btn.clicked.connect(self.run_pipeline)
-        toolbar.addWidget(self.run_btn)
-        
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setIcon(get_icon("stop"))
-        self.stop_btn.clicked.connect(self.stop_pipeline)
+        centre_layout.addWidget(log_box)
+
+        splitter.addWidget(centre)
+
+        self.properties = PropertiesPanel()
+        self.properties.setMaximumWidth(340)
+        splitter.addWidget(self.properties)
+
+        splitter.setSizes([240, 700, 320])
+        layout.addWidget(splitter, 1)
+        self.refresh_view()
+        self.properties.show_empty()
+
+    def _toolbar(self) -> QWidget:
+        host = QWidget()
+        bar = QHBoxLayout(host)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(6)
+
+        def button(text: str, icon: str, tip: str, handler,
+                   shortcut: str = '', primary: bool = False) -> QPushButton:
+            widget = QPushButton(text)
+            widget.setIcon(get_icon(icon, color='#D5D8DF', size=14))
+            widget.setToolTip(f'{tip}  ({shortcut})' if shortcut else tip)
+            if shortcut:
+                widget.setShortcut(shortcut)
+            if primary:
+                widget.setProperty('primary', 'true')
+            widget.clicked.connect(handler)
+            bar.addWidget(widget)
+            return widget
+
+        button('New', 'add', 'A blank pipeline', self.new_pipeline, 'Ctrl+N')
+        button('Open', 'folder', 'Open a saved pipeline', self.open_pipeline, 'Ctrl+O')
+        button('Save', 'backup', 'Save this pipeline', self.save_pipeline, 'Ctrl+S')
+        button('Save As', 'backup', 'Save it to a new file', self.save_pipeline_as,
+               'Ctrl+Shift+S')
+        bar.addSpacing(12)
+        self.run_btn = button('Run Pipeline', 'play',
+                              'Run every node in dependency order', self.run_pipeline,
+                              'Ctrl+R', primary=True)
+        self.stop_btn = button('Stop', 'stop',
+                               'Stop after the file that is in hand', self.stop_pipeline,
+                               'Ctrl+T')
         self.stop_btn.setEnabled(False)
-        toolbar.addWidget(self.stop_btn)
-        
-        toolbar.addSeparator()
-        
-        # View actions
-        zoom_in_action = QAction("Zoom In", self)
-        zoom_in_action.setIcon(get_icon("search"))
-        zoom_in_action.triggered.connect(lambda: self.graphics_view.scale(1.2, 1.2))
-        toolbar.addAction(zoom_in_action)
-        
-        zoom_out_action = QAction("Zoom Out", self)
-        zoom_out_action.setIcon(get_icon("search"))
-        zoom_out_action.triggered.connect(lambda: self.graphics_view.scale(0.8, 0.8))
-        toolbar.addAction(zoom_out_action)
-        
-        fit_action = QAction("Fit View", self)
-        fit_action.setIcon(get_icon("focus"))
-        fit_action.triggered.connect(lambda: self.graphics_view.fitInView(
-            self.graphics_view.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio
-        ))
-        toolbar.addAction(fit_action)
-        
-        return toolbar
-    
-    def create_new_pipeline(self):
-        """Create a new pipeline."""
-        import uuid
-        self.current_pipeline = Pipeline(
-            id=str(uuid.uuid4()),
-            name="New Pipeline",
-            description=""
-        )
-        self.current_file_path = None
-        self.pipeline_name_edit.setText(self.current_pipeline.name)
-        self.engine._current_pipeline = self.current_pipeline
-        self.graphics_view.clear_all()
+        bar.addSpacing(12)
+        button('Zoom In', 'search', 'Zoom in', lambda: self.view.scale(1.2, 1.2))
+        button('Zoom Out', 'search', 'Zoom out',
+               lambda: self.view.scale(1 / 1.2, 1 / 1.2))
+        button('Fit View', 'focus', 'Fit the whole graph on screen',
+               lambda: self.view.fit_all())
+        bar.addStretch(1)
+        return host
+
+    # ---- the graph on screen, always rebuilt from the Pipeline ----
+
+    def refresh_view(self, selected_id: Optional[str] = None) -> None:
+        self.view.clear_all()
+        for node in self.pipeline.nodes:
+            definition = node.get_definition()
+            if definition is not None:
+                self.view.add_node_item(node, definition)
+        for connection in self.pipeline.connections:
+            self.view.add_wire_item(connection)
+        self.node_count_label.setText(f'{len(self.pipeline.nodes)} nodes, '
+                                      f'{len(self.pipeline.connections)} wires')
+        if selected_id is not None:
+            item = self.view.node_items.get(selected_id)
+            if item is not None:
+                item.setSelected(True)
+
+    def log(self, sentence: str) -> None:
+        self.log_output.append(sentence)
+
+    # ---- new / open / save ----
+
+    def new_pipeline(self) -> None:
+        self.pipeline = self._new_pipeline()
+        self.file_path = None
+        self.name_edit.setText(self.pipeline.name)
+        self.results_table.setRowCount(0)
         self.log_output.clear()
-    
-    def open_pipeline(self):
-        """Open existing pipeline."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Pipeline", "", "Pipeline Files (*.json)"
-        )
-        
-        if file_path:
-            from ..processing.pipeline_engine import load_pipeline
-            pipeline = load_pipeline(file_path)
-            
-            if pipeline:
-                self.current_pipeline = pipeline
-                self.current_file_path = file_path
-                self.engine._current_pipeline = self.current_pipeline
-                self.load_pipeline_to_view()
-                self.add_log_message(f"Opened pipeline: {file_path}")
-            else:
-                QMessageBox.warning(self, "Error", "Failed to open pipeline")
-    
-    def save_pipeline(self):
-        """Save current pipeline."""
-        if self.current_file_path:
-            self.save_pipeline_to_file(self.current_file_path)
+        self.refresh_view()
+        self.properties.show_empty()
+        self.summary_label.setText('A blank pipeline. Nothing has run yet.')
+
+    def open_pipeline(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, 'Open pipeline', '',
+                                              'Pipeline files (*.json)')
+        if not path:
+            return
+        from ..processing.pipeline_engine import load_pipeline
+        pipeline, warnings = load_pipeline(path)
+        if pipeline is None:
+            QMessageBox.warning(self, 'Not loaded', '\n'.join(warnings))
+            self.log(f"NOT LOADED {path}: {'; '.join(warnings)}")
+            return
+        self.pipeline = pipeline
+        self.file_path = path
+        self.name_edit.setText(pipeline.name)
+        self.results_table.setRowCount(0)
+        self.refresh_view()
+        self.properties.show_empty()
+        self.log(f"Opened {path}: {len(pipeline.nodes)} node(s), "
+                 f"{len(pipeline.connections)} wire(s)")
+        if warnings:
+            QMessageBox.information(self, 'What this file brought with it',
+                                    '\n\n'.join(warnings)
+                                    + '\n\nThe pipeline was loaded as it is; nothing in the '
+                                      'file was rewritten.')
+
+    def save_pipeline(self) -> None:
+        if self.file_path:
+            self.save_pipeline_to_file(self.file_path)
         else:
             self.save_pipeline_as()
-    
-    def save_pipeline_as(self):
-        """Save pipeline as new file."""
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Pipeline As", "", "Pipeline Files (*.json)"
-        )
-        
-        if file_path:
-            if not file_path.endswith('.json'):
-                file_path += '.json'
-            self.save_pipeline_to_file(file_path)
-            self.current_file_path = file_path
-        self.engine._current_pipeline = self.current_pipeline
-    
-    def save_pipeline_to_file(self, file_path: str):
-        """Save pipeline to file."""
-        from ..processing.pipeline_engine import save_pipeline
-        
-        if save_pipeline(self.current_pipeline, file_path):
-            self.add_log_message(f"Saved pipeline: {file_path}")
-        else:
-            QMessageBox.warning(self, "Error", "Failed to save pipeline")
-    
-    def load_pipeline_to_view(self):
-        """Load current pipeline into the view."""
-        self.graphics_view.clear_all()
-        self.pipeline_name_edit.setText(self.current_pipeline.name)
-        self.engine._current_pipeline = self.current_pipeline
-        
-        # Add nodes
-        for node in self.current_pipeline.nodes:
-            definition = node.get_definition()
-            if definition:
-                self.graphics_view.add_node_item(node, definition)
-        
-        # Add connections
-        for connection in self.current_pipeline.connections:
-            self.graphics_view.add_connection_item(connection)
-    
-    def add_node_from_palette(self, definition_id: str):
-        """Add node from palette."""
-        import uuid
-        
-        definition = NODE_DEFINITIONS.get(definition_id)
-        if not definition:
-            return
-        
-        # Create node at center of view
-        view_center = self.graphics_view.mapToScene(
-            self.graphics_view.viewport().rect().center()
-        )
-        
-        node = PipelineNode(
-            id=str(uuid.uuid4()),
-            definition_id=definition_id,
-            position=(view_center.x(), view_center.y()),
-            parameters={}
-        )
-        
-        # Set default parameters
-        for param in definition.parameters:
-            if param.default is not None:
-                node.parameters[param.name] = param.default
-        
-        self.current_pipeline.nodes.append(node)
-        self.graphics_view.add_node_item(node, definition)
-        self.add_log_message(f"Added node: {definition.name}")
-    
-    def delete_nodes(self, node_ids: List[str]):
-        """Delete nodes."""
-        for node_id in node_ids:
-            # Remove from pipeline
-            self.current_pipeline.nodes = [
-                n for n in self.current_pipeline.nodes if n.id != node_id
-            ]
-            
-            # Remove connections
-            self.current_pipeline.connections = [
-                c for c in self.current_pipeline.connections
-                if c.from_node != node_id and c.to_node != node_id
-            ]
-            
-            # Remove from view
-            self.graphics_view.remove_node_item(node_id)
-        
-        # Reload view
-        self.load_pipeline_to_view()
-        self.add_log_message(f"Deleted {len(node_ids)} node(s)")
-    
-    def on_node_selected(self, node: PipelineNode, definition: NodeDefinition):
-        """Handle node selection."""
-        self.properties_panel.load_node(node, definition)
-    
-    def on_parameter_changed(self, node_id: str, param_name: str, value):
-        """Handle parameter change."""
-        # Already updated in the node object
-        pass
-    
-    def on_pipeline_name_changed(self, name: str):
-        """Handle pipeline name change."""
-        if self.current_pipeline:
-            self.current_pipeline.name = name
 
-    def on_connection_created(self, from_node_id: str, to_node_id: str):
-        """Handle new connection creation."""
-        if not self.current_pipeline:
+    def save_pipeline_as(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, 'Save pipeline', '',
+                                             'Pipeline files (*.json)')
+        if not path:
             return
-            
-        # Create connection object
-        connection = PipelineConnection(from_node_id, to_node_id)
-        
-        # Add to pipeline
-        if self.engine.add_connection(connection):
-            # Add to view
-            self.graphics_view.add_connection_item(connection)
-            self.log_output.append(f"Connected {from_node_id} -> {to_node_id}")
+        if not path.lower().endswith('.json'):
+            path += '.json'
+        if self.save_pipeline_to_file(path):
+            self.file_path = path
+
+    def save_pipeline_to_file(self, path: str) -> bool:
+        from ..processing.pipeline_engine import save_pipeline
+        ok, why = save_pipeline(self.pipeline, path)
+        if ok:
+            self.log(f'Saved {path}: {len(self.pipeline.nodes)} node(s) and '
+                     f'{len(self.pipeline.connections)} wire(s) were written and counted back '
+                     f'off the file')
+            self.summary_label.setText(f'Saved to {path}.')
+            return True
+        QMessageBox.warning(self, 'Not saved', why)
+        self.log(f'NOT SAVED: {why}')
+        return False
+
+    # ---- editing the graph ----
+
+    def add_node_from_palette(self, definition_id: str,
+                              parameters: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Put one node of this type on the graph, or say why it cannot be put there."""
+        definition = NODE_DEFINITIONS.get(definition_id)
+        if definition is None:
+            self.log(f'NOT ADDED: this build has no node type {definition_id}')
+            QMessageBox.warning(self, 'Not added',
+                                f'This build has no node type {definition_id}.')
+            return None
+        reason = definition_not_backed(definition)
+        if reason:
+            self.log(f'NOT ADDED: {reason}')
+            QMessageBox.warning(self, 'Not added', reason)
+            return None
+        position = self.view.mapToScene(self.view.viewport().rect().center())
+        offset = 24 * sum(1 for node in self.pipeline.nodes
+                          if node.definition_id == definition_id)
+        node = PipelineNode(id=str(uuid.uuid4()), definition_id=definition_id,
+                            position=(position.x() - 105 + offset,
+                                      position.y() - 46 + offset),
+                            parameters=dict(parameters or {}))
+        ok, why = self.pipeline.add_node(node)
+        if not ok:
+            self.log(f'NOT ADDED: {why}')
+            return None
+        self.refresh_view(selected_id=node.id)
+        self.on_node_selected(node.id)
+        self.log(f'Added {definition.name}. Its knobs are on the right; nothing has run yet.')
+        return node.id
+
+    def accept_model_file(self, path: str) -> None:
+        """Take a file the Library handed over as a Load node on this graph."""
+        cloud = path.lower().endswith(CLOUD_SUFFIXES)
+        definition_id = 'input.load_cloud' if cloud else 'input.load_model'
+        node_id = self.add_node_from_palette(definition_id,
+                                             {'file_path': path.replace('\\', '/')})
+        if node_id:
+            self.log(f"{NODE_DEFINITIONS[definition_id].name} now points at {path}; wire it "
+                     f"to a step and press Run Pipeline.")
+
+    def delete_nodes(self, node_ids: List[str]) -> None:
+        removed = 0
+        for node_id in node_ids:
+            ok, why = self.pipeline.remove_node(node_id)
+            if ok:
+                removed += 1
+            else:
+                self.log(f'NOT DELETED: {why}')
+        self.refresh_view()
+        self.properties.reload()
+        if removed:
+            self.log(f'Deleted {removed} node(s) and every wire into or out of them.')
+
+    def delete_wires(self, pairs: List[Tuple[str, str]]) -> None:
+        for from_id, to_id in pairs:
+            ok, why = self.pipeline.remove_connection(PipelineConnection(from_id, to_id))
+            if not ok:
+                self.log(f'NOT DELETED: {why}')
+        self.refresh_view()
+        self.properties.reload()
+
+    def on_connection_created(self, from_id: str, to_id: str) -> None:
+        ok, why = self.pipeline.add_connection(PipelineConnection(from_id, to_id))
+        if ok:
+            self.refresh_view()
+            source = self.pipeline.node_by_id(from_id).get_definition()
+            target = self.pipeline.node_by_id(to_id).get_definition()
+            self.log(f'Wired {source.name} to {target.name}.')
         else:
-            self.log_output.append(f"Failed to connect {from_node_id} -> {to_node_id} (Cycle detected?)")
-    
-    def run_pipeline(self):
-        """Run the pipeline."""
-        if not self.current_pipeline or not self.current_pipeline.nodes:
-            QMessageBox.warning(self, "Warning", "Pipeline is empty")
+            self.log(f'NOT WIRED: {why}')
+
+    def on_node_selected(self, node_id: str) -> None:
+        node = self.pipeline.node_by_id(node_id)
+        if node is None:
+            self.properties.show_empty()
             return
-        
+        definition = node.get_definition()
+        if definition is None:
+            self.properties.show_empty(
+                f'{node_id} is a {node.definition_id}, which this build does not have')
+            return
+        self.properties.load_node(node, definition, self.pipeline.unknown_parameters(node))
+
+    # ---- running ----
+
+    def _keep_worker(self, thread: PipelineRunThread) -> None:
+        """Hold every started worker until it says it is done.
+
+        Dropping the last Python reference of a running QThread is answered by Qt with a
+        process abort - no exception, no message, the window simply goes.
+        """
+        self._workers.append(thread)
+        thread.finished.connect(lambda: self._release_worker(thread))
+        # Both the verdict and the thread's own end reopen the pane, so a run that somehow
+        # ended without answering cannot leave the buttons greyed out forever.
+        thread.finished.connect(self._reopen_pane)
+
+    def _release_worker(self, thread: Optional[PipelineRunThread]) -> None:
+        """Drop a worker only once it has said it finished.
+
+        `run_finished` is not that moment: the thread is still winding down, and removing
+        the last reference to a live QThread is answered by Qt with a process abort. So the
+        pane is reopened by `_reopen_pane` and the reference is dropped here, on `finished`.
+        """
+        if thread in self._workers:
+            self._workers.remove(thread)
+
+    def _reopen_pane(self) -> None:
+        self._active_thread = None
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.palette.setEnabled(True)
+        self.properties.setEnabled(True)
+
+    def run_pipeline(self) -> None:
+        if self._active_thread is not None:
+            self.log('NOT STARTED: a run is already in progress. Stop it first.')
+            return
+        if not self.pipeline.nodes:
+            QMessageBox.warning(self, 'Nothing to run',
+                                f'{self.pipeline.name} has no nodes. Double-click one in the '
+                                f'palette on the left.')
+            return
+        problems = self.pipeline.problems()
+        if problems:
+            QMessageBox.warning(self, 'This pipeline will not run', '\n\n'.join(problems))
+            self.log('NOT STARTED: ' + '; '.join(problems))
+            self.summary_label.setText(f'Not started: {problems[0]}')
+            return
+
+        self.results_table.setRowCount(0)
+        self.log_output.clear()
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.log_output.clear()
-        
-        # Reset node states
-        for item in self.graphics_view.node_items.values():
-            item.is_executing = False
-            item.is_completed = False
-            item.is_failed = False
-            item.update()
-        
-        # Execute in separate thread
-        QTimer.singleShot(100, lambda: self.engine.execute_pipeline(self.current_pipeline))
-    
-    def stop_pipeline(self):
-        """Stop pipeline execution."""
-        self.engine.stop()
-        self.run_btn.setEnabled(True)
+        self.palette.setEnabled(False)
+        self.properties.setEnabled(False)
+        self.properties.show_empty('Running - the knobs are locked until the run answers')
+        self.summary_label.setText(f'Running {self.pipeline.name}: '
+                                   f'{len(self.pipeline.nodes)} node(s).')
+
+        thread = PipelineRunThread(self.pipeline)
+        thread.log_line.connect(self.log)
+        thread.node_state.connect(self.on_node_state)
+        thread.run_finished.connect(self.on_run_finished)
+        self._keep_worker(thread)
+        self._active_thread = thread
+        thread.start()
+
+    def stop_pipeline(self) -> None:
+        if self._active_thread is None:
+            self.log('Nothing is running, so there is nothing to stop.')
+            return
+        self._active_thread.request_stop()
         self.stop_btn.setEnabled(False)
-    
-    def on_node_started(self, node_id: str):
-        """Handle node execution started."""
-        if node_id in self.graphics_view.node_items:
-            item = self.graphics_view.node_items[node_id]
-            item.is_executing = True
-            item.update()
-    
-    def on_node_completed(self, node_id: str):
-        """Handle node execution completed."""
-        if node_id in self.graphics_view.node_items:
-            item = self.graphics_view.node_items[node_id]
-            item.is_executing = False
-            item.is_completed = True
-            item.update()
-    
-    def on_node_failed(self, node_id: str, error: str):
-        """Handle node execution failed."""
-        if node_id in self.graphics_view.node_items:
-            item = self.graphics_view.node_items[node_id]
-            item.is_executing = False
-            item.is_failed = True
-            item.update()
-    
-    def on_pipeline_completed(self):
-        """Handle pipeline execution completed."""
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-    
-    def add_log_message(self, message: str):
-        """Add message to log."""
-        self.log_output.append(message)
+        self.summary_label.setText('Stopping after the file that is in hand.')
+
+    def on_node_state(self, node_id: str, name: str, status: str, detail: str) -> None:
+        self.view.set_node_result(node_id, status, detail)
+        if status == 'running':
+            return
+        row = self._row_for(node_id, name)
+        self._write_row(row, status, detail if detail or status != 'done'
+                        else 'done, and nothing was reported about it')
+
+    def _row_for(self, node_id: str, name: str) -> int:
+        """The row this node already has, or the next empty one.
+
+        Rows are keyed by node id in a hidden column so a node that refused, then ran again,
+        updates the row the person is looking at instead of adding a second verdict.
+        """
+        for existing in range(self.results_table.rowCount()):
+            item = self.results_table.item(existing, 4)
+            if item is not None and item.text() == node_id:
+                return existing
+        row = self.results_table.rowCount()
+        self.results_table.insertRow(row)
+        self.results_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+        self.results_table.setItem(row, 1, QTableWidgetItem(name))
+        self.results_table.setItem(row, 4, QTableWidgetItem(node_id))
+        return row
+
+    def _write_row(self, row: int, status: str, detail: str) -> None:
+        unknown = status not in STATUSES and status != 'running'
+        state = QTableWidgetItem(f'{status} (not a status the engine reports)'
+                                 if unknown else (status or 'no status'))
+        state.setForeground(QColor(STATUS_COLORS.get(status, NOT_RUN_COLOR)))
+        self.results_table.setItem(row, 2, state)
+        answer = QTableWidgetItem(detail)
+        answer.setToolTip(detail)
+        self.results_table.setItem(row, 3, answer)
+        self.results_table.resizeRowToContents(row)
+
+    def on_run_finished(self, result: Dict[str, Any]) -> None:
+        for position, row in enumerate(result.get('nodes') or []):
+            where = self._row_for(row['id'], row['name'])
+            self.results_table.setItem(where, 0, QTableWidgetItem(str(position + 1)))
+            self._write_row(where, row['status'], row['detail'])
+        counts = result.get('counts') or {}
+        files = result.get('files') or []
+        reason = result.get('reason') or ''
+        sentence = (f"{result.get('status', 'unknown')} in {result.get('elapsed', 0)}s - "
+                    f"{reason or counts}")
+        self.summary_label.setText(f"{sentence} | {len(files)} file(s) written | staging: "
+                                   f"{result.get('staging', 'none')}")
+        if result.get('exception'):
+            self.log(f"NODE CRASHED WITH {result['exception']}")
+        if counts.get('failed'):
+            QMessageBox.warning(self, 'A node crashed',
+                                f"{result['status']}: {reason}\n\nThe files its earlier nodes "
+                                f"wrote are still in the staging folder named in the bar above.")
+        elif counts.get('refused') or counts.get('invalid'):
+            self.log(f"{counts['refused']} refused, {counts['invalid']} read wrong. The rows "
+                     f"say which, in the words the engine answered with.")
+        selected = [item for item in self.view.graph.selectedItems()
+                    if isinstance(item, NodeGraphicsItem)]
+        if selected:
+            self.on_node_selected(selected[0].node.id)
+        else:
+            self.properties.show_empty(
+                'No node selected - click one to see the knobs it ran with.')
+        self._reopen_pane()

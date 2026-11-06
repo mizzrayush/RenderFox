@@ -328,12 +328,20 @@ def render_file(geometry_path: str, out_path: str, width: int = 1920, height: in
                 camera: Optional[Camera] = None, light: Optional[Light] = None,
                 background: Tuple[float, float, float] = (0.12, 0.12, 0.14),
                 transparent: bool = False, point_size: float = 3.0,
-                display_mode: str = 'object', should_cancel=None) -> Dict[str, Any]:
+                display_mode: str = 'object', should_cancel=None,
+                supersample: int = 1) -> Dict[str, Any]:
     """Draw `geometry_path` into `out_path` and report what the written file says about itself.
 
     Raises `PreviewError` with the reason instead of returning a picture that was never
     drawn: a file that is the wrong size, or one whose every pixel is the background colour,
     is not a render of anything.
+
+    `supersample` is how many times the size of the picture the frame is drawn at before it
+    is filtered back down. There is one raster here and it draws one frame per call, so the
+    samples are not N exposures averaged together - the geometry is drawn once at N times the
+    edge and a Lanczos filter folds N x N pixels into one, which is what removes the staircase
+    on a diagonal edge. The verdict says which multiple actually ran, because this machine
+    will not open a window past the ceiling.
     """
     blocked = renderer_blocker()
     if blocked:
@@ -356,8 +364,14 @@ def render_file(geometry_path: str, out_path: str, width: int = 1920, height: in
     # realises and then resampled to the size that was asked for.
     final_width = int(min(MAX_WINDOW, max(1, asked_width)))
     final_height = int(min(MAX_WINDOW, max(1, asked_height)))
-    window_width = int(min(MAX_WINDOW, max(MIN_WINDOW_WIDTH, final_width)))
-    window_height = int(min(MAX_WINDOW, max(MIN_WINDOW_HEIGHT, final_height)))
+    samples_asked = max(1, int(supersample))
+    # The enlarged frame is the thing that has to fit under the ceiling, so the multiple is
+    # cut to the largest one that does rather than opened short and reported as if it ran.
+    ceiling = MAX_WINDOW // max(1, final_width, final_height)
+    samples = max(1, min(samples_asked, ceiling))
+    draw_width, draw_height = final_width * samples, final_height * samples
+    window_width = int(min(MAX_WINDOW, max(MIN_WINDOW_WIDTH, draw_width)))
+    window_height = int(min(MAX_WINDOW, max(MIN_WINDOW_HEIGHT, draw_height)))
     camera = camera or Camera()
 
     geometry, kind = _read_geometry(geometry_path)
@@ -381,15 +395,22 @@ def render_file(geometry_path: str, out_path: str, width: int = 1920, height: in
     frame, (open_width, open_height) = _capture(geometry, window_width, window_height, camera,
                                                 background_rgb, point_size)
     reasons = []
+    if (open_width, open_height) != (draw_width, draw_height):
+        reasons.append(f'this machine opened its window at {open_width}x{open_height} rather '
+                       f'than the {draw_width}x{draw_height} this picture needed (it will not '
+                       f'go below {MIN_WINDOW_WIDTH}x{MIN_WINDOW_HEIGHT} or above the '
+                       f'desktop), so the frame was drawn at the size it did open')
     if (open_width, open_height) != (final_width, final_height):
         frame = _resample(frame, final_width, final_height)
-        reasons.append(f'this machine opened its window at {open_width}x{open_height} rather '
-                       f'than {final_width}x{final_height} (it will not go below '
-                       f'{MIN_WINDOW_WIDTH}x{MIN_WINDOW_HEIGHT} or above the desktop), so the '
-                       f'frame was redrawn to the size asked for')
+    if samples > 1:
+        reasons.append(f'one frame was drawn at {samples}x the edge and filtered back down '
+                       f'to {final_width}x{final_height}')
     if (final_width, final_height) != (asked_width, asked_height):
         reasons.append(f'the picture is capped at {MAX_WINDOW} px, not the {asked_width}x'
                        f'{asked_height} asked for')
+    if samples_asked != samples:
+        reasons.append(f'supersample was cut from {samples_asked}x to {samples}x so the frame '
+                       f'still fits under the {MAX_WINDOW} px ceiling')
     note = ' '.join(reasons)
 
     background_pixel = np.round(np.asarray(background_rgb) * 255).astype(np.uint8)
@@ -453,6 +474,8 @@ def render_file(geometry_path: str, out_path: str, width: int = 1920, height: in
         'asked_width': asked_width,
         'asked_height': asked_height,
         'window_opened': [open_width, open_height],
+        'supersample': samples,
+        'supersample_asked': samples_asked,
         'note': note,
         'mode': mode,
         'kind': kind,
