@@ -22,6 +22,15 @@ And three things about the file, not the frame: the window will not open narrowe
 nor larger than the desktop, `o3d.geometry.Image` cannot write a PNG here so the encoders are
 Pillow's, and every number in the verdict is counted from the written file re-opened from disk.
 
+Four of these rules cannot be proven through a window at all, because when the line is wrong
+Open3D kills the process and a dead process reports no failing test: a mesh painted with the
+point-cloud channel, an extrinsic that puts the eye behind the model, a fitted eye that sits
+inside the geometry, and a camera whose position is the point it looks at. `SeamCase` reaches
+them through the module's own seams - four pure helpers and `_place` driven by a control that
+only records what the product writes - and `WrittenFileCase` reaches the two verdict rules that
+a real frame never produces by accident: a file that re-reads as nothing but background, and a
+silhouette one pixel wide.
+
 Run: python -X utf8 tests/test_preview_render_contract.py
 """
 
@@ -422,6 +431,30 @@ class FormatAndSizeCase(unittest.TestCase):
         self.assertEqual(verdict['asked_width'], 99999)
         self.assertIn('capped at 900 px', verdict['note'])
 
+    def test_supersample_draws_one_frame_at_the_multiple_and_reports_it(self):
+        """The multiple is a bigger window folded down, and the verdict says which one ran."""
+        verdict = render(name='ss2.png', width=200, height=200, supersample=2)
+        self.assertEqual((verdict['width'], verdict['height']), (200, 200))
+        self.assertEqual([400, 400], verdict['window_opened'],
+                         'the frame was not drawn at twice the edge')
+        self.assertEqual(2, verdict['supersample'])
+        self.assertEqual(2, verdict['supersample_asked'])
+        self.assertIn('one frame was drawn at 2x the edge', verdict['note'])
+
+    def test_a_supersample_that_will_not_fit_is_cut_and_says_so(self):
+        ceiling = pr.MAX_WINDOW
+        pr.MAX_WINDOW = 900
+        try:
+            verdict = render(name='sscut.png', width=300, height=300, supersample=4,
+                             reuse=False)
+        finally:
+            pr.MAX_WINDOW = ceiling
+        self.assertEqual(3, verdict['supersample'], 'the multiple that could not open is '
+                                                    'reported as though it did')
+        self.assertEqual(4, verdict['supersample_asked'])
+        self.assertEqual((verdict['width'], verdict['height']), (300, 300))
+        self.assertIn('supersample was cut from 4x to 3x', verdict['note'])
+
     def test_transparency_accounts_for_every_pixel_in_the_file(self):
         verdict = render(name='transparent.png', width=400, height=400, light=pr.Light(),
                          transparent=True)
@@ -483,6 +516,182 @@ class StopCase(unittest.TestCase):
         self.assertIn('was written and then the run was stopped', str(caught.exception))
         self.assertGreaterEqual(len(asked), 2, 'the frame was never asked for')
         self.assertTrue(os.path.isfile(out))
+
+
+class SeamCase(unittest.TestCase):
+    """The five rules a window would take the process down before it could report them.
+
+    Each of these is the answer to a mutation that the sweep could only detect by killing
+    the suite - the Open3D window segfaults on a nan camera and on a mesh painted as points,
+    so no `FAIL:` line is ever printed and no test owns the defect. The lines below are the
+    same code paths through the seams the module already has: `_extrinsic`, `_fit_distance`,
+    `_display_colors` and `_paint` are pure, and `_place` is driven by a stand-in that keeps
+    whatever the product writes into the camera parameters. Nothing here tests a stand-in's
+    behaviour; each asserts what the product produced, and reverting any of these lines makes
+    the named test go red inside a process that finishes.
+    """
+
+    class _Intrinsic:
+        def __init__(self):
+            self.intrinsic_matrix = np.eye(3)
+
+    class _Parameters:
+        def __init__(self):
+            self.extrinsic = np.eye(4)
+            self.intrinsic = SeamCase._Intrinsic()
+
+    class _Control:
+        """The two methods `_place` calls on the view control, keeping what it hands back."""
+
+        def __init__(self):
+            self.received = None
+
+        def convert_to_pinhole_camera_parameters(self):
+            return SeamCase._Parameters()
+
+        def convert_from_pinhole_camera_parameters(self, parameters, allow_arbitrary=False):
+            self.received = parameters
+
+    class _Window:
+        def __init__(self):
+            self.control = SeamCase._Control()
+
+        def get_view_control(self):
+            return self.control
+
+    class _Bounds:
+        def __init__(self, low, high):
+            self._low = np.asarray(low, dtype=float)
+            self._high = np.asarray(high, dtype=float)
+
+        def get_min_bound(self):
+            return self._low
+
+        def get_max_bound(self):
+            return self._high
+
+    def place(self, camera, low=(-1.0, -1.0, -0.6), high=(1.0, 1.0, 0.6), width=400, height=300):
+        window = SeamCase._Window()
+        pr._place(window, SeamCase._Bounds(low, high), camera, width, height)
+        return window.control.received
+
+    def test_the_extrinsic_puts_the_eye_at_the_camera_origin_and_its_target_in_front(self):
+        """The eye is the origin of its own frame, and what it looks at sits at positive z."""
+        for eye, target, up in (((0.0, 0.0, 3.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                                ((2.0, -1.0, 0.5), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                                ((0.0, 0.0, 0.0), (4.0, 4.0, 4.0), (0.0, 0.0, 1.0))):
+            with self.subTest(eye=eye):
+                matrix = pr._extrinsic(np.asarray(eye), np.asarray(target), np.asarray(up))
+                eye_in_its_own_frame = matrix @ np.append(np.asarray(eye, float), 1.0)
+                self.assertEqual(np.round(eye_in_its_own_frame, 9).tolist(), [0.0, 0.0, 0.0, 1.0],
+                                 'the extrinsic does not travel with the eye')
+                ahead = matrix @ np.append(np.asarray(target, float), 1.0)
+                self.assertGreater(ahead[2], 0.0, 'the point looked at sits behind the camera')
+
+    def test_the_fitted_distance_projects_the_whole_bounding_sphere_inside_the_frame(self):
+        for fov in (15.0, 45.0, 90.0):
+            for width, height in ((400, 400), (640, 480)):
+                with self.subTest(fov=fov, size=(width, height)):
+                    radius = 1.0
+                    distance = pr._fit_distance(radius, fov, width, height)
+                    self.assertGreater(distance, radius, 'the fitted eye is inside the model')
+                    focal = (height / 2.0) / np.tan(np.radians(fov) / 2.0)
+                    projected = focal * radius / distance
+                    self.assertLessEqual(projected, height / 2.0,
+                                         'the sphere leaves the frame top and bottom')
+                    self.assertLessEqual(projected, width / 2.0, 'the sphere leaves the sides')
+
+    def test_the_coordinate_maps_ramp_on_the_axis_their_names_promise(self):
+        expected = {'x_coordinate': 0, 'y_coordinate': 1, 'z_coordinate': 2, 'height': 2}
+        for mode, axis in expected.items():
+            with self.subTest(mode=mode):
+                points = np.zeros((24, 3))
+                points[:, axis] = np.linspace(0.0, 5.0, 24)
+                ramp = pr._display_colors(None, mode, points, None)[:, 0]
+                self.assertGreater(ramp[-1] - ramp[0], 0.9,
+                                   f'{mode} did not ramp along axis {axis}')
+                self.assertTrue(bool(np.all(np.diff(ramp) > 0.0)), f'{mode} ramp is not ordered')
+        # `height` means the vertical extent, so a column that varies only in x is flat.
+        sideways = np.zeros((24, 3))
+        sideways[:, 0] = np.linspace(0.0, 5.0, 24)
+        colors = pr._display_colors(None, 'height', sideways, None)
+        self.assertAlmostEqual(float(colors[:, 0].max() - colors[:, 0].min()), 0.0,
+                               msg='the height map ramped along an axis that is not the height')
+
+    def test_a_surface_is_painted_with_vertex_colours_and_not_point_colours(self):
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]))
+        mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [1, 3, 2]])
+        pr._paint(mesh, 'surface', np.full((4, 3), 0.25))
+        self.assertTrue(mesh.has_vertex_colors(), 'a mesh was handed the point-cloud channel')
+        self.assertEqual(np.round(np.asarray(mesh.vertex_colors), 6).tolist(),
+                         [[0.25, 0.25, 0.25]] * 4)
+
+    def test_the_pinhole_matrix_puts_the_principal_point_at_the_centre_of_the_frame(self):
+        for width, height, fov in ((640, 480, 45.0), (320, 200, 60.0)):
+            with self.subTest(size=(width, height)):
+                written = self.place(pr.Camera(fov=fov), width=width, height=height)
+                intrinsic = written.intrinsic.intrinsic_matrix
+                self.assertEqual(float(intrinsic[0, 2]), width / 2.0,
+                                 'the model is drawn off to one side of its own picture')
+                self.assertEqual(float(intrinsic[1, 2]), height / 2.0,
+                                 'the model is drawn off the middle, vertically')
+                focal = (height / 2.0) / np.tan(np.radians(fov) / 2.0)
+                self.assertAlmostEqual(float(intrinsic[0, 0]), float(focal), places=6)
+                self.assertAlmostEqual(float(intrinsic[1, 1]), float(focal), places=6)
+
+    def test_a_fitted_camera_placed_on_the_point_it_looks_at_refuses(self):
+        with self.assertRaises(pr.PreviewError) as caught:
+            self.place(pr.Camera(position=(0.0, 0.0, 0.0), target=(0.0, 0.0, 0.0), fit=True))
+        self.assertIn('no direction to look in', str(caught.exception))
+
+    def test_an_unfitted_camera_on_the_point_it_looks_at_refuses(self):
+        with self.assertRaises(pr.PreviewError) as caught:
+            self.place(pr.Camera(position=(0.0, 0.0, 0.0), target=(0.0, 0.0, 0.0), fit=False))
+        self.assertIn('no direction to look in', str(caught.exception))
+
+
+class WrittenFileCase(unittest.TestCase):
+    """The two verdict rules that only the file on disk can show, forced without a window."""
+
+    def test_a_file_that_rereads_as_only_background_refuses(self):
+        """What the encoder actually wrote is the answer, not the buffer it was handed."""
+        from PIL import Image as PilImage
+        original = pr._write
+
+        def write_flat_background(image, alpha, out_path):
+            flat = np.full(image.shape, np.round(np.asarray([0.12, 0.12, 0.14]) * 255),
+                           dtype=np.uint8)
+            PilImage.fromarray(flat).save(out_path)
+
+        out = os.path.join(TMP, 'flat_background.png')
+        pr._write = write_flat_background
+        try:
+            with self.assertRaises(pr.PreviewError) as caught:
+                pr.render_file(BOX, out, 200, 200)
+        finally:
+            pr._write = original
+        self.assertIn('nothing but the background', str(caught.exception))
+        self.assertIn('re-read from disk', str(caught.exception))
+
+    def test_a_one_column_wide_silhouette_is_one_pixel_wide(self):
+        """A bounds inclusive of both ends: one lit column is one pixel, not zero."""
+        original = pr._capture
+        frame = np.tile(np.round(np.asarray([0.12, 0.12, 0.14]) * 255).astype(np.uint8),
+                        (200, 200, 1))
+        frame[:, 77] = (200, 120, 40)
+        pr._capture = lambda geometry, width, height, camera, background, point_size: (
+            frame.copy(), (width, height))
+        out = os.path.join(TMP, 'one_column.png')
+        try:
+            verdict = pr.render_file(BOX, out, 200, 200)
+        finally:
+            pr._capture = original
+        self.assertEqual(verdict['silhouette_width'], 1,
+                         'a single lit column measured as nothing wide')
+        self.assertEqual(verdict['silhouette_height'], 200)
+        self.assertEqual(verdict['covered_pixels'], 200)
 
 
 class SourceContractCase(unittest.TestCase):
