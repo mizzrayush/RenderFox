@@ -3,7 +3,10 @@ The Diagnostics pane: system checks, health indicators, and the recorded error l
 """
 
 import datetime
+import json
 import logging
+import os
+import weakref
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QPushButton, QComboBox, QLabel, QGroupBox, QFormLayout, 
                              QSpinBox, QDoubleSpinBox, QSlider, QTabWidget, QCheckBox,
@@ -11,14 +14,17 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
                              QListWidget, QTreeWidget, QTreeWidgetItem, QPlainTextEdit,
                              QFileDialog, QMessageBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QThreadPool
 from PyQt6.QtGui import QFont, QColor, QTextCharFormat, QSyntaxHighlighter
 
 # Import diagnostic engine
 from ..features.diagnostic_engine import (
     DiagnosticEngine, SystemInfo, DependencyChecker, 
-    HealthChecker, PerformanceBenchmark, OpenGLInfo
+    HealthChecker, OpenGLInfo
 )
+from ..features.performance_analyzer import BenchmarkRunner, benchmark_engine
+from ..utils.frame_clock import shared_clock
+from ..utils.worker import Worker
 from .icon_provider import get_icon
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
@@ -74,16 +80,72 @@ class LogSyntaxHighlighter(QSyntaxHighlighter):
                     self.setFormat(start, len(level), self.formats[level])
                     break
 
+class PaneLogHandler(logging.Handler):
+    """Turns the app's own log records into rows in the Diagnostics log table.
+
+    The table used to be filled by five lines written at startup - an OpenGL context
+    that may not exist, a model nobody loaded, a GPU percentage nothing read - because
+    no part of the app ever called its `add_log_entry`. This is the source that was
+    missing. `emit` only re-emits a Qt signal, so a record logged on a worker thread
+    reaches the table through the event loop rather than from that thread.
+
+    It holds the pane weakly and looks the signal up when a record arrives. A bound
+    signal kept its own reference to the receiver's Qt object, so a handler left on the
+    root logger after its pane closed was a live reference into memory Qt had already
+    handed to the next widget - which is how an exit-time log record segfaulted the
+    process during testing.
+    """
+
+    def __init__(self, pane) -> None:
+        super().__init__()
+        self._pane = weakref.ref(pane)
+
+    def emit(self, record) -> None:
+        pane = self._pane()
+        if pane is None:
+            return
+        try:
+            pane.log_record.emit(record.levelname, record.name, record.getMessage())
+        except (RuntimeError, TypeError):
+            # The pane's Qt object is gone: a rebuilt window, or a record arriving after
+            # teardown. A log line is never a reason to stop the app.
+            pass
+
+    def pane_alive(self) -> bool:
+        """Whether the pane this handler belongs to is still there to receive a record."""
+        return self._pane() is not None
+
+
+def _detach_when_destroyed(root, handler):
+    """The closure that takes a pane's log handler off the root logger when it dies.
+
+    A bound method connected to the pane's own `destroyed` is never called: PyQt drops a
+    slot whose receiver is the object being torn down, which is exactly the object whose
+    death is being noticed. A plain closure over the handler does fire, and without it
+    the root logger keeps a dead handler for every pane the app ever built.
+    """
+
+    def detach(_deleted=None):
+        root.removeHandler(handler)
+
+    return detach
+
+
 class DiagnosticsTab(QWidget):
     """Diagnostics and logging interface."""
     
     log_message = pyqtSignal(str, str)  # level, message
+    log_record = pyqtSignal(str, str, str)  # level, component, message
     diagnostic_completed = pyqtSignal(str, dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.log_entries = []
         self.max_log_entries = 10000
+        self._benchmark_workers = []
+        self._measure_workers = []
+        self._report_paths = {}
+        self._log_handler = None
         
         # Initialize diagnostic engine
         self.diagnostic_engine = DiagnosticEngine()
@@ -427,17 +489,11 @@ class DiagnosticsTab(QWidget):
         list_layout = QVBoxLayout()
         
         self.reports_list = QListWidget()
-        
-        # Add sample reports
-        sample_reports = [
-            "Crash Report - 2024-08-29 14:30:15",
-            "Memory Leak Report - 2024-08-29 12:15:22",
-            "Performance Report - 2024-08-29 10:05:45",
-            "System Report - 2024-08-29 09:30:12"
-        ]
-        
-        for report in sample_reports:
-            self.reports_list.addItem(report)
+        # The list used to open holding four reports dated 2024-08-29 that no code ever
+        # wrote, and selecting one painted a crash that never happened. It now starts
+        # empty and fills with the files this app actually exports, each remembering its
+        # own path.
+        self.reports_list.itemSelectionChanged.connect(self.preview_report)
         
         list_buttons = QHBoxLayout()
         self.view_report_btn = QPushButton("View")
@@ -547,8 +603,12 @@ class DiagnosticsTab(QWidget):
         
         self.frequent_issues_table = QTableWidget()
         self.frequent_issues_table.setColumnCount(4)
+        # The fourth column said "Suggested Fix" and was filled by three lines written
+        # into this file - "Implement memory pooling", "Increase timeout values", "Add
+        # input validation" - for problems the app had never reported. What a repeated
+        # record does carry is the module that logged it, so the column now says that.
         self.frequent_issues_table.setHorizontalHeaderLabels([
-            "Issue", "Frequency", "Last Seen", "Suggested Fix"
+            "Issue", "Frequency", "Last Seen", "Logged By"
         ])
         
         issues_layout.addWidget(self.frequent_issues_table)
@@ -612,13 +672,27 @@ class DiagnosticsTab(QWidget):
         self.analyze_btn.clicked.connect(self.analyze_logs)
         
     def setup_logging(self):
-        """Setup logging system."""
-        # Add some sample log entries
-        self.add_log_entry("INFO", "Application", "RenderFox started successfully")
-        self.add_log_entry("INFO", "3D Viewer", "OpenGL context initialized")
-        self.add_log_entry("DEBUG", "Model Loader", "Loading model: test.obj")
-        self.add_log_entry("WARNING", "GPU", "GPU memory usage at 85%")
-        self.add_log_entry("INFO", "Renderer", "Render completed in 245ms")
+        """Attach the app's real log records to this table, which starts it empty.
+
+        The five lines this used to write described a session that had not happened:
+        "OpenGL context initialized", "Loading model: test.obj", "GPU memory usage at
+        85%". They also set the counts below the table, so the error rate was a
+        percentage of a made-up sample.
+
+        The guard is per pane, not per process. Checking the root logger for *any*
+        handler of this kind meant that a second Diagnostics pane - the one a test
+        builds, or the first one a rebuilt window replaces - attached nothing and its
+        table stayed empty for the rest of the session.
+        """
+        self.log_record.connect(self.add_log_entry)
+        if self._log_handler is not None:
+            return
+        self._log_handler = PaneLogHandler(self)
+        logging.getLogger().addHandler(self._log_handler)
+        # The handler outlives nothing: as soon as this pane's Qt object is destroyed it
+        # is taken off the root logger, because a record arriving afterwards would be
+        # delivered to a widget that no longer exists.
+        self.destroyed.connect(_detach_when_destroyed(logging.getLogger(), self._log_handler))
         
     def add_log_entry(self, level, component, message):
         """Add a new log entry."""
@@ -633,6 +707,12 @@ class DiagnosticsTab(QWidget):
             'full_text': log_text
         })
         
+        # The table's own limit, now enforced on the list too: the display capped its
+        # blocks at max_log_entries while the list grew without one, so a long session
+        # held every record twice and the analysis below counted lines no longer visible.
+        if len(self.log_entries) > self.max_log_entries:
+            del self.log_entries[:-self.max_log_entries]
+
         # Update display if not paused
         if not hasattr(self, 'log_paused') or not self.log_paused:
             self.log_display.appendPlainText(log_text)
@@ -933,35 +1013,67 @@ Overall Status: {overall}"""
             self.issues_table.setItem(row, 3, QTableWidgetItem("Review system resources"))
         
     def run_hardware_test(self):
-        """Run hardware performance test."""
+        """Time the engine's CPU and memory work off the interface thread.
+
+        The two calls this replaces summed `math.sqrt` over a million integers and then
+        graded the elapsed time Excellent/Good/Average on thresholds that the loop beat
+        on every machine it has ever run on, so the line was a constant dressed as a
+        verdict - and it did the summing on the interface thread, which is why the pane
+        stopped answering while it thought it was measuring.
+        """
         self.health_status.setText("Status: Running hardware test...")
         self.diagnostic_results.setPlainText("Benchmarking hardware...")
-        
-        try:
-            # Run CPU benchmark
-            cpu_bench = PerformanceBenchmark.benchmark_cpu()
-            mem_bench = PerformanceBenchmark.benchmark_memory()
-            
-            results = f"""Hardware Performance Test Results:
+        self.run_engine_kinds(('cpu', 'memory'), self.show_hardware_test)
 
-=== CPU BENCHMARK ===
-Elapsed Time: {cpu_bench['elapsed_time']}
-Score: {cpu_bench['score']}
-Rating: {cpu_bench['rating']}
+    def run_engine_kinds(self, kinds, receiver, readings=None):
+        """One worker over the named kinds of work, with the failure channel connected.
 
-=== MEMORY BENCHMARK ===
-Elapsed Time: {mem_bench['elapsed_time']}
-Score: {mem_bench['score']}
-Rating: {mem_bench['rating']}
+        `readings`, when given, runs on the same worker thread: the machine figures and
+        the timed work then come from one look at the machine rather than two, and the
+        interface thread is asked for neither.
+        """
+        engine = benchmark_engine()
 
-Overall Performance: {cpu_bench['rating']} CPU, {mem_bench['rating']} Memory"""
-            
-            self.diagnostic_results.setPlainText(results)
-            self.health_status.setText("Status: Hardware test completed")
-            
-        except Exception as e:
-            self.diagnostic_results.setPlainText(f"Error running hardware test: {str(e)}")
-            self.health_status.setText("Status: Test failed")
+        def worker_func(progress_callback=None):
+            results = [engine.run(kind, record=True, progress_callback=progress_callback)
+                       for kind in kinds]
+            return {'benchmarks': results,
+                    'readings': readings() if readings is not None else None}
+
+        worker = Worker(worker_func)
+        worker.signals.result.connect(receiver)
+        worker.signals.error.connect(self.on_benchmark_failed)
+        self._benchmark_workers.append(worker)
+        QThreadPool.globalInstance().start(worker)
+
+    @staticmethod
+    def _live_readings():
+        """The figures that describe the machine as it is, not as it was configured."""
+        return {
+            'cpu': SystemInfo.get_cpu_info(),
+            'memory': SystemInfo.get_memory_info(),
+            'frames': shared_clock().stats(),
+        }
+
+    def on_benchmark_failed(self, error):
+        kind, value, _traceback = error
+        self.diagnostic_results.setPlainText(f"Benchmark failed: {kind.__name__}: {value}")
+        self.health_status.setText("Status: Test failed")
+
+    def show_hardware_test(self, payload):
+        results = payload['benchmarks']
+        blocks = [BenchmarkRunner.describe(result) for result in results]
+        refused = [result for result in results if result.get('ran') is None]
+        closing = ("Nothing here is graded against another machine: the app has never "
+                   "collected anybody else's result, so it compares this run with its "
+                   "own earlier ones.")
+        if refused:
+            closing = (f"{len(refused)} of {len(results)} kinds did not run; their "
+                       f"reasons are printed above.")
+        self.diagnostic_results.setPlainText(
+            "Hardware Performance Test Results:\n\n" + '\n\n'.join(blocks)
+            + "\n\n" + closing)
+        self.health_status.setText("Status: Hardware test completed")
     
     def run_dependency_check(self):
         """Check all dependencies using engine."""
@@ -990,192 +1102,599 @@ Overall Performance: {cpu_bench['rating']} CPU, {mem_bench['rating']} Memory"""
             self.health_status.setText("Status: Check failed")
     
     def run_performance_test(self):
-        """Run comprehensive performance test."""
+        """Every kind of work the engine performs, with the machine read in the same pass.
+
+        Both halves used to be invented. The two ratings came from thresholds the loop
+        always beat; the two lines under `SYSTEM INFORMATION` asked psutil twice from the
+        interface thread, which is why the pane would not answer while it claimed to be
+        measuring. The frame figures are new and they are the app's own views: a viewer
+        that drew nothing says that, instead of a rate made by dividing one timer tick by
+        the next - which the old code computed and never showed anyone.
+        """
         self.health_status.setText("Status: Running performance tests...")
         self.diagnostic_results.setPlainText("Benchmarking system performance...")
-        
-        try:
-            cpu_bench = PerformanceBenchmark.benchmark_cpu()
-            mem_bench = PerformanceBenchmark.benchmark_memory()
-            
-            results = f"""Performance Test Results:
+        self.run_engine_kinds(BenchmarkRunner.KINDS, self.show_performance_test,
+                              readings=self._live_readings)
 
-=== CPU BENCHMARK ===
-Elapsed Time: {cpu_bench['elapsed_time']}
-Score: {cpu_bench['score']}
-Rating: {cpu_bench['rating']}
+    def show_performance_test(self, payload):
+        results = payload['benchmarks']
+        readings = payload['readings']
+        cpu = readings['cpu']
+        memory = readings['memory']
+        frames = readings['frames']
 
-=== MEMORY BENCHMARK ===
-Elapsed Time: {mem_bench['elapsed_time']}
-Score: {mem_bench['score']}
-Rating: {mem_bench['rating']}
+        if frames['fps'] is None:
+            frame_lines = (f"Frames: nothing measured - {frames['reason']}\n"
+                           f"  frames finished since this pane opened: "
+                           f"{frames['total_frames']}")
+            if frames['failures']:
+                frame_lines += (
+                    f"\n  paints that raised: {frames['failures']}"
+                    f"\n  last one said: {frames['last_failure']}")
+        else:
+            frame_lines = (
+                f"Frames: {frames['fps']} fps from {frames['frames']} frames drawn by "
+                f"{', '.join(frames['sources']) or 'no view'}; "
+                f"{frames['frame_time_ms']} ms average, "
+                f"{frames['slowest_frame_ms']} ms slowest, over the last "
+                f"{frames['window_seconds']:g} s")
 
-=== SYSTEM INFORMATION ===
-CPU Usage: {SystemInfo.get_cpu_info()['usage_percent']}%
-Memory Usage: {SystemInfo.get_memory_info()['percent']}%
+        blocks = [BenchmarkRunner.describe(result) for result in results]
+        refused = [result for result in results if result.get('ran') is None]
+        overall = (f"{len(results) - len(refused)} of {len(results)} kinds of work "
+                   f"were timed")
+        if refused:
+            overall += f"; {len(refused)} did not run, each with its reason above"
 
-Overall Performance: {cpu_bench['rating']} CPU, {mem_bench['rating']} Memory"""
-            
-            self.diagnostic_results.setPlainText(results)
-            self.health_status.setText("Status: Performance test completed")
-            
-        except Exception as e:
-            self.diagnostic_results.setPlainText(f"Error running performance test: {str(e)}")
-            self.health_status.setText("Status: Test failed")
+        self.diagnostic_results.setPlainText(
+            "Performance Test Results:\n\n" + '\n\n'.join(blocks)
+            + "\n\n=== THIS MACHINE, WHILE IT WAS BEING TIMED ===\n"
+            + f"CPU: {cpu['usage_percent']}% busy across {cpu['logical_cores']} "
+              f"logical cores ({cpu['physical_cores']} physical), "
+              f"{cpu['current_frequency']} now\n"
+            + f"Memory: {memory['used']} used / {memory['total']} total "
+              f"({memory['percent']}%)\n"
+            + frame_lines
+            + f"\n\nOverall: {overall}.")
+        self.health_status.setText("Status: Performance test completed")
     
+    def run_off_thread(self, measure, receiver, busy_text, sink=None):
+        """Ask one question of the machine on a worker, with the failure channel connected.
+
+        Every measurement this pane makes blocks: a drive scan, a WMI query, a walk of
+        every live object. Run on the interface thread they stop the window from painting,
+        which is how the pane came to look busy while it was only stuck. `measure` takes no
+        arguments and runs on the worker; `receiver` gets its return value on this thread.
+        """
+        target = sink if sink is not None else self.debug_output
+        target.setPlainText(busy_text)
+
+        def worker_func(progress_callback=None):
+            return measure()
+
+        worker = Worker(worker_func)
+        worker.signals.result.connect(receiver)
+        worker.signals.error.connect(self.on_measurement_failed)
+        self._measure_workers.append(worker)
+        QThreadPool.globalInstance().start(worker)
+
+    def on_measurement_failed(self, error):
+        kind, value, _traceback = error
+        self.debug_output.setPlainText(
+            f"The measurement raised before it answered.\n\n"
+            f"{kind.__name__}: {value}")
+
     def dump_application_state(self):
-        """Dump current application state for debugging."""
-        state_info = f"""Application State Dump - {datetime.datetime.now()}
+        """The state of this process, read from the process.
 
-=== SYSTEM INFORMATION ===
-Platform: Windows 11
-Python Version: 3.11.5
-PyQt Version: 6.5.2
-Available Memory: 8.5 GB
+        The lines this replaced were a screenshot of a session that had not happened:
+        `Windows 11` and `PyQt 6.5.2` on a machine running a different build of each,
+        three loaded models nobody loaded, twelve active processes nobody counted, and
+        `GPU Acceleration: Enabled` in a viewer that had not drawn. Every figure below
+        comes from one worker-thread pass over this process, the panes under the same
+        window, and the shared clock the 3D views stamp.
+        """
+        self.run_off_thread(self._state_readings, self.show_application_state,
+                            "Reading this process, the panes beside it and this pane's own records...")
 
-=== APPLICATION STATE ===
-Current Tab: Diagnostics
-Loaded Models: 3
-Active Processes: 12
-GPU Acceleration: Enabled
+    def _state_readings(self):
+        return {
+            'build': SystemInfo.get_build_info(),
+            'process': SystemInfo.get_process_info(),
+            'memory': SystemInfo.get_memory_info(),
+            'frames': shared_clock().stats(),
+            'viewers': self._viewer_files(),
+            'queue': self._queue_readings(),
+            'error_log': self._error_log_readings(),
+            'pane': {
+                'log_rows': len(self.log_entries),
+                'reports_written': len(self._report_paths),
+                'filters': self.log_level_combo.currentText(),
+            },
+        }
 
-=== MEMORY USAGE ===
-Total Allocated: 1.2 GB
-Peak Usage: 1.8 GB
-Active Objects: 45,232
+    def _viewer_files(self):
+        """The files the 3D views under this window are actually holding.
 
-=== RECENT OPERATIONS ===
-- Model loaded: building.obj (2.3MB)
-- Mesh processing completed
-- Cache cleared (150MB freed)"""
+        Reached through the widget tree rather than a registry because the app has no
+        registry: each view keeps its own path. A pane shown on its own has no views
+        beside it and says that, instead of reporting an empty list as if the app had
+        nothing open.
+        """
+        owner = self.window()
+        if owner is self:
+            return {'available': False,
+                    'reason': 'this pane is not inside the main window, so it has no sibling views to ask'}
+        holders = [child for child in owner.findChildren(QWidget)
+                   if hasattr(child, 'current_file_path')]
+        paths = [getattr(child, 'current_file_path', None) for child in holders]
+        return {
+            'available': True,
+            'views': len(holders),
+            'files': [str(path) for path in paths if path],
+        }
 
-        self.debug_output.setPlainText(state_info)
-        
-    def take_memory_snapshot(self):
-        """Take a memory usage snapshot."""
-        snapshot = f"""Memory Snapshot - {datetime.datetime.now()}
-
-=== MEMORY BREAKDOWN ===
-3D Viewer: 245 MB
-Model Data: 156 MB
-Textures: 89 MB
-Cache: 67 MB
-UI Framework: 34 MB
-Other: 28 MB
-
-Total: 619 MB
-
-=== ALLOCATION DETAILS ===
-Large Objects (>1MB): 23
-Cached Models: 8
-Active Buffers: 156
-Memory Pools: 12
-
-=== RECOMMENDATIONS ===
-- Consider clearing texture cache (89 MB)
-- 3 unused models can be unloaded (45 MB)"""
-
-        self.debug_output.setPlainText(snapshot)
-        
-    def generate_debug_report(self):
-        """Generate comprehensive debug report using engine."""
+    def _queue_readings(self):
+        """What the job queue above this pane says, or why it cannot be asked."""
+        owner = self.window()
+        manager = getattr(owner, 'job_manager', None)
+        if manager is None:
+            return {'available': False,
+                    'reason': f'the window above this pane is a {type(owner).__name__}, '
+                              f'which holds no job queue'}
         try:
-            # Export report using diagnostic engine
-            report_path = self.diagnostic_engine.export_report()
-            self.debug_output.setPlainText(f"Debug report generated and saved to:\n{report_path}")
-            
-            # Add to reports list
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            report_name = f"System Report - {timestamp}"
-            self.reports_list.addItem(report_name)
-            
-        except Exception as e:
-            self.debug_output.setPlainText(f"Error generating report: {str(e)}")
-        
-    def generate_error_report(self):
-        """Generate error report."""
-        report_type = self.generate_report_combo.currentText()
-        
-        # Add to reports list
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        report_name = f"{report_type} - {timestamp}"
-        self.reports_list.addItem(report_name)
-        
-    def preview_report(self):
-        """Preview selected report."""
-        current_item = self.reports_list.currentItem()
-        if current_item:
-            # Show sample report content
-            sample_content = f"""Error Report Preview
+            stats = manager.get_queue_stats()
+            durations = [job.end_time - job.start_time
+                         for job in manager.get_all_jobs()
+                         if getattr(job, 'start_time', None) and getattr(job, 'end_time', None)]
+        except Exception as failed:
+            return {'available': False, 'reason': f'{type(failed).__name__}: {failed}'}
+        return {
+            'available': True,
+            'stats': stats,
+            'finished_with_a_clock': len(durations),
+            'mean_seconds': round(sum(durations) / len(durations), 2) if durations else None,
+            'slowest_seconds': round(max(durations), 2) if durations else None,
+        }
 
-Report Type: Crash Report
-Generated: 2024-08-29 14:30:15
-Application: RenderFox v1.0
+    def _error_log_readings(self):
+        """The app's own error file: where it is, and how many records are in it."""
+        log_file = self.diagnostic_engine.error_logger.log_file
+        records = self.diagnostic_engine.error_logger.get_recent_errors(limit=1000)
+        return {
+            'path': str(log_file),
+            'exists': log_file.exists(),
+            'records': len(records),
+            'types': sorted({str(row.get('type') or '') for row in records}),
+        }
 
-=== CRASH DETAILS ===
-Exception: segmentation fault
-Location: mesh_processor.cpp:245
-Function: process_vertices()
+    @staticmethod
+    def _fmt(value, suffix=''):
+        return f"{value}{suffix}" if value is not None else "not reported"
 
-=== STACK TRACE ===
-#0 process_vertices() at mesh_processor.cpp:245
-#1 load_model() at model_loader.cpp:89
-#2 import_file() at file_manager.cpp:156
+    @staticmethod
+    def _peak_phrase(process):
+        """The peak resident size in one phrase, or the statement that it is missing.
 
-=== SYSTEM STATE ===
-Available Memory: 2.1 GB
-GPU Memory: 89% used
-CPU Usage: 45%
+        A single 'not reported' inside a sentence that ends in 'MB' reads as a figure,
+        which is the mistake this whole pass is about; so the wording is chosen whole.
+        """
+        if process['peak_rss_mb'] is None:
+            return "peak not reported"
+        return f"{process['peak_rss_mb']} MB at its peak"
 
-=== RECOMMENDATIONS ===
-- Reduce model complexity
-- Update graphics drivers
-- Increase virtual memory"""
+    def show_application_state(self, payload):
+        build = payload['build']
+        process = payload['process']
+        memory = payload['memory']
+        frames = payload['frames']
+        viewers = payload['viewers']
+        queue = payload['queue']
+        error_log = payload['error_log']
+        pane = payload['pane']
 
-            self.report_preview.setPlainText(sample_content)
-            
-    def analyze_logs(self):
-        """Analyze logs for patterns and issues."""
-        # Update statistics
-        self.total_logs_label.setText("1,247")
-        self.error_rate_label.setText("2.3%")
-        self.avg_response_label.setText("156ms")
-        self.peak_memory_label.setText("1.8GB")
-        self.crash_count_label.setText("0")
-        
-        # Show trends
-        trends = """Log Analysis Results:
-
-=== IDENTIFIED PATTERNS ===
-• GPU memory warnings increase during complex model loading
-• Performance degrades after 2+ hours of continuous use
-• Memory usage spikes correlate with large texture loading
-• Error rate increases during batch processing operations
-
-=== RECOMMENDATIONS ===
-• Implement automatic GPU memory management
-• Add periodic memory cleanup routines
-• Optimize texture loading for large files
-• Improve error handling in batch operations
-
-=== ANOMALIES DETECTED ===
-• Unusual memory allocation pattern at 14:30-15:00
-• Unexpected GPU driver timeouts (3 occurrences)
-• File I/O errors during peak usage periods"""
-
-        self.trends_display.setPlainText(trends)
-        
-        # Update frequent issues table
-        self.frequent_issues_table.setRowCount(3)
-        
-        issues = [
-            ("GPU Memory Warning", "23 times", "2 minutes ago", "Implement memory pooling"),
-            ("File Load Timeout", "12 times", "1 hour ago", "Increase timeout values"),
-            ("Mesh Processing Error", "8 times", "3 hours ago", "Add input validation")
+        running = ('a frozen build' if build['packaged'] else 'a source tree')
+        lines = [
+            f"Application State Dump - {datetime.datetime.now()}",
+            "",
+            "=== WHAT THIS PROCESS IS ===",
+            f"Operating system: {build['os']} on {build['architecture']}",
+            f"Processor: {build['processor']}",
+            f"Python: {build['python']} ({build['python_implementation']}), {running}",
+            f"Qt runtime: {self._fmt(build['qt_runtime'])}, PyQt: {self._fmt(build['pyqt'])}",
         ]
-        
-        for row, (issue, freq, last_seen, fix) in enumerate(issues):
-            self.frequent_issues_table.setItem(row, 0, QTableWidgetItem(issue))
-            self.frequent_issues_table.setItem(row, 1, QTableWidgetItem(freq))
-            self.frequent_issues_table.setItem(row, 2, QTableWidgetItem(last_seen))
-            self.frequent_issues_table.setItem(row, 3, QTableWidgetItem(fix))
+        if build.get('reason'):
+            lines.append(f"  ({build['reason']})")
+
+        lines += [
+            "",
+            "=== THIS PROCESS, READ AT THIS MOMENT ===",
+            f"Process id: {process['pid']}, started {process['started_at']}, "
+            f"running {process['uptime_seconds']} s",
+            f"Resident memory: {process['rss_mb']} MB now, "
+            f"{self._peak_phrase(process)}; virtual {process['vms_mb']} MB",
+            f"Threads: {self._fmt(process['threads'])}, "
+            f"open files: {self._fmt(process['open_files'])}, "
+            f"live objects: {self._fmt(process['gc_objects'])}",
+        ]
+        for note in process['failures']:
+            lines.append(f"  not reported: {note}")
+
+        lines += [
+            "",
+            "=== THE 3D VIEWS UNDER THIS WINDOW ===",
+            (f"{viewers['views']} view(s) found, {len(viewers['files'])} holding a file"
+             if viewers['available'] else f"Views: {viewers['reason']}"),
+        ]
+        if viewers['available']:
+            for path in viewers['files'][:12]:
+                lines.append(f"  {os.path.basename(path)}  ({path})")
+            if not viewers['files']:
+                lines.append("  none: every view is showing nothing")
+        lines.append(f"Frames: {self._frame_sentence(frames)}")
+
+        lines += [
+            "",
+            "=== THE JOB QUEUE ===",
+            (f"{queue['stats']['total']} job(s): "
+             f"{queue['stats']['pending']} waiting, {queue['stats']['rendering']} running, "
+             f"{queue['stats']['paused']} paused, {queue['stats']['completed']} finished, "
+             f"{queue['stats']['failed']} failed"
+             if queue['available'] else f"Queue: {queue['reason']}"),
+        ]
+        if queue['available']:
+            lines.append(
+                f"{queue['finished_with_a_clock']} job(s) carry both a start and an end time"
+                if queue['mean_seconds'] is None else
+                f"Finished jobs took {queue['mean_seconds']} s on average, "
+                f"{queue['slowest_seconds']} s at the slowest")
+
+        lines += [
+            "",
+            "=== WHAT THIS PANE HOLDS ===",
+            f"Log records it has seen: {pane['log_rows']} (level filter set to "
+            f"{pane['filters']}), reports it wrote this session: {pane['reports_written']}",
+            f"Error log on disk: {error_log['records']} record(s) in {error_log['path']}"
+            + ("" if error_log['exists'] else " (the file does not exist)"),
+            f"This machine's memory: {memory['used']} used of {memory['total']} "
+            f"({memory['percent']}%), swap {memory['swap_used']} of {memory['swap_total']}",
+            "",
+            "=== WHAT THIS DUMP DOES NOT ANSWER ===",
+            "  Which models are open inside a view's scene: a view reports the file it "
+            "reads, not the objects it built from it.",
+            "  Whether a crash ended an earlier session: this process cannot see the one "
+            "before it, and the error log above only holds what the app wrote.",
+            "  Any figure for another machine: nothing here has ever left this one.",
+        ]
+        self.debug_output.setPlainText('\n'.join(lines))
+
+    def _frame_sentence(self, frames):
+        if frames['fps'] is None:
+            return f"nothing measured - {frames['reason']}"
+        return (f"{frames['fps']} fps from {frames['frames']} frame(s) drawn by "
+                f"{', '.join(frames['sources']) or 'a view'}, "
+                f"{frames['frame_time_ms']} ms average, "
+                f"{frames['slowest_frame_ms']} ms slowest")
+
+    def take_memory_snapshot(self):
+        """Every live object in this process, counted by what it actually is.
+
+        The snapshot this replaces was a price list: `3D Viewer: 245 MB`, `Textures: 89
+        MB`, `Cache: 67 MB`, `Cached Models: 8`, plus advice to free two amounts nothing
+        in the app measures. Memory is not tagged by the feature that asked for it, and
+        the interpreter's allocation tracer is not started at launch, so there is no
+        per-feature total to read; object counts and this process's resident size are
+        what can be measured, and that is what is printed.
+        """
+        self.run_off_thread(lambda: SystemInfo.live_object_counts(limit=14),
+                            self.show_memory_snapshot,
+                            "Walking every live object in this process...")
+
+    def show_memory_snapshot(self, payload):
+        process = payload['process']
+        memory = payload['machine_memory']
+        lines = [
+            f"Memory Snapshot - {datetime.datetime.now()}",
+            "",
+            "=== THIS PROCESS ===",
+            f"Resident: {process['rss_mb']} MB now, {self._peak_phrase(process)}; "
+            f"virtual {process['vms_mb']} MB",
+            f"Threads: {self._fmt(process['threads'])}, "
+            f"open files: {self._fmt(process['open_files'])}, "
+            f"up since {process['started_at']} ({process['uptime_seconds']} s)",
+        ]
+        for note in process['failures']:
+            lines.append(f"  not reported: {note}")
+        lines += [
+            "",
+            f"=== ALIVE RIGHT NOW ({payload['scanned']} objects of "
+            f"{payload['distinct_classes']} classes) ===",
+        ]
+        for name, count in payload['classes']:
+            lines.append(f"  {count:>8}  {name}")
+        lines += [
+            "",
+            "=== BUFFERS THAT STATE THEIR OWN SIZE ===",
+            f"{payload['array_like_count']} object(s) of these types: "
+            f"{payload['sized_types']}",
+            f"Together they hold {payload['array_bytes']} bytes "
+            f"({payload['array_mb']} MB).",
+            "That is a floor, not a total: it counts only buffers whose type reports its "
+            "own size, and none of the Python objects wrapped around them.",
+            "",
+            "=== THIS MACHINE ===",
+            f"Physical memory: {memory['used']} used of {memory['total']}, "
+            f"{memory['available']} marked available ({memory['percent']}% used)",
+            f"Swap: {memory['swap_used']} of {memory['swap_total']} "
+            f"({memory['swap_percent']}%)",
+            "",
+            "=== WHAT A PER-FEATURE BREAKDOWN WOULD NEED ===",
+            "The interpreter tracer (tracemalloc) started before the first allocation, and "
+            "a record of which feature asked for each block. Neither exists in this app, "
+            "so the counts above are the whole honest answer.",
+        ]
+        self.debug_output.setPlainText('\n'.join(lines))
+
+    def generate_debug_report(self):
+        """Write the full system reading to a file and put that file in the list.
+
+        The row this replaces named a report with no bytes behind it, so selecting it
+        showed a crash that never happened. The list row now carries the path, and the
+        preview reads the file.
+        """
+        self.run_off_thread(self.diagnostic_engine.export_report, self.show_debug_report,
+                            "Taking the full system reading (drives, adapters and "
+                            "dependencies included - a few seconds)...")
+
+    def show_debug_report(self, report_path):
+        """The file the engine just wrote, and the row in the list that points at it.
+
+        The line this replaces was the busy message left on screen: the method added a
+        list row and never said where the report went, so the pane kept claiming it was
+        still taking the reading.
+        """
+        self._add_report_row(f"System Report - {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+                             report_path)
+        self.debug_output.setPlainText(
+            f"Wrote the full system reading, {os.path.getsize(report_path)} bytes, to:\n"
+            f"{report_path}\n\n"
+            "The row added to the list points at this file, and the preview beside the "
+            "list is showing it.")
+
+    def generate_error_report(self):
+        """Fill the report type the combo names, from figures the engine can read.
+
+        `Custom Report` is on that list with nothing behind it, and the button used to
+        answer by adding its name to the list anyway. Now it says which kinds the engine
+        can fill and writes nothing.
+        """
+        report_type = self.generate_report_combo.currentText()
+        rows = list(self.log_entries)
+        self.run_off_thread(
+            lambda: self.diagnostic_engine.export_error_report(report_type, rows),
+            self.show_generated_report, f"Writing the {report_type}...")
+
+    def show_generated_report(self, result):
+        path = result.get('path')
+        if not path:
+            self.debug_output.setPlainText(
+                f"No file was written.\n\n{result['reason']}\n\n"
+                f"Each kind holds: " +
+                '\n'.join(f"  {name}: {what}"
+                          for name, what in self.diagnostic_engine.REPORT_KINDS.items()))
+            return
+        self._add_report_row(
+            f"{result['report_type']} - {datetime.datetime.now():%Y-%m-%d %H:%M:%S}", path)
+        self.debug_output.setPlainText(
+            f"Wrote {os.path.getsize(path)} bytes to:\n{path}\n\n"
+            f"Its sections: {', '.join(result['sections'])}")
+
+    def _add_report_row(self, name, path):
+        """One row per file that exists, carrying the path of that file."""
+        self.reports_list.addItem(name)
+        row = self.reports_list.item(self.reports_list.count() - 1)
+        row.setData(Qt.ItemDataRole.UserRole, path)
+        self._report_paths[path] = name
+        self.reports_list.setCurrentItem(row)
+
+    def preview_report(self):
+        """Show the file behind the selected row, as it is on disk.
+
+        Selecting a row used to paint a fixed crash - a `mesh_processor.cpp` stack trace
+        from C++ this app does not contain, with memory figures nobody read. There is no
+        canned content left to show: the text below is the file, and if the file is gone
+        the pane says where it was.
+        """
+        item = self.reports_list.currentItem()
+        if item is None:
+            self.report_preview.setPlainText(
+                "Nothing selected. The list holds only reports this app wrote in this "
+                "session; generate one and its file appears here.")
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            self.report_preview.setPlainText(
+                f"'{item.text()}' has no file behind it. Rows written by earlier versions "
+                f"of this pane were names only.")
+            return
+        if not os.path.exists(path):
+            self.report_preview.setPlainText(
+                f"The file this row points at is gone:\n{path}\n"
+                f"Nothing in the app deleted it; the pane only reads it.")
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                raw = handle.read()
+        except OSError as failed:
+            self.report_preview.setPlainText(f"Could not read {path}: {failed}")
+            return
+        try:
+            body = json.dumps(json.loads(raw), indent=2)
+            kind = "JSON"
+        except ValueError:
+            body, kind = raw, "plain text"
+        shown = body[:200000]
+        note = ("" if len(body) <= 200000 else
+                f"\n\n[stopped at 200,000 of {len(body)} characters]")
+        stamp = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+        self.report_preview.setPlainText(
+            f"{item.text()}\n"
+            f"Read from: {path}\n"
+            f"{os.path.getsize(path)} bytes on disk, last written {stamp:%Y-%m-%d %H:%M:%S}, "
+            f"{kind} as the app wrote it.\n\n"
+            f"{shown}{note}")
+
+    def analyze_logs(self):
+        """Count the records this pane actually holds, over the window it can cut.
+
+        Every number this method used to print was written here: 1,247 records, a 2.3%
+        error rate, a 156 ms response time, 1.8 GB peak, three named issues with
+        frequencies and a fix each, and trends about a 14:30-15:00 anomaly that no
+        record mentions. The records are the pane's own; the window, the counts and the
+        repeats are arithmetic over them; the response time is the app's own job clock,
+        and a crash that ended an earlier session stays unreachable because it is.
+        """
+        window_name = self.analysis_period_combo.currentText()
+        rows = list(self.log_entries)
+
+        def measure():
+            cut = self.diagnostic_engine.rows_in_window(rows, window_name)
+            summary = self.diagnostic_engine.summarise_log_rows(cut['rows'])
+            return {
+                'window': window_name,
+                'seconds': cut['seconds'],
+                'cutoff': cut['cutoff'],
+                'unparsed': cut['unparsed'],
+                'reason': cut['reason'],
+                'summary': summary,
+                'seen': len(rows),
+                'queue': self._queue_readings(),
+                'process': SystemInfo.get_process_info(),
+                'error_log': self._error_log_readings(),
+            }
+
+        self.run_off_thread(measure, self.show_log_analysis,
+                            f"Counting the records in the {window_name} window...",
+                            sink=self.trends_display)
+
+    def show_log_analysis(self, payload):
+        summary = payload['summary']
+        queue = payload['queue']
+        process = payload['process']
+        error_log = payload['error_log']
+
+        if payload['reason']:
+            for label in (self.total_logs_label, self.error_rate_label,
+                          self.avg_response_label, self.peak_memory_label,
+                          self.crash_count_label):
+                label.setText("not measured")
+            self.frequent_issues_table.setRowCount(0)
+            self.trends_display.setPlainText(
+                f"Nothing was counted.\n\n{payload['reason']}\n\n"
+                f"The records this pane holds ({payload['seen']}) were left untouched, "
+                f"because cutting them on a range nobody gave would be a made-up window.")
+            return
+
+        self.total_logs_label.setText(
+            f"{summary['total']} of {payload['seen']} seen")
+        self.error_rate_label.setText(
+            f"{summary['error_rate_percent']}%" if summary['error_rate_percent'] is not None
+            else "no records")
+        if queue['available'] and queue['mean_seconds'] is not None:
+            self.avg_response_label.setText(
+                f"{queue['mean_seconds']} s over {queue['finished_with_a_clock']} finished job(s)")
+        else:
+            self.avg_response_label.setText(
+                "no finished job" if queue['available'] else "not measured")
+        self.peak_memory_label.setText(
+            f"{process['peak_rss_mb']} MB in this process"
+            if process['peak_rss_mb'] is not None else "peak not reported")
+        if error_log['exists'] and error_log['records']:
+            self.crash_count_label.setText(f"{error_log['records']} record(s)")
+        else:
+            self.crash_count_label.setText("nothing recorded")
+
+        issues = [row for row in summary['repeated']
+                  if row['level'] in ('ERROR', 'WARNING')]
+        self.frequent_issues_table.setRowCount(len(issues))
+        for row_number, issue in enumerate(issues):
+            self.frequent_issues_table.setItem(row_number, 0,
+                                               QTableWidgetItem(issue['message'][:120]))
+            self.frequent_issues_table.setItem(row_number, 1,
+                                               QTableWidgetItem(f"{issue['count']} times"))
+            self.frequent_issues_table.setItem(
+                row_number, 2, QTableWidgetItem(self._ago(issue['last_at'])))
+            self.frequent_issues_table.setItem(
+                row_number, 3, QTableWidgetItem(issue['component'] or 'no module name'))
+
+        cut_at = (datetime.datetime.fromtimestamp(payload['cutoff'])
+                  if payload['cutoff'] else None)
+        lines = [
+            f"Log Analysis - the {payload['window']} window, so only records the pane "
+            f"stamped at or after " + (f"{cut_at:%Y-%m-%d %H:%M:%S}" if cut_at
+                                       else "a time it could not read"),
+            "",
+            "=== WHAT THE RECORDS SAY ===",
+            f"Records in the window: {summary['total']} of the {payload['seen']} this pane "
+            f"has ever seen; it holds the first one at {self._fmt(summary['first_at'])} and "
+            f"the last at {self._fmt(summary['last_at'])} "
+            f"({self._fmt(summary['span_seconds'], ' s')} apart)",
+            f"Levels: " + (', '.join(f"{name}: {count}" for name, count in summary['by_level'])
+                           or "none"),
+            f"Error rate: {self._fmt(summary['error_rate_percent'], '%')} - "
+            f"{summary['errors']} ERROR of {summary['total']} records in this window",
+            f"Modules: " + (', '.join(f"{name}: {count}"
+                                      for name, count in summary['by_component']) or "none"),
+            f"Messages that repeat: {len(summary['repeated'])}",
+            "",
+            "=== WHAT THE REPEATS ARE ===",
+        ]
+        if summary['repeated']:
+            for issue in summary['repeated'][:12]:
+                lines.append(f"  [{issue['level']}] {issue['message'][:110]} - "
+                             f"{issue['count']} time(s), last {self._ago(issue['last_at'])}, "
+                             f"from {issue['component'] or 'no module name'}")
+        else:
+            lines.append("  No message appears twice in this window, so nothing here is a pattern.")
+
+        lines += [
+            "",
+            "=== THE APP'S OWN JOB CLOCK AND ERROR FILE ===",
+            (f"{queue['stats']['total']} job(s) in the queue, "
+             f"{queue['finished_with_a_clock']} of them carrying a start and an end time"
+             if queue['available'] else f"Job clock: {queue['reason']}"),
+            f"Error file: {error_log['path']} - "
+            + (f"{error_log['records']} record(s)" if error_log['exists']
+               else "does not exist yet"),
+            f"This process: {process['rss_mb']} MB resident now, "
+            f"{self._fmt(process['peak_rss_mb'])} MB at its peak",
+            "",
+            "=== WHAT THIS COUNT CANNOT REACH ===",
+            "  Records logged before this pane opened: the list above is what this pane "
+            "caught, and nothing older.",
+            "  A crash that ended an earlier session: this count is only what the "
+            "exception handler managed to write to the file above. A process the "
+            "operating system killed, or one that died before the handler ran, leaves "
+            "nothing here, so an empty file is not evidence of an uneventful session.",
+            "  Response time of anything that is not a queued job: no other part of the "
+            "app records how long it took.",
+        ]
+        if payload['unparsed']:
+            lines.append(f"  {payload['unparsed']} record(s) carry a time this pane cannot read "
+                         f"and were left out of the window.")
+        self.trends_display.setPlainText('\n'.join(lines))
+
+    @staticmethod
+    def _ago(stamp):
+        """How long ago a record's own time was, in the coarsest unit that still says something."""
+        at = DiagnosticEngine.parse_row_time(stamp)
+        if at is None:
+            return "time unreadable"
+        seconds = max(0.0, (datetime.datetime.now() - at).total_seconds())
+        if seconds < 60:
+            return f"{seconds:.0f} s ago"
+        if seconds < 3600:
+            return f"{seconds / 60:.0f} min ago"
+        if seconds < 86400:
+            return f"{seconds / 3600:.1f} h ago"
+        return f"{seconds / 86400:.1f} days ago"

@@ -10,6 +10,8 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QWheelEvent, QMouseEvent, QPixmap, QPainter, QPen, QColor, QImage
 import trimesh
 
+from ..utils import frame_clock
+
 # Try to import OpenGL - if it fails, we'll use a simple fallback viewer
 try:
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -1215,6 +1217,8 @@ class ModelViewer3D(QOpenGLWidget):
             # load_model calls update(), so we might return or continue. 
             
         if not OPENGL_AVAILABLE:
+            frame_clock.note_blocked(
+                'PyOpenGL could not be imported, so this viewer draws no frames')
             return
             
         try:
@@ -1509,8 +1513,12 @@ class ModelViewer3D(QOpenGLWidget):
             except Exception as e:
                 # Painter errors are non-critical
                 pass
+
+            name = self.objectName() or f'{type(self).__name__} at 0x{id(self):x}'
+            frame_clock.note_frame(name)
                 
         except Exception as e:
+            frame_clock.note_failure(e)
             print(f"paintGL failed: {e}")
             import traceback
             traceback.print_exc()

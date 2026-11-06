@@ -39,7 +39,7 @@ MUTATIONS = [
         'file': 'src/processing/pipeline_engine.py',
         'find': '        if not keep_staging and result[\'status\'] == \'done\':',
         'replace': '        if True:',
-        'expect': 'test_29',
+        'expect': 'test_29_staging',
         'note': 'the staging folder is deleted while the rows still point into it',
     },
     {

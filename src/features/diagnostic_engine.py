@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 import traceback
 
+from ..utils.frame_clock import shared_clock
+
 try:
     import GPUtil
     GPU_UTIL_AVAILABLE = True
@@ -44,6 +46,127 @@ class SystemInfo:
             'python_implementation': platform.python_implementation()
         }
     
+    @staticmethod
+    def get_build_info() -> Dict[str, Any]:
+        """Which interpreter and which Qt this process is really running on.
+
+        The Diagnostics state dump used to print `Windows 11`, `Python 3.11.5` and
+        `PyQt Version: 6.5.2` as three lines of text. Two of the three were wrong on
+        this machine, which is how a build claim should be treated: read it, or do not
+        print it.
+        """
+        try:
+            from PyQt6.QtCore import QT_VERSION_STR, PYQT_VERSION_STR
+            qt = {'qt_runtime': QT_VERSION_STR, 'pyqt': PYQT_VERSION_STR}
+        except ImportError as failed:
+            qt = {'qt_runtime': None, 'pyqt': None,
+                  'reason': f'PyQt6 could not be imported: {failed}'}
+        os_info = SystemInfo.get_os_info()
+        return {
+            'os': f"{os_info['os']} {os_info['os_release']} "
+                  f"(build {os_info['os_version']})",
+            'architecture': os_info['architecture'],
+            'processor': os_info['processor'] or 'not reported by the platform module',
+            'python': os_info['python_version'].split()[0],
+            'python_implementation': os_info['python_implementation'],
+            'packaged': bool(getattr(sys, 'frozen', False)),
+            **qt,
+        }
+
+    @staticmethod
+    def get_process_info() -> Dict[str, Any]:
+        """What this process costs, read at the moment it was asked.
+
+        `uptime_seconds` is the process's own start time, so a dump says how long this
+        session ran rather than how long a machine has been up. Figures a call refuses
+        come back as None with the reason in `failures`, never as a plausible number.
+        """
+        import gc
+        import time as _time
+        process = psutil.Process(os.getpid())
+        info = process.memory_info()
+        started = process.create_time()
+        now = _time.time()
+        failures = []
+        try:
+            threads = process.num_threads()
+        except psutil.Error as failed:
+            threads = None
+            failures.append(f'thread count: {failed}')
+        peak_bytes = getattr(info, 'peak_wset', None)
+        if peak_bytes is None:
+            peak_bytes = getattr(info, 'peak_rss', None)
+        if peak_bytes is None:
+            failures.append(
+                'peak resident size: this platform\'s process memory record has no '
+                f'peak field (fields present: {", ".join(info._fields)})')
+        try:
+            open_files = len(process.open_files())
+        except (psutil.AccessDenied, psutil.Error, OSError) as failed:
+            open_files = None
+            failures.append(f'open files: {failed}')
+        return {
+            'pid': process.pid,
+            'started_at': datetime.fromtimestamp(started).isoformat(timespec='seconds'),
+            'uptime_seconds': round(now - started, 1),
+            'rss_mb': round(info.rss / (1024 * 1024), 1),
+            'vms_mb': round(info.vms / (1024 * 1024), 1),
+            'peak_rss_mb': round(peak_bytes / (1024 * 1024), 1) if peak_bytes else None,
+            'threads': threads,
+            'open_files': open_files,
+            'gc_objects': len(gc.get_objects()),
+            'failures': failures,
+        }
+
+    @staticmethod
+    def live_object_counts(limit: int = 12) -> Dict[str, Any]:
+        """Every live object in this process, counted by the class it actually is.
+
+        The memory snapshot this replaces printed a price list - `3D Viewer: 245 MB`,
+        `Textures: 89 MB` - for components that never reported a figure and in a unit
+        (bytes per feature) nothing in this app is able to measure: allocations are not
+        tagged by the code that asked for them. Counts are measurable, so this counts.
+
+        Walking every object takes a fraction of a second and must not happen on the
+        interface thread; the pane runs it on a worker. Array bytes are summed only from
+        objects that state their own size (`numpy.ndarray.nbytes`, `bytes`, `bytearray`),
+        which is a floor for the heap, not a total, and is labelled as such.
+
+        The size lookup is a type test, never an attribute probe: a `getattr(obj,
+        'nbytes')` over every live object asks a `ctypes` lazy library for a DLL called
+        'nbytes' and raises FileNotFoundError out of the middle of a memory snapshot.
+        """
+        import gc
+        from collections import Counter
+
+        try:
+            import numpy
+            array_types = (numpy.ndarray, bytes, bytearray, memoryview)
+        except ImportError:
+            array_types = (bytes, bytearray, memoryview)
+
+        counts = Counter()
+        array_bytes = 0
+        arrays = 0
+        scanned = 0
+        for obj in gc.get_objects():
+            counts[type(obj).__name__] += 1
+            scanned += 1
+            if isinstance(obj, array_types):
+                arrays += 1
+                array_bytes += getattr(obj, 'nbytes', None) or len(obj)
+        return {
+            'scanned': scanned,
+            'classes': counts.most_common(limit),
+            'distinct_classes': len(counts),
+            'array_like_count': arrays,
+            'array_bytes': array_bytes,
+            'array_mb': round(array_bytes / (1024 * 1024), 1),
+            'sized_types': ', '.join(t.__name__ for t in array_types),
+            'process': SystemInfo.get_process_info(),
+            'machine_memory': SystemInfo.get_memory_info(),
+        }
+
     @staticmethod
     def get_cpu_info() -> Dict[str, Any]:
         """Core counts, clock speed, and how busy the cores are over a measured window.
@@ -363,6 +486,55 @@ class SystemInfo:
                     f'when both lists are one adapter')
         return None
 
+    @staticmethod
+    def live_gpu_sample() -> Dict[str, Any]:
+        """What the first adapter is doing now, or the reason this machine does not say.
+
+        GPUtil runs a helper program for each of these figures, so this is the only GPU
+        question the per-second monitor is allowed to ask, and `get_gpu_report()` - which
+        also queries Windows for the adapters and costs about two seconds - stays the
+        identity reader behind the Detect button. A figure GPUtil leaves out is returned
+        as None with its name in `reason`, never as a zero: this machine has one Intel
+        adapter and GPUtil answers no adapter at all here, so a monitored zero would be a
+        number about hardware that was never asked.
+        """
+        adapters, why = SystemInfo._gputil_adapters()
+        if not adapters:
+            return {'load_percent': None, 'memory_percent': None, 'temperature_c': None,
+                    'memory_used_mb': None, 'reader': 'GPUtil',
+                    'reason': why or 'GPUtil answered no adapter'}
+
+        gpu = adapters[0]
+        sample = {'reader': 'GPUtil', 'reason': ''}
+        missing = []
+        for key, attr, scale in (('load_percent', 'load', 100.0),
+                                 ('memory_percent', 'memoryUtil', 100.0)):
+            value = getattr(gpu, attr, None)
+            if value is None:
+                sample[key] = None
+                missing.append(attr)
+            else:
+                sample[key] = round(value * scale, 1)
+        used = getattr(gpu, 'memoryUsed', None)
+        sample['memory_used_mb'] = None if used is None else round(used)
+        if used is None:
+            missing.append('memoryUsed')
+        temperature = getattr(gpu, 'temperature', None)
+        if temperature is None or temperature < 0:
+            sample['temperature_c'] = None
+            missing.append('temperature')
+        else:
+            sample['temperature_c'] = round(temperature, 1)
+
+        if missing:
+            sample['reason'] = ('GPUtil answered this adapter but not '
+                                + ', '.join(missing))
+        if len(adapters) > 1:
+            extra = (f'GPUtil answered {len(adapters)} adapters and these figures are '
+                     f'the first of them')
+            sample['reason'] = f'{sample["reason"]}; {extra}' if sample['reason'] else extra
+        return sample
+
 
 class DependencyChecker:
     """Checks for required and optional dependencies."""
@@ -668,7 +840,7 @@ class ErrorLogger:
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'output', 'logs')
         
-        self.log_dir = Path(log_dir)
+        self.log_dir = Path(os.path.normpath(log_dir))
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / 'errors.log'
     
@@ -706,53 +878,6 @@ class ErrorLogger:
         """Clear the error log."""
         if self.log_file.exists():
             self.log_file.unlink()
-
-
-class PerformanceBenchmark:
-    """Simple performance benchmarking."""
-    
-    @staticmethod
-    def benchmark_cpu() -> Dict[str, Any]:
-        """Benchmark CPU performance."""
-        import time
-        import math
-        
-        start = time.time()
-        
-        # Simple calculation benchmark
-        result = 0
-        for i in range(1000000):
-            result += math.sqrt(i)
-        
-        elapsed = time.time() - start
-        
-        score = 1000 / elapsed  # Higher is better
-        
-        return {
-            'elapsed_time': f"{elapsed:.3f}s",
-            'score': f"{score:.2f}",
-            'rating': 'Excellent' if score > 100 else 'Good' if score > 50 else 'Average'
-        }
-    
-    @staticmethod
-    def benchmark_memory() -> Dict[str, Any]:
-        """Benchmark memory performance."""
-        import time
-        
-        start = time.time()
-        
-        # Memory allocation benchmark
-        data = [list(range(1000)) for _ in range(1000)]
-        
-        elapsed = time.time() - start
-        
-        score = 1000 / elapsed
-        
-        return {
-            'elapsed_time': f"{elapsed:.3f}s",
-            'score': f"{score:.2f}",
-            'rating': 'Excellent' if score > 200 else 'Good' if score > 100 else 'Average'
-        }
 
 
 class DiagnosticEngine:
@@ -799,6 +924,180 @@ class DiagnosticEngine:
             json.dump(report, f, indent=2)
         
         return output_path
+
+    REPORT_KINDS = {
+        'Crash Report': 'the records this app wrote to its error log, and the process as it '
+                        'stood when the report was asked for',
+        'Error Summary': 'every ERROR and WARNING record the Diagnostics pane has seen, grouped',
+        'Performance Report': 'machine readings taken now, plus the frames this app\'s own views drew',
+        'Memory Report': 'this process\'s resident size and a count of the objects alive in it',
+        'System Report': 'the same full system reading every other pane shows',
+    }
+
+    LOG_WINDOWS = {
+        'Last Hour': 3600.0,
+        'Last 6 Hours': 6 * 3600.0,
+        'Last 24 Hours': 24 * 3600.0,
+        'Last Week': 7 * 24 * 3600.0,
+        'Last Month': 30 * 24 * 3600.0,
+    }
+
+    @staticmethod
+    def parse_row_time(value):
+        """The instant a log row says it happened, or None when it does not say."""
+        if not value:
+            return None
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f'):
+            try:
+                return datetime.strptime(str(value), fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    @classmethod
+    def rows_in_window(cls, rows: List[Dict[str, Any]],
+                       window_name: str) -> Dict[str, Any]:
+        """The records whose own timestamp falls inside the window the pane named.
+
+        `Custom Range` is on the pane's list with no picker behind it, so it answers with
+        a refusal instead of quietly standing for the whole log - which is what the
+        version this replaced did, while printing a percentage over the lot.
+        """
+        if window_name not in DiagnosticEngine.LOG_WINDOWS:
+            return {'rows': [], 'seconds': None, 'cutoff': None, 'unparsed': 0,
+                    'reason': f"'{window_name}' needs a start and an end, and this pane has "
+                              f"no control that asks for either. The windows it can cut are "
+                              f"{', '.join(DiagnosticEngine.LOG_WINDOWS)}."}
+        import time as _time
+        seconds = DiagnosticEngine.LOG_WINDOWS[window_name]
+        cutoff = _time.time() - seconds
+        kept, unparsed = [], 0
+        for row in rows:
+            at = cls.parse_row_time(row.get('timestamp'))
+            if at is None or at.timestamp() < cutoff:
+                if at is None:
+                    unparsed += 1
+                continue
+            kept.append(row)
+        return {'rows': kept, 'seconds': seconds, 'cutoff': cutoff,
+                'unparsed': unparsed, 'reason': None}
+
+    @classmethod
+    def summarise_log_rows(cls, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Count what a list of log records says, without adding a claim to it.
+
+        `rows` are the dicts the Diagnostics pane keeps (`timestamp`, `level`,
+        `component`, `message`). Everything returned is a count or a time read off those
+        rows: the analysis this replaces printed 1,247 records, a 2.3% error rate and a
+        156 ms response time that were not measurements of anything.
+        """
+        from collections import Counter
+
+        levels = Counter(str(row.get('level') or '') for row in rows)
+        components = Counter(str(row.get('component') or '') for row in rows)
+        grouped = Counter(
+            (str(row.get('level') or ''), str(row.get('message') or '')) for row in rows)
+        times = [cls.parse_row_time(row.get('timestamp')) for row in rows]
+        stamps = [at for at in times if at is not None]
+
+        repeated = []
+        for (level, message), count in grouped.most_common():
+            if count < 2:
+                continue
+            seen = [cls.parse_row_time(row.get('timestamp')) for row in rows
+                    if str(row.get('level') or '') == level
+                    and str(row.get('message') or '') == message]
+            valid = [at for at in seen if at is not None]
+            owner = next((str(row.get('component') or '') for row in rows
+                          if str(row.get('level') or '') == level
+                          and str(row.get('message') or '') == message), '')
+            repeated.append({
+                'level': level,
+                'message': message,
+                'component': owner,
+                'count': count,
+                'first_at': min(valid).strftime('%Y-%m-%d %H:%M:%S') if valid else None,
+                'last_at': max(valid).strftime('%Y-%m-%d %H:%M:%S') if valid else None,
+            })
+
+        total = len(rows)
+        errors = levels.get('ERROR', 0)
+        return {
+            'total': total,
+            'errors': errors,
+            'warnings': levels.get('WARNING', 0),
+            'by_level': levels.most_common(),
+            'by_component': components.most_common(8),
+            'error_rate_percent': round(100.0 * errors / total, 1) if total else None,
+            'repeated': repeated[:20],
+            'first_at': min(stamps).strftime('%Y-%m-%d %H:%M:%S') if stamps else None,
+            'last_at': max(stamps).strftime('%Y-%m-%d %H:%M:%S') if stamps else None,
+            'span_seconds': round(max(stamps).timestamp() - min(stamps).timestamp(), 1)
+                            if stamps else None,
+            'rows_without_a_readable_time': len(rows) - len(stamps),
+        }
+
+    def export_error_report(self, report_type: str,
+                            log_rows: Optional[List[Dict[str, Any]]] = None,
+                            output_path: Optional[str] = None) -> Dict[str, Any]:
+        """Write one report file and answer with where it is, or why nothing was written.
+
+        The Reports list used to gain a row for a file no code had created, and selecting
+        that row painted a crash carrying a `mesh_processor.cpp` stack trace out of a C++
+        build this app does not contain. A row now appears only after a real file exists,
+        and the preview reads that file off the disk.
+        """
+        if report_type not in DiagnosticEngine.REPORT_KINDS:
+            return {'report_type': report_type, 'path': None,
+                    'reason': f"'{report_type}' is not a report this engine can fill. The "
+                              f"kinds it knows are {', '.join(DiagnosticEngine.REPORT_KINDS)}."}
+
+        rows = log_rows or []
+        errors = self.error_logger.get_recent_errors(limit=1000)
+        payload = {
+            'report_type': report_type,
+            'what_this_report_is': DiagnosticEngine.REPORT_KINDS[report_type],
+            'generated_at': datetime.now().isoformat(timespec='seconds'),
+            'build': SystemInfo.get_build_info(),
+        }
+        if report_type in ('Crash Report', 'Error Summary'):
+            payload['error_log'] = {
+                'path': str(self.error_logger.log_file),
+                'exists': self.error_logger.log_file.exists(),
+                'records': errors,
+            }
+            payload['records_the_pane_saw'] = self.summarise_log_rows(rows)
+            if not rows:
+                payload['records_the_pane_saw']['note'] = (
+                    'this pane only sees records logged while it exists, and it has seen none')
+        if report_type == 'Crash Report':
+            payload['process'] = SystemInfo.get_process_info()
+        elif report_type == 'Performance Report':
+            payload['cpu'] = SystemInfo.get_cpu_info()
+            payload['memory'] = SystemInfo.get_memory_info()
+            payload['process'] = SystemInfo.get_process_info()
+            payload['frames'] = shared_clock().stats()
+            payload['gpu'] = SystemInfo.live_gpu_sample()
+        elif report_type == 'Memory Report':
+            payload['memory'] = SystemInfo.get_memory_info()
+            payload['objects'] = SystemInfo.live_object_counts()
+        elif report_type == 'System Report':
+            payload['system'] = self.get_full_system_report()
+
+        if output_path is None:
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe = ''.join(c for c in report_type if c.isalnum() or c in ' -_')
+            file_name = f"report_{safe.strip().lower().replace(' ', '_')}_{stamp}.json"
+            output_path = os.path.join(self.error_logger.log_dir, file_name)
+
+        with open(output_path, 'w') as handle:
+            json.dump(payload, handle, indent=2, default=str)
+        return {'report_type': report_type, 'path': output_path,
+                'bytes': os.path.getsize(output_path),
+                'sections': [key for key in payload if key != 'report_type']}
     
     def get_recommendations(self, health: Optional[Dict[str, Any]] = None) -> List[str]:
         """What the health checks say is wrong, one line each, in the words the table shows.

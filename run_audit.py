@@ -167,6 +167,13 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "performance_backend_contract",
+        "name": "Performance Backend and Frame Clock Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_performance_backend_contract.py")],
+        "description": "Requires every figure on the Performance tab to be arithmetic over stamps the app's own views made, or a refusal that says which kind of nothing it is: the rate is taken over a window so a burst that stopped five seconds ago reads as stale rather than current, the four cases with no gaps to take each name themselves, an unread field stays None with its reason in not_read instead of becoming 0.0 or last run's answer, the score refuses when the two fields it leans on were never read, advice names the reading that caused it and the control in this app that changes it and promises no percentage, the four kinds of bounded work record what this machine did and compare only with the app's own earlier runs while a fifth kind is refused by name, a session or profile log name carrying .. a colon or a slash cannot walk out of the log folder, the storage probe measures the volume the app actually writes into, and the pane keeps the progress bar's range so the percentages the engine reports are not thrown away by Qt and paints the engine's own cells",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

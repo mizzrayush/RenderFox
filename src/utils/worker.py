@@ -42,7 +42,8 @@ class Worker(QRunnable):
 
         # Add the callback to our kwargs
         # The function must accept a 'progress_callback' argument if it wants to report progress
-        self.kwargs['progress_callback'] = self.signals.progress
+        # `.emit` and not the signal itself: a PyQt6 signal object is not callable.
+        self.kwargs['progress_callback'] = self.signals.progress.emit
 
     @pyqtSlot()
     def run(self):

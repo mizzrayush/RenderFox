@@ -28,7 +28,7 @@ except ImportError:
 
 # Import performance analyzer backend
 from ..features.performance_analyzer import (
-    PerformanceAnalyzer, PerformanceMetrics, ProfileResult
+    PerformanceAnalyzer, BenchmarkRunner
 )
 from ..utils.worker import Worker
 
@@ -149,6 +149,7 @@ class PerformanceTab(QWidget):
         super().__init__(parent)
         self.current_settings = {}
         self.benchmark_results = []
+        self._workers = []
         self.gpu_report = None
         self.storage_info = None
         
@@ -417,8 +418,8 @@ class PerformanceTab(QWidget):
         
         self.benchmark_cpu_btn = QPushButton("CPU Benchmark")
         self.benchmark_cpu_btn.setIcon(get_icon("performance"))
-        self.benchmark_gpu_btn = QPushButton("GPU Benchmark")
-        self.benchmark_gpu_btn.setIcon(get_icon("rendered"))
+        self.benchmark_geometry_btn = QPushButton("Geometry Benchmark")
+        self.benchmark_geometry_btn.setIcon(get_icon("rendered"))
         self.benchmark_memory_btn = QPushButton("Memory Benchmark")
         self.benchmark_memory_btn.setIcon(get_icon("diagnostics"))
         self.benchmark_storage_btn = QPushButton("Storage Benchmark")
@@ -428,7 +429,7 @@ class PerformanceTab(QWidget):
         self.benchmark_full_btn.setProperty("primary", "true")
         
         controls_layout.addWidget(self.benchmark_cpu_btn)
-        controls_layout.addWidget(self.benchmark_gpu_btn)
+        controls_layout.addWidget(self.benchmark_geometry_btn)
         controls_layout.addWidget(self.benchmark_memory_btn)
         controls_layout.addWidget(self.benchmark_storage_btn)
         controls_layout.addWidget(self.benchmark_full_btn)
@@ -458,7 +459,13 @@ class PerformanceTab(QWidget):
         
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(4)
-        self.results_table.setHorizontalHeaderLabels(["Component", "Score", "Performance", "Rank"])
+        # The columns are the measurement, not a verdict about it. "Performance" and
+        # "Rank" used to hold "Excellent" and "Top 1%": the first was a threshold the
+        # work always beat, the second a percentile against results RenderFox has never
+        # collected from anyone. The engine words these cells (row_cells), because a
+        # table column is a claim and the claim belongs beside the number.
+        self.results_table.setHorizontalHeaderLabels(
+            ["Kind", "What ran", "Measured", "Against this app's own earlier runs"])
         
         results_table_layout.addWidget(self.results_table)
         results_group.setLayout(results_table_layout)
@@ -750,7 +757,7 @@ class PerformanceTab(QWidget):
         
         # Benchmark tab
         self.benchmark_cpu_btn.clicked.connect(self.run_cpu_benchmark)
-        self.benchmark_gpu_btn.clicked.connect(self.run_gpu_benchmark)
+        self.benchmark_geometry_btn.clicked.connect(self.run_geometry_benchmark)
         self.benchmark_full_btn.clicked.connect(self.run_full_benchmark)
         
         # Optimization tab
@@ -903,88 +910,124 @@ class PerformanceTab(QWidget):
             self.detect_gpu_hardware()
             
     def run_cpu_benchmark(self):
-        """Run CPU benchmark."""
-        self.benchmark_status.setText("Running CPU benchmark...")
+        """Time square matrix multiplies, which is the work this kind performs."""
+        self.start_benchmark('cpu', 'CPU')
+
+    def run_geometry_benchmark(self):
+        """Time point-cloud normal estimation through Open3D, and say which device ran it.
+
+        This button was labelled GPU Benchmark while the work behind it was Open3D's
+        CPU build. The engine's refusal for a `gpu` kind is what that label deserved, so
+        the label names the work now and the row names the device that answered.
+        """
+        self.start_benchmark('geometry', 'Geometry')
+
+    def start_benchmark(self, kind, label):
+        """Run one kind in a worker thread; the interface thread times nothing itself.
+
+        The two methods this replaces passed a `worker_func()` that took no
+        `progress_callback`, which is the one argument this app's Worker always supplies,
+        and never connected `signals.error`, so a failure left the bar indeterminate
+        forever. Both are handled here.
+        """
+        self.benchmark_status.setText(f"Running {label.lower()} benchmark...")
+        # Qt throws away setValue while minimum == maximum, so a busy bar cannot report numbers.
+        self.benchmark_progress.setRange(0, 100)
         self.benchmark_progress.setValue(0)
-        self.benchmark_progress.setRange(0, 0) # Indeterminate
-        
-        def worker_func():
-            return self.performance_analyzer.benchmark.run_cpu_benchmark()
-            
+        self.set_benchmark_buttons_enabled(False)
+        engine = self.performance_analyzer.benchmark
+
+        def worker_func(progress_callback=None):
+            return engine.run(kind, record=True, progress_callback=progress_callback)
+
         worker = Worker(worker_func)
-        
-        def on_result(result):
-            self.benchmark_status.setText("CPU benchmark completed")
-            self.benchmark_progress.setRange(0, 100)
-            self.benchmark_progress.setValue(100)
-            
-            # Add results
-            row = self.results_table.rowCount()
-            self.results_table.insertRow(row)
-            self.results_table.setItem(row, 0, QTableWidgetItem("CPU"))
-            self.results_table.setItem(row, 1, QTableWidgetItem(f"{result['score']:,}"))
-            
-            # Determine rank
-            score = result['score']
-            if score > 50000: rank = "Top 1%"
-            elif score > 20000: rank = "Top 10%"
-            elif score > 10000: rank = "Top 25%"
-            else: rank = "Average"
-            
-            self.results_table.setItem(row, 2, QTableWidgetItem("Excellent" if score > 10000 else "Good"))
-            self.results_table.setItem(row, 3, QTableWidgetItem(rank))
-            
-        worker.signals.result.connect(on_result)
+        worker.signals.result.connect(self.show_benchmark_result)
+        worker.signals.error.connect(self.on_benchmark_failed)
+        worker.signals.progress.connect(self.benchmark_progress.setValue)
+        worker.signals.finished.connect(self.finish_benchmark)
+        self._workers.append(worker)
         QThreadPool.globalInstance().start(worker)
-        
-    def run_gpu_benchmark(self):
-        """Run GPU benchmark."""
-        if not self.enable_gpu_cb.isChecked():
-            # Auto-enable for benchmark if possible?
-            # For now just warn
-            pass
-            
-        self.benchmark_status.setText("Running GPU benchmark...")
-        self.benchmark_progress.setValue(0)
-        self.benchmark_progress.setRange(0, 0)
-        
-        def worker_func():
-            return self.performance_analyzer.benchmark.run_gpu_benchmark()
-            
-        worker = Worker(worker_func)
-        
-        def on_result(result):
-            if 'error' in result:
-                self.benchmark_status.setText(f"GPU benchmark failed: {result['error']}")
-                QMessageBox.warning(self, "Error", result['error'])
-                return
-                
-            self.benchmark_status.setText("GPU benchmark completed")
-            self.benchmark_progress.setRange(0, 100)
-            self.benchmark_progress.setValue(100)
-            
-            # Add results
-            row = self.results_table.rowCount()
-            self.results_table.insertRow(row)
-            self.results_table.setItem(row, 0, QTableWidgetItem("GPU"))
-            self.results_table.setItem(row, 1, QTableWidgetItem(f"{result['score']:,}"))
-            
-            score = result['score']
-            self.results_table.setItem(row, 2, QTableWidgetItem("Outstanding" if score > 5000 else "Good"))
-            self.results_table.setItem(row, 3, QTableWidgetItem("Top 10%" if score > 5000 else "Average"))
-            
-        worker.signals.result.connect(on_result)
-        QThreadPool.globalInstance().start(worker)
-        
+
+    def set_benchmark_buttons_enabled(self, enabled):
+        for button in (self.benchmark_cpu_btn, self.benchmark_geometry_btn,
+                       self.benchmark_memory_btn, self.benchmark_storage_btn,
+                       self.benchmark_full_btn):
+            button.setEnabled(enabled)
+
+    def show_benchmark_result(self, result):
+        """Paint the engine's own cells, including the one that says the work did not run."""
+        row = self.results_table.rowCount()
+        self.results_table.insertRow(row)
+        for column, text in enumerate(BenchmarkRunner.row_cells(result)):
+            self.results_table.setItem(row, column, QTableWidgetItem(text))
+        self.benchmark_results.append(result)
+        self.paint_comparison(result)
+        if result.get('ran') is None:
+            self.benchmark_status.setText(
+                f"{result.get('kind')} benchmark did not run: {result.get('reason')}")
+        else:
+            self.benchmark_status.setText(
+                f"{result.get('kind')} benchmark finished: {result.get('ran')}")
+
+    def paint_comparison(self, result):
+        """The app's own earlier runs of this work, which is the only series it owns."""
+        kind = result.get('kind')
+        if result.get('ran') is None:
+            self.comparison_chart.setText('nothing to compare - this work did not run')
+            return
+        stored = self.performance_analyzer.benchmark.history.recent_runs(kind)
+        if stored['reason']:
+            self.comparison_chart.setText(
+                f"the stored runs could not be read: {stored['reason']}")
+            return
+        unit = result.get('comparison_unit', '')
+        lines = [f"RenderFox's own runs of the {kind} work on this machine", '']
+        if not stored['runs']:
+            lines.append('this run was not recorded, so there is no series yet')
+        for entry in stored['runs']:
+            lines.append(f"{entry.get('at')} - {entry.get('value')} {unit}")
+        lines.extend(['',
+                      'No other machine is in this list. The app has never collected '
+                      "anybody else's result, so it cannot rank this one against a field."])
+        self.comparison_chart.setText('\n'.join(lines))
+
+    def on_benchmark_failed(self, error):
+        kind, value, _traceback = error
+        self.benchmark_status.setText(f"benchmark failed: {kind.__name__}: {value}")
+
+    def finish_benchmark(self):
+        self.benchmark_progress.setRange(0, 100)
+        self.benchmark_progress.setValue(100)
+        self.set_benchmark_buttons_enabled(True)
+
     def run_full_benchmark(self):
-        """Run full system benchmark."""
-        self.benchmark_status.setText("Running full system benchmark...")
-        
-        # Run all benchmarks
-        self.run_cpu_benchmark()
-        self.run_gpu_benchmark()
-        
-        self.benchmark_status.setText("Full system benchmark completed")
+        """Every kind the engine performs, in one worker, with its refusals kept."""
+        self.benchmark_status.setText(
+            'Running every benchmark this engine performs...')
+        # Qt throws away setValue while minimum == maximum, so a busy bar cannot report numbers.
+        self.benchmark_progress.setRange(0, 100)
+        self.benchmark_progress.setValue(0)
+        self.set_benchmark_buttons_enabled(False)
+        engine = self.performance_analyzer.benchmark
+
+        def worker_func(progress_callback=None):
+            return engine.run_all(record=True, progress_callback=progress_callback)
+
+        worker = Worker(worker_func)
+        worker.signals.result.connect(self.show_full_benchmark)
+        worker.signals.error.connect(self.on_benchmark_failed)
+        worker.signals.progress.connect(self.benchmark_progress.setValue)
+        worker.signals.finished.connect(self.finish_benchmark)
+        self._workers.append(worker)
+        QThreadPool.globalInstance().start(worker)
+
+    def show_full_benchmark(self, summary):
+        for kind in BenchmarkRunner.KINDS:
+            self.show_benchmark_result(summary['kinds'][kind])
+        refused = summary['refused']
+        self.benchmark_status.setText(
+            f"measured {', '.join(summary['performed']) or 'nothing'}"
+            + (f"; refused {len(refused)}: {'; '.join(refused)}" if refused else ''))
         
     def apply_performance_profile(self):
         """Apply the selected performance profile."""

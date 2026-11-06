@@ -39,8 +39,10 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -1121,6 +1123,751 @@ class Test14VolumeDiskJoin(unittest.TestCase):
                          f'only some of the letters went unlabelled: {got["reasons"]}')
         self.assertIsNone(self.row(got, 'C')['media_type'],
                           'a letter was matched to no disk and labelled anyway')
+
+
+def log_row(level='ERROR', message='the mesh has no faces',
+            component='src.features.mesh', at=None):
+    """One record in the exact shape the Diagnostics pane keeps."""
+    stamp = (at if isinstance(at, str)
+             else (at or datetime.now()).strftime('%Y-%m-%d %H:%M:%S'))
+    return {'timestamp': stamp, 'level': level, 'component': component,
+            'message': message,
+            'full_text': f'[{stamp}] {level}: [{component}] {message}'}
+
+
+def proc(**over):
+    """A process reading, with the fields the panes read and nothing else."""
+    row = {'pid': 4242, 'started_at': '2026-11-06T09:00:00', 'uptime_seconds': 12.5,
+           'rss_mb': 512.25, 'vms_mb': 1024.0, 'peak_rss_mb': 600.5, 'threads': 9,
+           'open_files': 4, 'gc_objects': 54321, 'failures': []}
+    row.update(over)
+    return row
+
+
+def machine_mem(**over):
+    row = {'total': '16.00 GB', 'used': '12.00 GB', 'available': '4.00 GB',
+           'percent': 75.0, 'swap_total': '18.00 GB', 'swap_used': '1.00 GB',
+           'swap_percent': 5.5}
+    row.update(over)
+    return row
+
+
+def frames(**over):
+    """A frame-clock answer: nothing measured, unless a test says frames were drawn."""
+    row = {'frames': 0, 'window_seconds': 1.0, 'fps': None, 'frame_time_ms': None,
+           'slowest_frame_ms': None, 'sources': [], 'total_frames': 0,
+           'last_frame_seconds_ago': None, 'failures': 0, 'last_failure': None,
+           'blocked': False, 'reason': 'no 3D view has drawn a frame since the app started',
+           'measured_at': time.time()}
+    row.update(over)
+    return row
+
+
+class Test15LogArithmetic(unittest.TestCase):
+    """Windows and counts over the records the pane holds, and the files it writes.
+
+    Everything here is arithmetic on rows the app itself produced. The analysis this
+    replaces printed 1,247 records, a 2.3% error rate, a 156 ms response time and three
+    named issues with a fix each, and none of those figures came from a measurement.
+    """
+
+    def setUp(self):
+        self.engine = DiagnosticEngine()
+        self.dir = tempfile.mkdtemp(prefix='rf6j2-')
+
+    def tearDown(self):
+        for name in os.listdir(self.dir):
+            os.remove(os.path.join(self.dir, name))
+        os.rmdir(self.dir)
+
+    def test_150_a_window_keeps_only_the_records_its_own_time_places_inside(self):
+        now = datetime.now()
+        rows = [log_row(at=now - timedelta(seconds=10)),
+                log_row(at=now - timedelta(hours=2)),
+                log_row(at=now - timedelta(hours=25)),
+                log_row(at='not a time at all')]
+        for window, expected in (('Last Hour', 1), ('Last 6 Hours', 2), ('Last Month', 3)):
+            got = self.engine.rows_in_window(rows, window)
+            self.assertEqual(expected, len(got['rows']),
+                             f'{window} kept {len(got["rows"])} of {len(rows)} rows')
+            self.assertEqual(1, got['unparsed'],
+                             f'{window} dropped the unreadable row silently')
+            self.assertIsNone(got['reason'])
+            self.assertAlmostEqual(got['cutoff'],
+                                   time.time() - DiagnosticEngine.LOG_WINDOWS[window],
+                                   delta=5.0)
+
+    def test_151_custom_range_refuses_by_name_instead_of_becoming_the_whole_log(self):
+        got = self.engine.rows_in_window([log_row()], 'Custom Range')
+        self.assertEqual([], got['rows'])
+        self.assertIsNone(got['cutoff'])
+        self.assertIn('Custom Range', got['reason'])
+        for window in DiagnosticEngine.LOG_WINDOWS:
+            self.assertIn(window, got['reason'], f'{window} was not offered as an answer')
+
+    def test_152_the_summary_is_a_count_of_the_rows_it_was_given(self):
+        rows = ([log_row(message='the mesh has no faces') for _ in range(4)]
+                + [log_row(level='WARNING', message='cache is full', at=datetime.now()
+                           - timedelta(seconds=30)),
+                   log_row(level='INFO', message='loaded 12 files',
+                           at=datetime.now() - timedelta(seconds=90))])
+        got = self.engine.summarise_log_rows(rows)
+        self.assertEqual(6, got['total'])
+        self.assertEqual(4, got['errors'])
+        self.assertEqual(66.7, got['error_rate_percent'])
+        self.assertEqual([('ERROR', 4), ('WARNING', 1), ('INFO', 1)],
+                         sorted(got['by_level'], key=lambda pair: -pair[1]))
+        self.assertEqual(0, got['rows_without_a_readable_time'])
+        self.assertEqual(1, len(got['repeated']))
+        self.assertEqual(4, got['repeated'][0]['count'])
+        self.assertEqual('the mesh has no faces', got['repeated'][0]['message'])
+        self.assertEqual('src.features.mesh', got['repeated'][0]['component'])
+        self.assertLessEqual(got['repeated'][0]['first_at'], got['repeated'][0]['last_at'])
+        self.assertGreater(got['span_seconds'], 0)
+
+    def test_153_no_rows_is_not_a_zero_percent_of_nothing(self):
+        got = self.engine.summarise_log_rows([])
+        self.assertEqual(0, got['total'])
+        self.assertIsNone(got['error_rate_percent'])
+        self.assertIsNone(got['first_at'])
+        self.assertIsNone(got['span_seconds'])
+        self.assertEqual([], got['repeated'])
+
+    def test_154_each_kind_of_report_writes_the_file_its_name_promises(self):
+        rows = [log_row(), log_row(level='WARNING')]
+        expected = {'Crash Report': ('error_log', 'records_the_pane_saw', 'process'),
+                    'Error Summary': ('error_log', 'records_the_pane_saw'),
+                    'Performance Report': ('cpu', 'frames', 'gpu'),
+                    'Memory Report': ('objects', 'memory'),
+                    'System Report': ('system',)}
+        for kind, keys in expected.items():
+            path = os.path.join(self.dir, f'{kind.replace(" ", "_")}.json')
+            got = self.engine.export_error_report(kind, rows, output_path=path)
+            self.assertEqual(path, got['path'], got)
+            with open(path, encoding='utf-8') as handle:
+                payload = json.load(handle)
+            self.assertEqual(kind, payload['report_type'])
+            for key in keys:
+                self.assertIn(key, payload, f'{kind} is missing its {key} reading')
+            self.assertIn('build', payload, f'{kind} forgot which interpreter it describes')
+
+    def test_155_a_kind_the_engine_cannot_fill_writes_nothing(self):
+        before = os.listdir(self.dir)
+        got = self.engine.export_error_report('Custom Report', [log_row()])
+        self.assertIsNone(got['path'])
+        self.assertIn('Custom Report', got['reason'])
+        for kind in DiagnosticEngine.REPORT_KINDS:
+            self.assertIn(kind, got['reason'], f'{kind} was not offered instead')
+        self.assertEqual(before, os.listdir(self.dir), 'a refusal still wrote a file')
+
+    def test_156_the_object_walk_asks_no_object_for_anything(self):
+        """A count must not probe attributes: some attributes load a library to answer.
+
+        `getattr(obj, 'nbytes')` over every live object asked a `ctypes` lazy library for
+        a DLL called 'nbytes' and raised FileNotFoundError out of the middle of the
+        memory snapshot. The size lookup is a type test now, and this pins it.
+        """
+        class Exploding:
+            def __getattr__(self, name):
+                raise RuntimeError(f'asking for {name} would load something')
+
+        keep = Exploding()
+        payload = SystemInfo.live_object_counts(limit=100000)
+        self.assertIn('Exploding', [name for name, _count in payload['classes']],
+                      'the walk died before it counted the test object')
+        self.assertGreaterEqual(payload['scanned'], 1000)
+        self.assertGreaterEqual(payload['distinct_classes'], 10)
+        self.assertIn('ndarray', payload['sized_types'])
+        self.assertIn('rss_mb', payload['process'])
+
+    def test_157_this_processes_peak_is_a_reading_not_a_default(self):
+        got = SystemInfo.get_process_info()
+        self.assertEqual([], got['failures'], str(got['failures']))
+        self.assertGreater(got['peak_rss_mb'], 0.0)
+        self.assertGreater(got['rss_mb'], 0.0)
+        self.assertLessEqual(got['rss_mb'], 10 * got['peak_rss_mb'])
+
+    def test_158_the_peak_is_read_under_the_name_the_records_of_either_platform_use(self):
+        """The second name in the fallback is proved with a shaped record, not on this machine.
+
+        `peak_wset` only exists on Windows and `peak_rss` only exists on Linux and macOS, so
+        whichever way this box answers, one of the two branches has never been watched. A
+        memory record built to the other shape is what watches them.
+        """
+        import collections
+        import psutil
+
+        Windows = collections.namedtuple('Windows', 'rss vms peak_wset')
+        Other = collections.namedtuple('Other', 'rss vms peak_rss')
+        Both = collections.namedtuple('Both', 'rss vms peak_wset peak_rss')
+        Neither = collections.namedtuple('Neither', 'rss vms')
+
+        class Recorded:
+            def __init__(self, info):
+                self.pid = 4242
+                self._info = info
+
+            def memory_info(self):
+                return self._info
+
+            def create_time(self):
+                return time.time() - 60.0
+
+            def num_threads(self):
+                return 3
+
+            def open_files(self):
+                return []
+
+        meg = 1024 * 1024
+        for info, peak, failures in (
+                (Windows(20 * meg, 100 * meg, 40 * meg), 40.0, []),
+                (Other(20 * meg, 100 * meg, 30 * meg), 30.0, []),
+                (Both(20 * meg, 100 * meg, 40 * meg, 90 * meg), 40.0, []),
+                (Neither(20 * meg, 100 * meg), None, ['no peak field'])):
+            with mock.patch.object(psutil, 'Process', lambda pid, info=info: Recorded(info)):
+                got = SystemInfo.get_process_info()
+            self.assertEqual(peak, got['peak_rss_mb'],
+                             f'{info._fields}: the peak read was {got["peak_rss_mb"]}')
+            self.assertEqual(20.0, got['rss_mb'])
+            for wanted in failures:
+                self.assertIn(wanted, ' '.join(got['failures']))
+            if not failures:
+                self.assertEqual([], got['failures'], str(got['failures']))
+        with mock.patch.object(psutil, 'Process',
+                               lambda pid: Recorded(Neither(20 * meg, 100 * meg))):
+            named = SystemInfo.get_process_info()
+        self.assertIn('rss, vms', ' '.join(named['failures']),
+                      'the refusal does not say which fields the record actually had')
+
+
+class Test16DiagnosticsStatePane(unittest.TestCase):
+    """The six buttons under Debug / Reports / Analysis, painting only what was measured."""
+
+    BUILD = {'os': 'TestOS 1.2 (build 9)', 'architecture': 'TESTARCH',
+             'processor': 'TestChip 3.0', 'python': '9.9.9',
+             'python_implementation': 'TestPython', 'packaged': False,
+             'qt_runtime': '9.8.7', 'pyqt': '6.6.6'}
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from src.ui.diagnostics_tab import DiagnosticsTab
+        from src.features.diagnostic_engine import ErrorLogger
+        self.dir = tempfile.mkdtemp(prefix='rf6j2-pane-')
+        self.tab = DiagnosticsTab()
+        self.tab.show()
+        self.tab.diagnostic_engine.error_logger = ErrorLogger(self.dir)
+
+    def tearDown(self):
+        for name in os.listdir(self.dir):
+            os.remove(os.path.join(self.dir, name))
+        os.rmdir(self.dir)
+        self.tab.close()
+
+    def pump(self, seconds=60.0, until=None):
+        end = time.time() + seconds
+        while time.time() < end:
+            self.app.processEvents()
+            time.sleep(0.02)
+            if until and until():
+                return True
+        return bool(until and until())
+
+    def painted(self, widget, marker, seconds=60.0):
+        self.assertTrue(self.pump(seconds, lambda: marker in widget.toPlainText()),
+                        f'the pane never painted {marker!r}')
+        return widget.toPlainText()
+
+    class FakeClock:
+        def __init__(self, stats):
+            self._stats = stats
+
+        def stats(self, window_seconds=1.0):
+            return self._stats
+
+    def patches(self, **over):
+        """Every reading the dump takes, held still so a painted line can be matched."""
+        from src.ui import diagnostics_tab as pane
+        build = dict(Test16DiagnosticsStatePane.BUILD)
+        build.update(over.pop('build', {}))
+        stack = [
+            mock.patch.object(SystemInfo, 'get_build_info', return_value=build),
+            mock.patch.object(SystemInfo, 'get_process_info',
+                              return_value=over.get('process', proc())),
+            mock.patch.object(SystemInfo, 'get_memory_info',
+                              return_value=over.get('memory', machine_mem())),
+            mock.patch.object(pane, 'shared_clock',
+                              lambda: self.FakeClock(over.get('frames', frames()))),
+        ]
+        return stack
+
+    def apply_patches(self, stack):
+        for patcher in stack:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_160_the_dump_names_the_interpreter_this_process_really_runs(self):
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn(sys.version.split()[0], text)
+        self.assertIn('CPython', text)
+        from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+        self.assertIn(PYQT_VERSION_STR, text)
+        self.assertIn(QT_VERSION_STR, text)
+        for invented in ('Windows 11', 'Python Version: 3.11.5', 'PyQt Version: 6.5.2',
+                         'Loaded Models: 3', 'Active Processes: 12',
+                         'GPU Acceleration: Enabled', 'Active Objects: 45,232',
+                         'building.obj', 'Total Allocated: 1.2 GB', 'Peak Usage: 1.8 GB',
+                         'Cache cleared (150MB freed)'):
+            self.assertNotIn(invented, text, f'the dump printed {invented!r} again')
+
+    def test_161_the_dump_paints_the_readings_it_was_handed(self):
+        stack = self.patches()
+        self.apply_patches(stack)
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn('TestOS 1.2 (build 9) on TESTARCH', text)
+        self.assertIn('Python: 9.9.9 (TestPython), a source tree', text)
+        self.assertIn('Qt runtime: 9.8.7, PyQt: 6.6.6', text)
+        self.assertIn('512.25 MB now, 600.5 MB at its peak; virtual 1024.0 MB', text)
+        self.assertIn('Threads: 9, open files: 4, live objects: 54321', text)
+        self.assertIn('12.00 GB used of 16.00 GB (75.0%)', text)
+        self.assertIn('Frames: nothing measured - '
+                      'no 3D view has drawn a frame since the app started', text)
+
+    def test_162_a_missing_peak_is_said_whole_not_spelled_into_a_number(self):
+        stack = self.patches(process=proc(peak_rss_mb=None,
+                                         failures=['peak resident size: no field here']))
+        self.apply_patches(stack)
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn('peak not reported', text)
+        self.assertIn('not reported: peak resident size: no field here', text)
+        self.assertIn('Resident memory: 512.25 MB now, peak not reported; '
+                      'virtual 1024.0 MB', text)
+        self.assertNotIn('None MB', text)
+
+    def test_163_a_frozen_build_says_so(self):
+        stack = self.patches(build={'packaged': True})
+        self.apply_patches(stack)
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn('a frozen build', text)
+
+    def test_164_frames_are_printed_even_when_no_view_is_in_reach(self):
+        stack = self.patches(frames=frames(frames=5, fps=48.0, frame_time_ms=20.8,
+                                          slowest_frame_ms=31.2, sources=['ViewerA'],
+                                          total_frames=5, window_seconds=1.0))
+        self.apply_patches(stack)
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn('48.0 fps from 5 frame(s) drawn by ViewerA, 20.8 ms average, '
+                      '31.2 ms slowest', text)
+
+    def test_165_a_standalone_pane_names_what_it_cannot_reach(self):
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn('not inside the main window', text)
+        self.assertIn('which holds no job queue', text)
+
+    def test_166_inside_the_window_the_dump_reaches_the_views_and_the_queue(self):
+        from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout
+
+        class Job:
+            def __init__(self, start, end):
+                self.start_time, self.end_time = start, end
+
+        class Manager:
+            def get_queue_stats(self):
+                return {'total': 3, 'pending': 1, 'rendering': 0, 'completed': 2,
+                        'failed': 0, 'paused': 0}
+
+            def get_all_jobs(self):
+                now = time.time()
+                return [Job(now - 30.0, now), Job(now - 10.0, now), Job(None, None)]
+
+        window = QMainWindow()
+        holder = QWidget()
+        holder.current_file_path = os.path.join(self.dir, 'MARKER-model.obj')
+        quiet = QWidget()
+        quiet.current_file_path = None
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.addWidget(self.tab)
+        layout.addWidget(holder)
+        layout.addWidget(quiet)
+        window.setCentralWidget(central)
+        window.job_manager = Manager()
+        self.addCleanup(window.close)
+
+        self.tab.dump_application_state()
+        text = self.painted(self.tab.debug_output, 'Application State Dump')
+        self.assertIn('2 view(s) found, 1 holding a file', text)
+        self.assertIn('MARKER-model.obj', text)
+        self.assertIn('3 job(s): 1 waiting, 0 running, 0 paused, 2 finished, 0 failed', text)
+        self.assertIn('20.0 s on average, 30.0 s at the slowest', text)
+        self.assertNotIn('which holds no job queue', text)
+
+    def test_167_the_snapshot_counts_objects_and_refuses_the_price_list(self):
+        payload = {'scanned': 54321, 'classes': [('tuple', 1000), ('dict', 900),
+                                                 ('list', 800), ('function', 700),
+                                                 ('type', 600)],
+                   'distinct_classes': 777, 'array_like_count': 3, 'array_bytes': 4096,
+                   'array_mb': 0.0, 'sized_types': 'ndarray, bytes',
+                   'process': proc(), 'machine_memory': machine_mem()}
+        with mock.patch.object(SystemInfo, 'live_object_counts', return_value=payload):
+            self.tab.take_memory_snapshot()
+            text = self.painted(self.tab.debug_output, 'Memory Snapshot')
+        self.assertIn('(54321 objects of 777 classes)', text)
+        self.assertIn('1000  tuple', text)
+        self.assertIn('3 object(s) of these types: ndarray, bytes', text)
+        self.assertIn('4096 bytes (0.0 MB)', text)
+        self.assertIn('12.00 GB used of 16.00 GB', text)
+        self.assertIn('tracemalloc', text, 'the refusal stopped naming what is missing')
+        for invented in ('3D Viewer: 245 MB', 'Model Data: 156 MB', 'Textures: 89 MB',
+                         'Cache: 67 MB', 'UI Framework: 34 MB', 'Cached Models: 8',
+                         'Memory Pools: 12', 'Total: 619 MB'):
+            self.assertNotIn(invented, text, f'the snapshot printed {invented!r} again')
+
+    def test_168_a_report_row_carries_the_file_it_was_written_to(self):
+        from PyQt6.QtCore import Qt
+        self.tab.generate_debug_report()
+        text = self.painted(self.tab.debug_output, 'Wrote the full system reading')
+        self.assertEqual(1, self.tab.reports_list.count())
+        row = self.tab.reports_list.item(0)
+        path = row.data(Qt.ItemDataRole.UserRole)
+        self.assertIn(path, text)
+        self.assertTrue(os.path.exists(path), f'the row points at nothing: {path}')
+        preview = self.painted(self.tab.report_preview, 'Read from:')
+        self.assertIn(path, preview)
+        self.assertIn('"cpu"', preview, 'the preview is not showing the file')
+        self.assertEqual(os.path.getsize(path),
+                         int(preview.splitlines()[2].split(' bytes')[0]))
+
+    def test_169_a_type_the_engine_cannot_fill_adds_no_row(self):
+        self.tab.generate_report_combo.setCurrentText('Custom Report')
+        self.tab.generate_error_report()
+        text = self.painted(self.tab.debug_output, 'No file was written')
+        self.assertIn('Custom Report', text)
+        self.assertEqual(0, self.tab.reports_list.count(), 'a refusal still added a row')
+        self.assertEqual([], [name for name in os.listdir(self.dir) if name.endswith('.json')])
+
+    def test_170_generated_reports_are_readable_after_the_worker_answers(self):
+        self.tab.generate_report_combo.setCurrentText('Memory Report')
+        self.tab.generate_error_report()
+        self.painted(self.tab.debug_output, 'bytes to:')
+        row = self.tab.reports_list.item(self.tab.reports_list.count() - 1)
+        self.assertTrue(row.text().startswith('Memory Report - '), row.text())
+        preview = self.painted(self.tab.report_preview, 'Read from:')
+        self.assertIn('"objects"', preview)
+        self.assertNotIn('"scanned": null', preview)
+
+    def test_171_the_preview_shows_no_crash_that_never_happened(self):
+        from PyQt6.QtCore import Qt
+        self.tab.preview_report()
+        self.assertIn('Nothing selected', self.tab.report_preview.toPlainText())
+
+        self.tab.reports_list.addItem('Old Report - 2024-08-29 14:30:15')
+        self.tab.reports_list.setCurrentRow(0)
+        self.tab.preview_report()
+        self.assertIn('no file behind it', self.tab.report_preview.toPlainText())
+
+        path = os.path.join(self.dir, 'gone.json')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write('{"built": true}')
+        item = self.tab.reports_list.item(0)
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.tab.preview_report()
+        self.assertIn('"built": true', self.tab.report_preview.toPlainText())
+        os.remove(path)
+        self.tab.preview_report()
+        text = self.tab.report_preview.toPlainText()
+        self.assertIn('file this row points at is gone', text)
+        for canned in ('mesh_processor.cpp', 'segmentation fault', 'process_vertices',
+                       'GPU Memory: 89% used', 'Update graphics drivers'):
+            self.assertNotIn(canned, text, f'the canned crash printed {canned!r} again')
+
+    def test_172_the_analysis_counts_the_rows_the_pane_holds(self):
+        self.tab.log_entries = ([log_row(message='the mesh has no faces') for _ in range(4)]
+                                + [log_row(level='WARNING', message='cache is full')])
+        self.tab.analysis_period_combo.setCurrentText('Last Hour')
+        self.tab.analyze_logs()
+        text = self.painted(self.tab.trends_display, 'Log Analysis - the Last Hour window')
+        self.assertEqual('5 of 5 seen', self.tab.total_logs_label.text())
+        self.assertEqual('80.0%', self.tab.error_rate_label.text())
+        self.assertIn('MB in this process', self.tab.peak_memory_label.text())
+        self.assertEqual('nothing recorded', self.tab.crash_count_label.text())
+        self.assertIn('80.0% - 4 ERROR of 5 records', text)
+        self.assertIn('the mesh has no faces - 4 time(s)', text)
+        self.assertEqual(1, self.tab.frequent_issues_table.rowCount())
+        cells = [self.tab.frequent_issues_table.item(0, col).text() for col in range(4)]
+        self.assertEqual('4 times', cells[1])
+        self.assertEqual('src.features.mesh', cells[3])
+        self.assertEqual('Logged By',
+                         self.tab.frequent_issues_table.horizontalHeaderItem(3).text())
+
+    def test_173_no_invented_statistics_survive_the_analysis(self):
+        self.tab.log_entries = [log_row()]
+        self.tab.analysis_period_combo.setCurrentText('Last Hour')
+        self.tab.analyze_logs()
+        self.painted(self.tab.trends_display, 'Log Analysis')
+        for label in (self.tab.total_logs_label, self.tab.error_rate_label,
+                      self.tab.avg_response_label, self.tab.peak_memory_label,
+                      self.tab.crash_count_label):
+            self.assertNotIn(label.text(), ('1,247', '2.3%', '156ms', '1.8GB', '0'))
+        text = self.tab.trends_display.toPlainText()
+        for invented in ('Performance degrades after 2+ hours', 'GPU driver timeouts',
+                         'Unusual memory allocation pattern at 14:30-15:00',
+                         'Implement automatic GPU memory management'):
+            self.assertNotIn(invented, text, f'the trends printed {invented!r} again')
+
+    def test_174_a_window_no_control_can_give_leaves_no_stale_figure(self):
+        self.tab.log_entries = [log_row() for _ in range(3)]
+        self.tab.analysis_period_combo.setCurrentText('Last Hour')
+        self.tab.analyze_logs()
+        self.painted(self.tab.trends_display, 'Log Analysis')
+        self.tab.analysis_period_combo.setCurrentText('Custom Range')
+        self.tab.analyze_logs()
+        self.painted(self.tab.trends_display, 'Nothing was counted')
+        for label in (self.tab.total_logs_label, self.tab.error_rate_label,
+                      self.tab.avg_response_label, self.tab.peak_memory_label,
+                      self.tab.crash_count_label):
+            self.assertEqual('not measured', label.text(), label.text())
+        self.assertEqual(0, self.tab.frequent_issues_table.rowCount())
+
+    def test_175_crash_records_are_counted_from_the_file_they_live_in(self):
+        from src.features.diagnostic_engine import ErrorLogger
+        logger = ErrorLogger(self.dir)
+        logger.log_error('ValueError', 'first crash')
+        logger.log_error('OSError', 'second crash')
+        self.tab.diagnostic_engine.error_logger = logger
+        self.tab.analysis_period_combo.setCurrentText('Last Hour')
+        self.tab.analyze_logs()
+        text = self.painted(self.tab.trends_display, 'Log Analysis')
+        self.assertEqual('2 record(s)', self.tab.crash_count_label.text())
+        self.assertIn('2 record(s)', text)
+
+        os.remove(logger.log_file)
+        self.tab.analyze_logs()
+        self.painted(self.tab.trends_display, 'Log Analysis')
+        self.assertEqual('nothing recorded', self.tab.crash_count_label.text())
+        self.assertIn('does not exist yet', self.tab.trends_display.toPlainText())
+
+    def test_176_no_measurement_runs_on_the_interface_thread(self):
+        """Every button that reads the machine hands the reading to a worker.
+
+        `run_quick_check` and its neighbours used to call psutil, WMI and the drive scan
+        from the click handler, which is how the pane stopped painting while it claimed to
+        be working. A measuring call is allowed only inside something the worker runs, so
+        this walks each entry point's tree and flags any call at the handler's own depth.
+        """
+        import ast
+        import inspect
+        import textwrap
+        from src.ui.diagnostics_tab import DiagnosticsTab
+
+        forbidden = ('get_process_info', 'live_object_counts', 'get_cpu_info',
+                     'export_report', 'export_error_report', 'rows_in_window',
+                     'summarise_log_rows')
+
+        def depth_of_calls(node, depth):
+            found = []
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.Call):
+                    name = ast.unparse(child.func).rsplit('.', 1)[-1]
+                    if name in forbidden:
+                        found.append((depth, ast.unparse(child)))
+                    found.extend(depth_of_calls(child, depth))
+                elif isinstance(child, (ast.FunctionDef, ast.Lambda)):
+                    found.extend(depth_of_calls(child, depth + 1))
+                else:
+                    found.extend(depth_of_calls(child, depth))
+            return found
+
+        for name in ('dump_application_state', 'take_memory_snapshot',
+                     'generate_debug_report', 'generate_error_report', 'analyze_logs'):
+            source = textwrap.dedent(inspect.getsource(getattr(DiagnosticsTab, name)))
+            body = ast.parse(source).body[0]
+            self.assertIn('run_off_thread', ast.unparse(body),
+                          f'{name} measures on the UI thread')
+            offenders = [text for depth, text in depth_of_calls(body, 0) if depth == 0]
+            self.assertEqual([], offenders, f'{name} measures where the window waits')
+
+    def test_177_a_measurement_that_raises_is_reported_not_swallowed(self):
+        def explode():
+            raise RuntimeError('the probe raised')
+
+        self.tab.run_off_thread(explode, lambda payload: None, 'Working...')
+        text = self.painted(self.tab.debug_output, 'RuntimeError')
+        self.assertIn('the probe raised', text)
+        self.assertIn('raised before it answered', text)
+
+    def test_177b_the_hardware_test_button_hands_the_engine_a_worker_it_can_answer(self):
+        """The house `Worker` always passes `progress_callback`, so this one has to take it.
+
+        `run_engine_kinds` is the path behind the Diagnostics pane's hardware test, and until
+        now nothing drove it: the pane's answer was only ever read by the person clicking the
+        button. A `worker_func` that cannot take the argument is a TypeError painted where a
+        benchmark belongs, so both channels are read here and the engine is asked whether it
+        was given the callback at all.
+        """
+        import src.ui.diagnostics_tab as pane
+        asked = []
+
+        class FakeEngine:
+            def run(self, kind, duration=2.0, record=False, should_stop=None,
+                    progress_callback=None, **work):
+                asked.append((kind, callable(progress_callback)))
+                return {'kind': kind, 'ran': f'{kind} work on this machine', 'reason': '',
+                        'result': {'multiplies_per_second': 1000.0}, 'against': {'reason': ''},
+                        'machine': {}, 'work': {},
+                        'stored': {'recorded': False, 'reason': 'the test engine'}}
+
+        real = pane.benchmark_engine
+        pane.benchmark_engine = lambda: FakeEngine()
+        self.addCleanup(setattr, pane, 'benchmark_engine', real)
+        self.tab.run_hardware_test()
+        answered = self.pump(20, lambda: (
+            'Hardware Performance Test Results' in self.tab.diagnostic_results.toPlainText()
+            or 'Benchmark failed' in self.tab.diagnostic_results.toPlainText()))
+        text = self.tab.diagnostic_results.toPlainText()
+        self.assertTrue(answered, 'the hardware test never answered at all')
+        self.assertNotIn('Benchmark failed', text,
+                        f'the pane took the failure channel instead of the result: {text}')
+        self.assertIn('cpu work on this machine', text)
+        self.assertIn('memory work on this machine', text)
+        self.assertIn('multiplies per second', text)
+        self.assertEqual([('cpu', True), ('memory', True)], asked,
+                         'the engine was run without the way to report its own progress')
+        self.assertEqual('Status: Hardware test completed', self.tab.health_status.text())
+
+    def test_177c_a_hardware_test_that_raises_is_said_out_loud(self):
+        """The engine's failure channel is connected, or the pane just stops answering.
+
+        177b proves the success path reaches the screen; it cannot see the error connect
+        being deleted, because nothing raises. This runs an engine that dies mid-kind and
+        requires the pane to print the exception it was handed, on the same widget the
+        benchmark writes to and with the status the person clicking is watching.
+        """
+        import src.ui.diagnostics_tab as pane
+
+        class DeadEngine:
+            def run(self, kind, duration=2.0, record=False, should_stop=None,
+                    progress_callback=None, **work):
+                raise RuntimeError('the engine died mid-run')
+
+        real = pane.benchmark_engine
+        pane.benchmark_engine = lambda: DeadEngine()
+        self.addCleanup(setattr, pane, 'benchmark_engine', real)
+        self.tab.run_hardware_test()
+        text = self.painted(self.tab.diagnostic_results, 'Benchmark failed')
+        self.assertIn('RuntimeError', text)
+        self.assertIn('the engine died mid-run', text)
+        self.assertEqual('Status: Test failed', self.tab.health_status.text())
+
+    def test_178_a_closed_pane_holds_no_log_handler_over_the_app(self):
+        """Every pane gets the app's records, and none of them outlives its pane.
+
+        The handler used to be attached once per process, so a second pane attached
+        nothing and its table stayed empty; and it stored a *bound signal*, which kept a
+        reference into the closed pane's Qt memory - memory the next widget then reused.
+        A record logged after that crashed the process, which is what the test run hit
+        before the handler was made to hold the pane weakly and detach on `destroyed`.
+        """
+        import logging
+        from PyQt6.QtWidgets import QWidget
+        from src.ui.diagnostics_tab import DiagnosticsTab, PaneLogHandler
+
+        def live_handlers():
+            return [handler for handler in logging.getLogger().handlers
+                    if isinstance(handler, PaneLogHandler) and handler.pane_alive()]
+
+        before = len(live_handlers())
+        second = DiagnosticsTab()
+        marker = 'the second pane must see this'
+        logging.getLogger('probe.component').error(marker)
+        end = time.time() + 10
+        while time.time() < end:
+            self.app.processEvents()
+            if (any(marker in row['message'] for row in self.tab.log_entries)
+                    and any(marker in row['message'] for row in second.log_entries)):
+                break
+            time.sleep(0.02)
+        self.assertTrue(any(marker in row['message'] for row in self.tab.log_entries),
+                        'the first pane stopped receiving records')
+        self.assertTrue(any(marker in row['message'] for row in second.log_entries),
+                        'a second pane attached nothing: the root logger was claimed by '
+                        'whichever pane was built first')
+        self.assertEqual(before + 1, len(live_handlers()),
+                         'the second pane logged nothing, or double')
+
+        died = []
+        second.destroyed.connect(lambda _=None: died.append(True))
+        second.deleteLater()
+        from PyQt6.QtCore import QEvent
+        end = time.time() + 15
+        while time.time() < end and not died:
+            self.app.processEvents()
+            # Deferred deletes only reach a widget once the loop really flushes them,
+            # which is what returning to the event loop does in a running app.
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.assertTrue(died, 'the pane was never destroyed, so the test proved nothing')
+        self.assertEqual(before, len(live_handlers()),
+                         'a destroyed pane still had a handler on the root logger')
+
+        # A record now must reach the surviving pane and crash nothing, and the memory
+        # the closed pane held must be in use by something else first.
+        spare = QWidget()
+        spare.setObjectName('recycled')
+        self.app.processEvents()
+        logging.getLogger('probe.component').error('logged after the pane died')
+        self.app.processEvents()
+        self.assertTrue(any('logged after the pane died' in row['message']
+                            for row in self.tab.log_entries),
+                        'the surviving pane stopped hearing the app')
+        spare.deleteLater()
+
+
+class Test17CrashRecord(unittest.TestCase):
+    """The handler that decides whether the crash count can ever be more than a claim."""
+
+    def test_179_the_unhandled_exception_writes_the_record_the_pane_counts(self):
+        import main as app_main
+        written = []
+
+        class FakeLogger:
+            def log_error(self, error_type, message, traceback_str=None):
+                written.append((error_type, message, traceback_str))
+
+        with mock.patch('src.features.diagnostic_engine.ErrorLogger', FakeLogger), \
+                mock.patch.object(app_main, 'get_telemetry') as telemetry, \
+                mock.patch.object(app_main, 'QMessageBox'):
+            try:
+                raise ValueError('the probe crashed')
+            except ValueError:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                app_main.global_exception_handler(exc_type, exc_value, exc_traceback)
+
+        self.assertEqual(1, len(written), 'the crash reached no file at all')
+        self.assertEqual('ValueError', written[0][0])
+        self.assertEqual('the probe crashed', written[0][1])
+        self.assertIn('ValueError: the probe crashed', written[0][2])
+        telemetry.return_value.track_error.assert_called_once()
+
+    def test_180_the_crash_path_swallows_nothing(self):
+        with open(os.path.join(ROOT, 'main.py'), encoding='utf-8') as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        bare = [node for node in ast.walk(tree)
+                if isinstance(node, ast.ExceptHandler) and node.type is None]
+        self.assertEqual([], [ast.unparse(node) for node in bare],
+                         'a bare except is again hiding the failure it should report')
+        for name in ('log_error', 'track_error'):
+            self.assertIn(name, source, f'the handler stopped using {name}')
 
 
 if __name__ == '__main__':

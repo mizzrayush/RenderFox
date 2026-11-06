@@ -29,12 +29,24 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 
     error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
     print(f"CRITICAL ERROR: {error_msg}", file=sys.stderr)
-    
-    # Log to telemetry
+
+    # The record the Diagnostics pane counts, written now because nothing else writes it.
+    # The call this replaces named `log_error`, a method the telemetry manager does not
+    # have (`track_error` is the one that exists), and the bare `except` swallowed the
+    # AttributeError - so a crash ended the process with no trace on disk, and the
+    # Diagnostics pane's crash count could only ever be a claim about an empty file.
     try:
-        get_telemetry().log_error("crash", str(exc_value), {"traceback": error_msg})
-    except:
-        pass
+        from src.features.diagnostic_engine import ErrorLogger
+        ErrorLogger().log_error(exc_type.__name__, str(exc_value), error_msg)
+    except (OSError, ImportError) as failed:
+        print(f"Could not write the crash record: {failed}", file=sys.stderr)
+
+    # Telemetry is an opt-in copy of the same event; a disabled or failing telemetry run
+    # must not hide the crash from the file above, so it is reported, not passed over.
+    try:
+        get_telemetry().track_error(exc_type.__name__, str(exc_value), error_msg)
+    except Exception as failed:
+        print(f"Could not record the crash in telemetry: {failed}", file=sys.stderr)
 
     # Show error dialog
     app = QApplication.instance()
