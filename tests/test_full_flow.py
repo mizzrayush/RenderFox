@@ -56,7 +56,7 @@ def test_full_flow():
             print(f"Operations: {result.get('operations')}")
         else:
             print(f"❌ Repair failed: {result.get('error')}")
-            return
+            return False
 
         # 3. AI Tagging (AIAssetTagger)
         print("\n[Step 2] Generating AI Tags...")
@@ -81,7 +81,7 @@ def test_full_flow():
                 print(f"  - {os.path.basename(lod)}")
         else:
             print("❌ LOD generation failed")
-            return
+            return False
 
         # 5. Version Control (AssetVersionControl)
         print("\n[Step 4] Committing Version...")
@@ -89,17 +89,42 @@ def test_full_flow():
         vc = AssetVersionControl(vc_dir)
         
         try:
-            version_hash = vc.save_version(repair_output, "Integration Test Commit")
-            print(f"✅ Committed version: {version_hash}")
-            
-            # Verify history (use get_version_history)
+            version_id = vc.save_version(repair_output, "Integration Test Commit")
             history = vc.get_version_history(repair_output)
-            print(f"✅ History entries: {len(history)}")
+
+            # The two lines this replaces printed a check mark over whatever came back, and what
+            # came back was `Committed version: None` and `History entries: 0` - the file the
+            # repairer had just written is a multi-material .obj, which is a Scene, and nothing
+            # here asked. Now every claim this step makes is one it checks.
+            if version_id is None or len(history) != 1:
+                print(f"❌ Version control committed nothing: id={version_id}, "
+                      f"rows={len(history)}")
+                return False
+
+            row = history[0]
+            snapshot_name = os.path.basename(row['snapshot_path'] or '')
+            strays = [n for n in os.listdir(os.path.join(vc_dir, '.versions', 'snapshots'))
+                      if n != snapshot_name]
+            if strays:
+                print(f"❌ Snapshots with no row pointing at them: {strays}")
+                return False
+            if not os.path.exists(row['snapshot_path']):
+                print(f"❌ The row names a snapshot that is not on disk: "
+                      f"{row['snapshot_path']}")
+                return False
+            if not row['polygon_count'] or not row['vertex_count']:
+                print(f"❌ The committed repair recorded no geometry: "
+                      f"{row['polygon_count']} faces, {row['vertex_count']} vertices")
+                return False
+
+            print(f"✅ Committed version {version_id}: {row['polygon_count']} faces, "
+                  f"{row['vertex_count']} vertices, 1 row")
         except Exception as e:
             print(f"❌ Version control failed: {e}")
-            return
+            return False
 
         print("\n🎉 Full Integration Test Passed!")
+        return True
 
 if __name__ == "__main__":
-    test_full_flow()
+    sys.exit(0 if test_full_flow() else 1)

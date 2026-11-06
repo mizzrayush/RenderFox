@@ -209,6 +209,13 @@ SUITES = [
         "timeout_seconds": 240
     },
     {
+        "id": "version_metrics_contract",
+        "name": "Version Metrics Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_version_metrics_contract.py")],
+        "description": "The Versions commit reads the file a DCC actually hands it: a mesh, a multi-material Scene and a point cloud each record the counts an oracle read straight off trimesh agrees with, a file with nothing measurable is refused before it is copied, a write that fails after the copy takes the copy and its picture back, a first version claims no delta and every later one equals the two rows printed above it, a number the file does not have is stored as NULL and said in the backend's own words in the column, the details, the statistics, the dialog and the HTML export, and the pane names which of the four facts stopped a commit",
+        "timeout_seconds": 240
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

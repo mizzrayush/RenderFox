@@ -34,6 +34,96 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 
 logger = logging.getLogger(__name__)
 
+# What a row says about a number the file does not have. Kept here so the timeline column, the
+# details pane and the HTML export all describe one absence in the same words.
+NO_FACES = 'no faces'
+NO_WATERTIGHT = 'no faces to close'
+NOT_COMPARABLE = 'not comparable - one version of this file has no faces'
+NO_GEOMETRY = ('the file holds neither a triangle mesh nor a point cloud, so there is nothing '
+               'to measure')
+
+
+def _normalise(loaded):
+    """One triangle mesh from whatever `trimesh.load` answered, or None if there is no mesh.
+
+    Imported on call rather than at the top of the module because `format_converter` drags
+    pymeshlab in: measured here at 1.54 s against 0.007 s for this module's own imports.
+    """
+    from ..processing.format_converter import as_trimesh
+    return as_trimesh(loaded)
+
+
+def _delta(now, then):
+    """Subtract a recorded count from a new one; None when either side does not have a number."""
+    return None if now is None or then is None else now - then
+
+
+def _measure_model(model_path: Path) -> Optional[Dict]:
+    """The facts a version row can honestly record for one file.
+
+    `trimesh.load` answers with three different objects and this backend was written against
+    one of them. Measured on this machine: an .obj carrying `mtllib`/`usemtl` - which is what
+    the app's own repair writes, `repaired_model.obj.mtl` beside it - answers `Scene`, a file
+    whose faces have been deleted answers `PointCloud`, and an empty or garbled .obj answers a
+    `Scene` with no geometries. `len(loaded.faces)` raised on the first two, `save_version`
+    logged the exception and returned None, and the pane read that as "no changes".
+
+    Returns None when there is no geometry at all, which is a fact to refuse on rather than an
+    error. A `PointCloud` has vertices and no faces: measured here, `faces`, `is_watertight`
+    and `volume` all raise `AttributeError` on it, so its face counts are recorded as absent.
+    """
+    loaded = trimesh.load(str(model_path))
+    mesh = _normalise(loaded)
+    if mesh is not None:
+        return {'mesh': mesh,
+                'polygon_count': len(mesh.faces),
+                'vertex_count': len(mesh.vertices),
+                'is_watertight': bool(mesh.is_watertight)}
+    if isinstance(loaded, trimesh.PointCloud):
+        return {'mesh': None,
+                'polygon_count': None,
+                'vertex_count': len(loaded.vertices),
+                'is_watertight': None}
+    return None
+
+
+def describe_polygon_count(version: Dict) -> str:
+    """The polygon count of one row, in words the row's own facts support."""
+    count = version.get('polygon_count')
+    return NO_FACES if count is None else f"{count:,}"
+
+
+def describe_watertight(version: Dict) -> str:
+    closed = version.get('is_watertight')
+    if closed is None:
+        return NO_WATERTIGHT
+    return 'Yes' if closed else 'No'
+
+
+def describe_volume(value, signed: bool = False) -> str:
+    """One volume from a comparison, or the fact that the surface is not closed.
+
+    Measured here: trimesh answers `is_volume` False for an open mesh, and an open surface has
+    no volume rather than a volume of nothing - which is what the comparison table's 0.0000 was.
+    """
+    if value is None:
+        return NO_WATERTIGHT
+    return f"{value:+.4f}" if signed else f"{value:.4f}"
+
+
+def describe_metrics(version: Dict) -> str:
+    """The timeline's Metrics column for one row, with its delta against the parent."""
+    polygons = version.get('polygon_count')
+    vertices = version.get('vertex_count')
+    if polygons is None:
+        text = f"V: {vertices:,}, {NO_FACES}"
+    else:
+        text = f"P: {polygons:,}, V: {vertices:,}"
+    delta = version.get('polygons_delta')
+    if delta:
+        text += f" ({delta:+,})"
+    return text
+
 
 class AssetVersionControl:
     """
@@ -125,7 +215,8 @@ class AssetVersionControl:
             auto: Whether this is an automatic save
             
         Returns:
-            Version ID if saved, None if no changes detected
+            Version ID if saved, None if the file is not on disk, is already committed on this
+            branch, or holds nothing measurable. `explain_no_commit` says which of those it was.
         """
         try:
             model_path = Path(model_path)
@@ -152,54 +243,67 @@ class AssetVersionControl:
                 logger.info(f"No changes detected for {model_path.name}, skipping version save")
                 return None
             
-            # Load mesh for metrics
-            mesh = trimesh.load(str(model_path))
-            
+            # Measured before the file is copied. This used to sit two statements after
+            # `shutil.copy2` as `len(mesh.faces)`, so a multi-material export - which is what the
+            # app's own repair writes, `repaired_model.obj.mtl` beside the .obj - raised
+            # `AttributeError` there, was caught at the bottom of this method, and left its
+            # snapshot on disk with no row pointing at it: invisible to rollback, never deleted.
+            try:
+                metrics = _measure_model(model_path)
+            except Exception as e:
+                logger.error(f"Could not read {model_path.name} to measure it: {e}")
+                return None
+            if metrics is None:
+                logger.error(f"Refusing to commit {model_path.name}: {NO_GEOMETRY}")
+                return None
+
+            metrics['file_size'] = file_size
+
             # Get next version number
             version_number = self._get_next_version_number(str(model_path))
-            
+
             # Create snapshot
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             snapshot_name = f"{model_path.stem}_v{version_number}_{timestamp}{model_path.suffix}"
             snapshot_path = self.snapshots_dir / snapshot_name
-            
-            shutil.copy2(model_path, snapshot_path)
-            
-            # Generate thumbnail (optional)
-            thumbnail_path = self._generate_thumbnail(snapshot_path)
-            
-            # Get parent version for diff calculation
-            parent_version = self._get_latest_version(str(model_path), branch)
-            
-            # Calculate metrics
-            metrics = {
-                'polygon_count': len(mesh.faces),
-                'vertex_count': len(mesh.vertices),
-                'file_size': model_path.stat().st_size,
-                'is_watertight': mesh.is_watertight
-            }
-            
-            # Calculate diff if parent exists
-            diff_metrics = {}
-            if parent_version:
-                diff_metrics = self._calculate_diff(mesh, parent_version)
-            
-            # Save to database
-            version_id = self._save_version_to_db(
-                model_path=str(model_path),
-                version_number=version_number,
-                file_hash=file_hash,
-                snapshot_path=str(snapshot_path),
-                thumbnail_path=thumbnail_path,
-                timestamp=datetime.now().isoformat(),
-                commit_message=commit_message if commit_message else f"Auto-save v{version_number}",
-                author=author,
-                branch=branch,
-                metrics=metrics,
-                diff_metrics=diff_metrics,
-                parent_version_id=parent_version['id'] if parent_version else None
-            )
-            
+            thumbnail_path = None
+
+            try:
+                shutil.copy2(model_path, snapshot_path)
+
+                # Generate thumbnail (optional)
+                thumbnail_path = self._generate_thumbnail(snapshot_path)
+
+                # Get parent version for diff calculation
+                parent_version = self._get_latest_version(str(model_path), branch)
+
+                # Calculate diff if parent exists
+                diff_metrics = {}
+                if parent_version:
+                    diff_metrics = self._calculate_diff(metrics, parent_version)
+
+                # Save to database
+                version_id = self._save_version_to_db(
+                    model_path=str(model_path),
+                    version_number=version_number,
+                    file_hash=file_hash,
+                    snapshot_path=str(snapshot_path),
+                    thumbnail_path=thumbnail_path,
+                    timestamp=datetime.now().isoformat(),
+                    commit_message=commit_message if commit_message else f"Auto-save v{version_number}",
+                    author=author,
+                    branch=branch,
+                    metrics=metrics,
+                    diff_metrics=diff_metrics,
+                    parent_version_id=parent_version['id'] if parent_version else None
+                )
+            except Exception:
+                # Nothing past the copy may leave a file behind that no row names.
+                if thumbnail_path:
+                    Path(thumbnail_path).unlink(missing_ok=True)
+                snapshot_path.unlink(missing_ok=True)
+                raise
+
             logger.info(f"Version {version_number} saved for {model_path.name}")
             return version_id
             
@@ -210,6 +314,33 @@ class AssetVersionControl:
             logger.error(f"Error saving version: {e}")
             return None
     
+    def explain_no_commit(self, model_path: str, branch: str = 'main') -> Dict:
+        """Say, from the file and the rows, why `save_version` recorded nothing.
+
+        `save_version` answers None for four different facts - no file on disk, bytes already
+        committed, a file with no geometry, a write that did not finish - and the pane read all
+        four as "No changes detected", which is one of them. It asks this instead of guessing,
+        and gets its answers from the same helpers the commit asks, not from a second reading
+        of what went wrong.
+
+        Returns `{'kind', 'reason'}`, the shape the app's other engines refuse with.
+        """
+        path = Path(model_path)
+        if not path.exists():
+            return {'kind': 'no_file', 'reason': f'There is no file at {path} to commit.'}
+        try:
+            metrics = _measure_model(path)
+        except Exception as e:
+            return {'kind': 'unreadable', 'reason': f'The file could not be read: {e}'}
+        if metrics is None:
+            return {'kind': 'no_geometry', 'reason': f'Nothing was committed: {NO_GEOMETRY}.'}
+        if self._is_duplicate_version(str(path), self._calculate_file_hash(path), branch):
+            return {'kind': 'duplicate',
+                    'reason': 'No changes detected. This file is already the newest version '
+                              'committed on this branch.'}
+        return {'kind': 'aborted',
+                'reason': 'The commit did not finish. Its reason is in the log.'}
+
     def get_version_history(self, model_path: str, branch: str = 'main') -> List[Dict]:
         """
         Get version history for a model.
@@ -256,9 +387,19 @@ class AssetVersionControl:
                 return {'error': 'Version not found'}
             
             # Load meshes
-            mesh1 = trimesh.load(v1['snapshot_path'])
-            mesh2 = trimesh.load(v2['snapshot_path'])
-            
+            mesh1 = _normalise(trimesh.load(v1['snapshot_path']))
+            mesh2 = _normalise(trimesh.load(v2['snapshot_path']))
+
+            no_mesh = [v['version_number'] for v, m in ((v1, mesh1), (v2, mesh2)) if m is None]
+            if no_mesh:
+                # A fact about the files, said once for both of them. This method used to reach
+                # `len(mesh.faces)` on a Scene and hand the dialog the raw AttributeError as its
+                # error string.
+                names = ' and v'.join(str(n) for n in no_mesh)
+                return {'error': f"v{names} "
+                                 f"{'holds' if len(no_mesh) == 1 else 'hold'} no triangle mesh, "
+                                 f"so there is nothing to compare"}
+
             # Calculate differences
             comparison = {
                 'version1': {
@@ -287,9 +428,13 @@ class AssetVersionControl:
                         'percent': ((len(mesh2.vertices) - len(mesh1.vertices)) / len(mesh1.vertices) * 100) if len(mesh1.vertices) > 0 else 0
                     },
                     'volume': {
-                        'v1': float(mesh1.volume) if mesh1.is_volume else 0,
-                        'v2': float(mesh2.volume) if mesh2.is_volume else 0,
-                        'delta': (float(mesh2.volume) if mesh2.is_volume else 0) - (float(mesh1.volume) if mesh1.is_volume else 0)
+                        # Not 0 for an open mesh: trimesh answers `is_volume` False there, and an
+                        # open surface has no volume at all rather than an empty one. The dialog
+                        # shows which of the two a cell means.
+                        'v1': float(mesh1.volume) if mesh1.is_volume else None,
+                        'v2': float(mesh2.volume) if mesh2.is_volume else None,
+                        'delta': (float(mesh2.volume - mesh1.volume)
+                                  if mesh1.is_volume and mesh2.is_volume else None)
                     },
                     'bounds': {
                         'v1': mesh1.bounds.tolist(),
@@ -521,8 +666,10 @@ class AssetVersionControl:
         """
         
         for version in versions:
-            delta_polys = version.get('polygons_delta', 0)
-            delta_class = 'delta-positive' if delta_polys > 0 else 'delta-negative' if delta_polys < 0 else ''
+            delta_polys = version.get('polygons_delta')
+            delta_class = 'delta-positive' if delta_polys and delta_polys > 0 else \
+                          'delta-negative' if delta_polys and delta_polys < 0 else ''
+    
             
             html += f"""
             <div class="version">
@@ -534,8 +681,8 @@ class AssetVersionControl:
                 <p><strong>Author:</strong> {version.get('author', 'Unknown')}</p>
                 <div class="metrics">
                     <div class="metric">
-                        <strong>Polygons:</strong> {version['polygon_count']:,}
-                        {f'<span class="{delta_class}"> ({delta_polys:+,})</span>' if delta_polys != 0 else ''}
+                        <strong>Polygons:</strong> {describe_polygon_count(version)}
+                        {f'<span class="{delta_class}"> ({delta_polys:+,})</span>' if delta_polys else ''}
                     </div>
                     <div class="metric">
                         <strong>Vertices:</strong> {version['vertex_count']:,}
@@ -655,18 +802,40 @@ class AssetVersionControl:
             return None
         return str(thumb_path)
     
-    def _calculate_diff(self, mesh, parent_version: Dict) -> Dict:
-        """Calculate differences from parent version."""
+    def _calculate_diff(self, metrics: Dict, parent_version: Dict) -> Dict:
+        """Subtract the parent row from the numbers just measured.
+
+        A field is None when one side has no number for it: a point cloud has no faces, and a
+        volume needs both meshes to be closed. The bare `except` this replaces returned 0 for
+        all three whatever happened, so a commit whose parent snapshot had been deleted - or
+        whose parent had been measured by a backend that could not read a Scene - reported "no
+        change", and the pane's green and red colouring showed that guess as a fact.
+
+        The counts come from the parent's row rather than from a second read of its file: the
+        row is the number the timeline prints, and a delta that disagreed with the two numbers
+        shown above it would be a third opinion, not a measurement.
+        """
+        diff = {
+            'polygons_delta': _delta(metrics.get('polygon_count'),
+                                     parent_version.get('polygon_count')),
+            'vertices_delta': _delta(metrics.get('vertex_count'),
+                                     parent_version.get('vertex_count')),
+            'volume_delta': None,
+        }
+
+        mesh = metrics.get('mesh')
+        if mesh is None or not mesh.is_volume:
+            return diff
         try:
-            parent_mesh = trimesh.load(parent_version['snapshot_path'])
-            
-            return {
-                'polygons_delta': len(mesh.faces) - len(parent_mesh.faces),
-                'vertices_delta': len(mesh.vertices) - len(parent_mesh.vertices),
-                'volume_delta': float(mesh.volume - parent_mesh.volume) if mesh.is_volume and parent_mesh.is_volume else 0
-            }
-        except:
-            return {'polygons_delta': 0, 'vertices_delta': 0, 'volume_delta': 0}
+            parent_mesh = _normalise(trimesh.load(parent_version['snapshot_path']))
+        except Exception as e:
+            logger.warning(f"Volume change against v{parent_version['version_number']} "
+                           f"not measured: its snapshot could not be read ({e})")
+            return diff
+        if parent_mesh is None or not parent_mesh.is_volume:
+            return diff
+        diff['volume_delta'] = float(mesh.volume - parent_mesh.volume)
+        return diff
     
     def _calculate_geometry_diff(self, mesh1, mesh2) -> Dict:
         """Calculate detailed geometry differences."""
@@ -715,13 +884,18 @@ class AssetVersionControl:
             kwargs['author'],
             kwargs.get('branch', 'main'),
             kwargs.get('parent_version_id'),
-            metrics.get('polygon_count', 0),
-            metrics.get('vertex_count', 0),
+            # No default for the three geometry facts. A count the file does not have is
+            # recorded as NULL, which is the row saying "this file has no faces"; the 0 and
+            # False this replaces were the row inventing a flat-shaded, open model out of a
+            # point cloud, and a first version's delta of 0 claimed equality with a parent it
+            # does not have.
+            metrics.get('polygon_count'),
+            metrics.get('vertex_count'),
             metrics.get('file_size', 0),
-            metrics.get('is_watertight', False),
-            diff_metrics.get('polygons_delta', 0),
-            diff_metrics.get('vertices_delta', 0),
-            diff_metrics.get('volume_delta', 0.0)
+            metrics.get('is_watertight'),
+            diff_metrics.get('polygons_delta'),
+            diff_metrics.get('vertices_delta'),
+            diff_metrics.get('volume_delta')
         ))
         
         version_id = cursor.lastrowid

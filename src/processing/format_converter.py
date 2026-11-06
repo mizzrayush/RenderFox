@@ -97,8 +97,10 @@ def _meaningful_options(options: Optional[Dict]) -> List[str]:
     return live
 
 
-# Helper: ensure we return a trimesh.Trimesh from a trimesh.Scene or Trimesh
-def _as_trimesh(obj):
+# Helper: ensure we return a trimesh.Trimesh from a trimesh.Scene or Trimesh. A PointCloud and
+# an empty Scene both answer None: this gives a triangle mesh or says there is not one, and
+# callers that also record points have to ask trimesh for the shape themselves.
+def as_trimesh(obj):
     if not TRIMESH_AVAILABLE:
         return None
     if isinstance(obj, trimesh.Trimesh):
@@ -114,7 +116,7 @@ def _as_trimesh(obj):
             if isinstance(dumped, trimesh.Trimesh):
                 return dumped
         except Exception as e:
-            logger.debug(f"Failed to dump scene in _as_trimesh: {e}")
+            logger.debug(f"Failed to dump scene in as_trimesh: {e}")
         try:
             geoms = list(obj.geometry.values()) if hasattr(obj, 'geometry') else []
             return trimesh.util.concatenate(geoms) if geoms else None
@@ -457,7 +459,7 @@ class FormatConverter(QObject):
             mesh_or_scene = trimesh.load(input_file)
             
             # Normalize to a single mesh
-            mesh = _as_trimesh(mesh_or_scene)
+            mesh = as_trimesh(mesh_or_scene)
             if mesh is None:
                 return {'success': False, 'message': 'Could not load as mesh'}
             
@@ -768,7 +770,7 @@ class FormatConverter(QObject):
         tried = []
 
         try:
-            mesh = _as_trimesh(trimesh.load(input_file))
+            mesh = as_trimesh(trimesh.load(input_file))
             if mesh is not None and len(mesh.faces):
                 return mesh, 'trimesh'
             tried.append('trimesh: no faces')

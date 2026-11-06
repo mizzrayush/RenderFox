@@ -21,7 +21,9 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 from .unified_viewer import UnifiedOpen3DViewer
-from ..features.version_control import AssetVersionControl
+from ..features.version_control import (AssetVersionControl, NOT_COMPARABLE, describe_metrics,
+                                        describe_polygon_count, describe_volume,
+                                        describe_watertight)
 from .icon_provider import get_icon
 
 logger = logging.getLogger(__name__)
@@ -157,9 +159,9 @@ class VersionComparisonDialog(QDialog):
         changes_table.insertRow(2)
         vol_delta = changes['volume']['delta']
         changes_table.setItem(2, 0, QTableWidgetItem("Volume"))
-        changes_table.setItem(2, 1, QTableWidgetItem(f"{changes['volume']['v1']:.4f}"))
-        changes_table.setItem(2, 2, QTableWidgetItem(f"{changes['volume']['v2']:.4f}"))
-        delta_item = QTableWidgetItem(f"{vol_delta:+.4f}")
+        changes_table.setItem(2, 1, QTableWidgetItem(describe_volume(changes['volume']['v1'])))
+        changes_table.setItem(2, 2, QTableWidgetItem(describe_volume(changes['volume']['v2'])))
+        delta_item = QTableWidgetItem(describe_volume(vol_delta, signed=True))
         delta_item.setForeground(QColor('blue'))
         changes_table.setItem(2, 3, delta_item)
         changes_table.setItem(2, 4, QTableWidgetItem("-"))
@@ -527,10 +529,17 @@ class VersionControlUI(QWidget):
             
             # Polygon count evolution
             if total_versions > 1:
-                poly_change = latest_version['polygon_count'] - first_version['polygon_count']
-                poly_percent = (poly_change / first_version['polygon_count'] * 100) if first_version['polygon_count'] > 0 else 0
-                color = 'red' if poly_change > 0 else 'green' if poly_change < 0 else 'gray'
-                stats_text += f"<b>Polygon Evolution:</b> <span style='color: {color}'>{poly_change:+,} ({poly_percent:+.1f}%)</span>"
+                first_polygons = first_version['polygon_count']
+                latest_polygons = latest_version['polygon_count']
+                if first_polygons is None or latest_polygons is None:
+                    # A point cloud has no faces, so there is no change between two of them to
+                    # report as one. Saying so is the answer; the arithmetic below is not run.
+                    stats_text += f"<b>Polygon Evolution:</b> {NOT_COMPARABLE}"
+                else:
+                    poly_change = latest_polygons - first_polygons
+                    poly_percent = (poly_change / first_polygons * 100) if first_polygons > 0 else 0
+                    color = 'red' if poly_change > 0 else 'green' if poly_change < 0 else 'gray'
+                    stats_text += f"<b>Polygon Evolution:</b> <span style='color: {color}'>{poly_change:+,} ({poly_percent:+.1f}%)</span>"
             
             self.stats_label.setText(stats_text)
         else:
@@ -554,10 +563,7 @@ class VersionControlUI(QWidget):
             item.setText(2, message)
             
             # Metrics
-            metrics = f"P: {version['polygon_count']:,}, V: {version['vertex_count']:,}"
-            if version.get('polygons_delta'):
-                delta = version['polygons_delta']
-                metrics += f" ({delta:+,})"
+            metrics = describe_metrics(version)
             item.setText(3, metrics)
             
             # Tags (would need to query tags table)
@@ -567,9 +573,10 @@ class VersionControlUI(QWidget):
             item.setData(0, Qt.ItemDataRole.UserRole, version['id'])
             
             # Color code based on changes
-            if version.get('polygons_delta', 0) < 0:
+            polygons_delta = version.get('polygons_delta')
+            if polygons_delta is not None and polygons_delta < 0:
                 item.setForeground(3, QColor('#27ae60'))  # Green for reduction
-            elif version.get('polygons_delta', 0) > 0:
+            elif polygons_delta is not None and polygons_delta > 0:
                 item.setForeground(3, QColor('#e74c3c'))  # Red for increase
             
             self.version_tree.addTopLevelItem(item)
@@ -608,13 +615,15 @@ class VersionControlUI(QWidget):
             details += f"<p>{version['commit_message']}</p>"
             details += f"<hr>"
             details += f"<p><b>Metrics:</b></p>"
-            details += f"<p>• Polygons: {version['polygon_count']:,}"
+            details += f"<p>• Polygons: {describe_polygon_count(version)}"
             if version.get('polygons_delta'):
                 details += f" ({version['polygons_delta']:+,})"
             details += "</p>"
             details += f"<p>• Vertices: {version['vertex_count']:,}</p>"
             details += f"<p>• File Size: {version['file_size'] / 1024:.1f} KB</p>"
-            details += f"<p>• Watertight: {'✓ Yes' if version['is_watertight'] else '✗ No'}</p>"
+            watertight = describe_watertight(version)
+            answer_mark = {'Yes': '✓ ', 'No': '✗ '}.get(watertight, '')
+            details += f"<p>• Watertight: {answer_mark}{watertight}</p>"
             
             self.details_text.setHtml(details)
 
@@ -679,11 +688,15 @@ class VersionControlUI(QWidget):
                     self.refresh_timeline()
                     logger.info(f"Version committed: {version_id}")
                 else:
+                    # `save_version` answers None for four different facts, and this pane used
+                    # to name one of them whatever had happened. It asks the backend which.
+                    verdict = self.version_control.explain_no_commit(self.current_model)
                     QMessageBox.warning(
                         self,
-                        "No Changes",
-                        "No changes detected. Version not saved."
+                        "Nothing Committed",
+                        verdict['reason']
                     )
+                    logger.warning(f"Commit recorded nothing for {model_name}: {verdict['kind']}")
             except ValueError as e:
                 QMessageBox.warning(self, "File Too Large", str(e))
             except IOError as e:
