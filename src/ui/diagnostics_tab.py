@@ -1,8 +1,7 @@
 """
-Diagnostics tab for enhanced logging, debugging, and system diagnostics.
+The Diagnostics pane: system checks, health indicators, and the recorded error list.
 """
 
-import os
 import datetime
 import logging
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
@@ -749,19 +748,42 @@ class DiagnosticsTab(QWidget):
             # Format results
             cpu = report['cpu']
             memory = report['memory']
-            disk = report['disk'][0] if report['disk'] else {}
-            gpu = report['gpu'][0] if report['gpu'] else {}
             health = report['health_checks']
-            
+
+            # The volume the app writes to and the verdict on it come from one check, so the
+            # word at the start of the line and the figures after it are the same reading of
+            # the same drive. A check that produced nothing prints that, rather than `[OK]`:
+            # the old line said OK to anything that was not exactly "healthy", so a drive
+            # reported as critical was shown with the same word as a warning.
+            disk = health.get('disk') or {'status': None, 'message': 'no storage check ran'}
+            words = {'healthy': '[OK]', 'warning': '[Warning]', 'critical': '[Critical]'}
+
+            def mark(name):
+                return words.get(health.get(name, {}).get('status'), '[Not checked]')
+
+            # The same five lines, counted: a check that did not answer is not a pass, and
+            # "all the checks that answered are fine" is not the sentence "all systems
+            # operational" - which is what the old line said when a check was missing.
+            checked = ('cpu', 'memory', 'disk', 'gpu', 'dependencies')
+            overall = ('All systems operational'
+                       if all(health.get(name, {}).get('status') == 'healthy'
+                              for name in checked) else 'Issues detected')
+
+            gpu_rows = report['gpu']
+            gpu_name = (gpu_rows[0]['name'] if gpu_rows
+                        else 'nothing identified one ('
+                             + (report['gpu_reasons'][0] if report['gpu_reasons']
+                                else 'no answer') + ')')
+
             results = f"""Quick System Check Results:
 
-{'[OK]' if health['memory']['status'] == 'healthy' else '[Warning]'} CPU: {cpu['physical_cores']} cores, {cpu['current_frequency']} - Usage: {cpu['usage_percent']}%
-{'[OK]' if health['memory']['status'] == 'healthy' else '[Warning]'} Memory: {memory['used']} used / {memory['total']} total ({memory['percent']}%)
-{'[OK]' if health['disk']['status'] == 'healthy' else '[Warning]'} Storage: {disk.get('used', 'N/A')} used / {disk.get('total', 'N/A')} total ({disk.get('percent', 'N/A')}%)
-{'[OK]' if health['gpu']['status'] == 'healthy' else '[Warning]'} GPU: {gpu.get('name', 'Unknown')}
-{'[OK]' if health['dependencies']['status'] == 'healthy' else '[Warning]'} Dependencies: {health['dependencies']['message']}
+{mark('cpu')} CPU: {cpu['physical_cores']} cores, {cpu['current_frequency']} - Usage: {cpu['usage_percent']}%
+{mark('memory')} Memory: {memory['used']} used / {memory['total']} total ({memory['percent']}%)
+{mark('disk')} Storage: {disk['message']}
+{mark('gpu')} GPU: {gpu_name}
+{mark('dependencies')} Dependencies: {health.get('dependencies', {}).get('message', 'no dependency check ran')}
 
-Overall Status: {'All systems operational' if all(h['status'] == 'healthy' for h in health.values()) else 'Issues detected'}"""
+Overall Status: {overall}"""
             
             self.diagnostic_results.setPlainText(results)
             self.health_status.setText("Status: Quick check completed")
@@ -774,23 +796,20 @@ Overall Status: {'All systems operational' if all(h['status'] == 'healthy' for h
             self.health_status.setText("Status: Check failed")
     
     def update_health_indicators(self, health_checks):
-        """Update health status indicators based on checks."""
-        status_map = {
-            'healthy': 'Good',
-            'warning': 'Warning',
-            'critical': 'Critical'
-        }
-        
-        # Update each health indicator
-        mem_status = health_checks.get('memory', {}).get('status', 'healthy')
-        disk_status = health_checks.get('disk', {}).get('status', 'healthy')
-        gpu_status = health_checks.get('gpu', {}).get('status', 'healthy')
-        
-        # Update health indicator frames
-        self.update_health_indicator_status(self.cpu_health, status_map.get(mem_status, 'Good'))
-        self.update_health_indicator_status(self.memory_health, status_map.get(mem_status, 'Good'))
-        self.update_health_indicator_status(self.storage_health, status_map.get(disk_status, 'Good'))
-        self.update_health_indicator_status(self.gpu_health, status_map.get(gpu_status, 'Good'))
+        """Colour the four badges from the four checks they stand for.
+
+        The CPU badge used to be painted from the memory check, so a machine short on memory
+        showed a processor problem it never had, and a check that did not run at all was
+        counted as a pass because its status defaulted to good. A badge with no reading
+        behind it now says so.
+        """
+        verdicts = {'healthy': 'Good', 'warning': 'Warning', 'critical': 'Critical'}
+        badges = ((self.cpu_health, 'cpu'), (self.memory_health, 'memory'),
+                  (self.storage_health, 'disk'), (self.gpu_health, 'gpu'))
+        for indicator, name in badges:
+            status = health_checks.get(name, {}).get('status')
+            self.update_health_indicator_status(
+                indicator, verdicts.get(status, 'Not checked'))
 
     def update_health_indicator_status(self, indicator_frame, status):
         """Update a single health indicator's status."""
@@ -800,12 +819,14 @@ Overall Status: {'All systems operational' if all(h['status'] == 'healthy' for h
             status_label = layout.itemAt(1).widget()
             if status_label:
                 status_label.setText(status)
-                
+
                 # Update color based on status
                 if status == "Good":
                     status_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
                 elif status == "Warning":
                     status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
+                elif status == "Not checked":
+                    status_label.setStyleSheet("color: #7f8c8d; font-weight: bold;")
                 else:
                     status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
         
@@ -843,19 +864,27 @@ Overall Status: {'All systems operational' if all(h['status'] == 'healthy' for h
             results += f"Available: {mem['available']}\n"
             results += f"Used: {mem['used']} ({mem['percent']}%)\n"
             results += f"Swap: {mem['swap_used']} / {mem['swap_total']}\n\n"
+
+            # Storage - each volume, and the disk behind it when Windows can say
+            results += "=== STORAGE ===\n"
+            storage = report['storage']
+            if not storage['volumes']:
+                results += "No mounted volume answered.\n"
+            for volume in storage['volumes']:
+                results += (f"{volume['mountpoint']} [{volume['filesystem']}]: "
+                            f"{volume['used_bytes'] / (1024 ** 3):.1f} GB used of "
+                            f"{volume['total_bytes'] / (1024 ** 3):.1f} GB "
+                            f"({volume['used_percent']}%) - "
+                            f"{volume['media_type'] or 'disk kind unknown'}"
+                            f"{', ' + volume['disk'] if volume['disk'] else ''}\n")
+            for reason in storage['reasons']:
+                results += f"Note: {reason}\n"
+            results += (f"\nWhere the app writes: "
+                        f"{report['health_checks']['disk']['message']}\n\n")
             
-            # GPU Information
+            # GPU Information - the same block of words the Performance pane prints
             results += "=== GPU ===\n"
-            for gpu in report['gpu']:
-                if 'error' in gpu:
-                    results += f"Error: {gpu['error']}\n"
-                else:
-                    results += f"Name: {gpu.get('name', 'Unknown')}\n"
-                    if 'driver' in gpu:
-                        results += f"Driver: {gpu['driver']}\n"
-                    if 'memory_total' in gpu:
-                        results += f"Memory: {gpu['memory_used']} / {gpu['memory_total']}\n"
-            results += "\n"
+            results += report.get('gpu_text', 'No GPU report in this file') + "\n\n"
             
             # OpenGL Information
             results += "=== OPENGL ===\n"
@@ -874,7 +903,8 @@ Overall Status: {'All systems operational' if all(h['status'] == 'healthy' for h
             self.update_health_indicators(report['health_checks'])
             
             # Get recommendations and show as issues
-            recommendations = self.diagnostic_engine.get_recommendations()
+            recommendations = self.diagnostic_engine.get_recommendations(
+                report['health_checks'])
             self.populate_issues_table(recommendations)
             
         except Exception as e:

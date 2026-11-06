@@ -160,6 +160,13 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "hardware_report_contract",
+        "name": "Hardware Report Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_hardware_report.py")],
+        "description": "Asks this machine what it is and requires the answer to be the machine's own: the volume every storage figure and storage verdict describes is the one the app writes into (here C: at 90.8%, not the start-up drive's 25.8%) picked by one shared helper, the drive letter to disk number to disk record join says which of its three failures happened, an adapter is named with the check that named it and its current figures arrive together or as the reason they did not, the CPU figure is taken over a real window, one measurement per report so a row and its verdict cannot be two looks, a library is looked up in the package records instead of imported (7.6s to 0.06s, and pillow and scikit-learn stop being called missing), and the two panes paint what they are handed - no seeded telemetry, no zero for an unread adapter, one badge per check, and the start-up drive never asked",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QSpinBox, QDoubleSpinBox, QSlider, QTabWidget, QCheckBox,
                              QFrame, QGridLayout, QScrollArea, QTextEdit, QLineEdit,
                              QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
-                             QListWidget, QTreeWidget, QTreeWidgetItem)
+                             QListWidget, QTreeWidget, QTreeWidgetItem, QApplication)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, pyqtSlot, QThreadPool
 from PyQt6.QtGui import QFont, QColor, QPainter
 import psutil
@@ -31,6 +31,11 @@ from ..features.performance_analyzer import (
     PerformanceAnalyzer, PerformanceMetrics, ProfileResult
 )
 from ..utils.worker import Worker
+
+GPU_POWER_NOTE = ("Nothing here measures what power the graphics chip draws - the tool that "
+                  "reports how busy it is, its memory and its temperature does not report "
+                  "power")
+GPU_NOT_READ_NOTE = "not measured yet - press Detect GPU Hardware"
 
 class SystemMonitorWidget(QWidget):
     """Real-time system monitoring widget."""
@@ -144,6 +149,8 @@ class PerformanceTab(QWidget):
         super().__init__(parent)
         self.current_settings = {}
         self.benchmark_results = []
+        self.gpu_report = None
+        self.storage_info = None
         
         # Initialize performance analyzer backend
         self.performance_analyzer = PerformanceAnalyzer()
@@ -275,11 +282,14 @@ class PerformanceTab(QWidget):
         # GPU Status
         status_group = QGroupBox("GPU Status")
         status_layout = QFormLayout()
-        
-        self.gpu_utilization_label = QLabel("0%")
-        self.gpu_memory_used_label = QLabel("0 MB")
-        self.gpu_temperature_label = QLabel("0°C")
-        self.gpu_power_label = QLabel("0W")
+
+        # Nothing has been read for these four rows at pane start. They used to be filled
+        # with "45%", "6,847 MB", "72 degC", "285W" every two seconds, on a machine whose
+        # utilisation no installed reader can answer for.
+        self.gpu_utilization_label = QLabel(GPU_NOT_READ_NOTE)
+        self.gpu_memory_used_label = QLabel(GPU_NOT_READ_NOTE)
+        self.gpu_temperature_label = QLabel(GPU_NOT_READ_NOTE)
+        self.gpu_power_label = QLabel(GPU_POWER_NOTE)
         
         status_layout.addRow("GPU Utilization:", self.gpu_utilization_label)
         status_layout.addRow("Memory Used:", self.gpu_memory_used_label)
@@ -760,6 +770,7 @@ class PerformanceTab(QWidget):
         self.performance_analyzer.start_monitoring(interval_ms=1000)
         
         self.update_system_info()
+        self.refresh_storage_info()
         
         # Update timer
         self.update_timer = QTimer()
@@ -768,45 +779,118 @@ class PerformanceTab(QWidget):
     
     @pyqtSlot(dict)
     def on_metrics_updated(self, metrics):
-        """Handle real-time metrics updates from performance analyzer."""
-        # Update GPU status labels with real data
-        self.gpu_utilization_label.setText(f"{metrics['gpu_percent']:.1f}%")
-        self.gpu_memory_used_label.setText(f"{metrics.get('gpu_memory_percent', 0):.1f}%")
-        
-        # Update memory cards
+        """Paint what the monitor actually measured.
+
+        This used to write `metrics['gpu_percent']` - a 0.0 the backend defaults when no
+        reader answered - into the GPU rows, and the 2-second timer overwrote it with
+        invented figures. GPU rows come from the adapter report now, because that is the
+        only place that knows whether a reader said anything.
+        """
         memory_used_gb = metrics['memory_used_mb'] / 1024
         self.used_memory_card.findChild(QLabel).setText(f"{memory_used_gb:.1f} GB")
-        
+
         # Emit signal for other components
         self.performance_updated.emit(metrics)
         
     def detect_gpu_hardware(self):
-        """Detect REAL GPU hardware using performance analyzer."""
-        self.gpu_info_display.setPlainText("Detecting GPU hardware...\n")
-        
-        # Get REAL GPU info from diagnostic engine
+        """Ask the machine which display adapters it has, and what can be read off them now.
+
+        Each question to Windows costs about a second, so they run on a background thread
+        and only when this button is pressed; the answer is kept for the status rows until
+        the next press.
+        """
+        self.detect_gpu_btn.setEnabled(False)
+        self.gpu_info_display.setPlainText("Asking Windows which adapters are present...")
+
+        def worker_func(progress_callback=None):
+            from ..features.diagnostic_engine import SystemInfo
+            return SystemInfo.get_gpu_report()
+
+        worker = Worker(worker_func)
+        worker.signals.result.connect(self.show_gpu_report)
+        worker.signals.error.connect(self.on_machine_reader_failed)
+        worker.signals.finished.connect(lambda: self.detect_gpu_btn.setEnabled(True))
+        QThreadPool.globalInstance().start(worker)
+
+    def show_gpu_report(self, report: dict) -> None:
+        """Paint the adapter answer, and name what could not be read instead of showing zero."""
+        self.gpu_report = report
+        self.gpu_info_display.setPlainText(report['text'])
+
+        adapters = report['adapters']
+        live = adapters[0]['live'] if adapters else None
+        if live:
+            self.gpu_utilization_label.setText(f"{live['load_percent']}% busy")
+            self.gpu_memory_used_label.setText(
+                f"{live['memory_used_mb']} MB "
+                f"({live['memory_percent']}% of the memory Windows records here)")
+            self.gpu_temperature_label.setText(f"{live['temperature_c']} degC")
+        else:
+            reason = report.get('load_reason') or (
+                'no adapter was identified, so there is nothing to measure'
+                if not adapters else
+                'nothing on this machine reports what this adapter is doing')
+            for label in (self.gpu_utilization_label, self.gpu_memory_used_label,
+                          self.gpu_temperature_label):
+                label.setText(reason)
+        self.gpu_power_label.setText(GPU_POWER_NOTE)
+
+    def refresh_storage_info(self) -> None:
+        """Read the volumes and the disk behind them once, on a background thread."""
+        def worker_func(progress_callback=None):
+            from ..features.diagnostic_engine import SystemInfo
+            return SystemInfo.get_storage_info()
+
+        worker = Worker(worker_func)
+        worker.signals.result.connect(self.show_storage_info)
+        worker.signals.error.connect(self.on_machine_reader_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def show_storage_info(self, storage: dict) -> None:
+        """Keep the answer; the monitor timer paints it, so nothing blocks on Windows again."""
+        self.storage_info = storage
+        self.paint_storage_info()
+
+    def paint_storage_info(self) -> None:
+        """Fill the Storage rows from the last volume reading.
+
+        This measured the drive the process happened to start on and never said which drive
+        that was. It now shows the volume the app's own output directory sits on - the one a
+        render can run out of room on - picked by the same helper the storage health check
+        uses, with its letter printed beside every figure.
+        """
+        if self.storage_info is None:
+            return
         from ..features.diagnostic_engine import SystemInfo
-        
-        gpus = SystemInfo.get_gpu_info()
-        
-        gpu_text = "GPU Detection Results:\n\n"
-        
-        for i, gpu in enumerate(gpus):
-            if 'error' in gpu:
-                gpu_text += f"[Error] {gpu['error']}\n"
-            else:
-                gpu_text += f"GPU {i+1}: {gpu.get('name', 'Unknown')}\n"
-                if 'driver' in gpu:
-                    gpu_text += f"   - Driver: {gpu['driver']}\n"
-                if 'memory_total' in gpu:
-                    gpu_text += f"   - Memory: {gpu['memory_total']}\n"
-                if 'load' in gpu:
-                    gpu_text += f"   - Current Load: {gpu['load']}\n"
-                if 'temperature' in gpu:
-                    gpu_text += f"   - Temperature: {gpu['temperature']}\n"
-                gpu_text += "\n"
-        
-        self.gpu_info_display.setPlainText(gpu_text)
+        volume = SystemInfo.working_volume(self.storage_info)
+        if volume is None:
+            for label in (self.storage_total_label, self.storage_used_label,
+                          self.storage_free_label):
+                label.setText('no mounted volume carries the app output directory')
+            self.storage_type_label.setText('unknown - no volume was listed')
+            return
+        self.storage_total_label.setText(
+            f"{volume['total_bytes'] / (1024 ** 3):.1f} GB ({volume['mountpoint']})")
+        self.storage_used_label.setText(
+            f"{volume['used_bytes'] / (1024 ** 3):.1f} GB ({volume['used_percent']}% full)")
+        self.storage_free_label.setText(f"{volume['free_bytes'] / (1024 ** 3):.1f} GB")
+        kind = volume['media_type']
+        if kind:
+            self.storage_type_label.setText(
+                kind + (f" - {volume['disk']}" if volume['disk'] else ''))
+        else:
+            self.storage_type_label.setText(
+                self.storage_info['reasons'][0] if self.storage_info['reasons']
+                else 'nothing reports what kind of disk this is')
+
+    def on_machine_reader_failed(self, error) -> None:
+        """A reader that raised is reported as failed, not as a zero."""
+        kind, value, _traceback = error
+        self.gpu_info_display.setPlainText(
+            f"Machine reader failed: {kind.__name__}: {value}")
+        for label in (self.storage_total_label, self.storage_used_label,
+                      self.storage_free_label, self.storage_type_label):
+            label.setText(f'reader failed: {kind.__name__}: {value}')
         
     def toggle_gpu_acceleration(self, enabled):
         """Toggle GPU acceleration controls."""
@@ -936,18 +1020,12 @@ class PerformanceTab(QWidget):
             self.memory_available_label.setText(f"{memory.available / (1024**3):.1f} GB")
             self.memory_used_label.setText(f"{memory.used / (1024**3):.1f} GB")
             
-            # Storage info
-            disk = psutil.disk_usage('/')
-            self.storage_total_label.setText(f"{disk.total / (1024**3):.1f} GB")
-            self.storage_used_label.setText(f"{disk.used / (1024**3):.1f} GB")
-            self.storage_free_label.setText(f"{disk.free / (1024**3):.1f} GB")
-            
-            # GPU status (placeholder)
-            self.gpu_utilization_label.setText("45%")
-            self.gpu_memory_used_label.setText("6,847 MB")
-            self.gpu_temperature_label.setText("72°C")
-            self.gpu_power_label.setText("285W")
-            
+            # Storage info - the volume the app writes to, with the media type the device
+            # store reported for the disk behind it. The device store costs about two
+            # seconds, so it is read once in a worker (refresh_storage_info) and this
+            # timer only paints what came back.
+            self.paint_storage_info()
+
         except Exception as e:
             print(f"Error updating system info: {e}")
             
