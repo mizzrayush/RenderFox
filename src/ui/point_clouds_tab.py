@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QDi
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 
 from ..processing.point_cloud_processor import PointCloudProcessor
+from ..utils.run_teardown import drain
 from .unified_viewer import UnifiedOpen3DViewer
 from .icon_provider import get_icon
 
@@ -223,27 +224,16 @@ class PointCloudsTab(QWidget):
 
         A verdict that is already in the queue when the window goes is delivered into widgets
         Qt has torn down, and Qt answers that with a heap fault instead of a traceback, so the
-        handlers come off before anything waits. Returns the threads the wait gave up on; those
-        stay held by the pane, because dropping a running QThread is the other way this
-        process ends.
+        handlers come off before anything waits. Returns the threads this pane still holds
+        because they outlasted the wait; releasing one of those is the other way this process
+        ends. The progress dialog goes with the run it was counting, so a close does not leave
+        a Cancel button waiting on an answer that will never come.
         """
-        still_running = 0
-        for thread in list(self._workers):
-            for signal in (thread.verdict_ready, thread.finished):
-                try:
-                    signal.disconnect()
-                except TypeError:
-                    pass  # already reported and let go; nothing left to take off
-            thread.request_stop()
-            if thread.wait(timeout_ms):
-                if thread in self._workers:
-                    self._workers.remove(thread)
-            else:
-                still_running += 1
+        running = drain(self._workers, timeout_ms)
         self._active_thread = None
         self._dismiss(self._run_progress)
         self._run_progress = None
-        return still_running
+        return len(running)
 
     def _no_file_message(self):
         QMessageBox.warning(self, "No point cloud loaded",

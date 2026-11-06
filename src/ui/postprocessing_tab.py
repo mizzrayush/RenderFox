@@ -18,6 +18,7 @@ from typing import List, Dict, Optional, Tuple
 import threading
 
 from ..core.models import PostProcessingSettings, RenderJob
+from ..utils.run_teardown import drain_attributes
 from ..processing.postprocessor import (PostProcessor, get_post_processing_presets, 
                                       estimate_processing_time, PostProcessingResult)
 from .icon_provider import get_icon
@@ -1140,6 +1141,19 @@ class PostProcessingTab(QWidget):
         self.worker.start()
         self.update_button_states()
     
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Ask the organise/archive/cleanup run to stop, silence it, and wait.
+
+        `progress_updated` drives the bar and the status line, `processing_completed`
+        writes the results box and reloads the file list, and `error_occurred` reports
+        into the same box - so a run that answers after the tab is destroyed writes three
+        widgets that no longer exist. This worker does have a cancellation, but spelled
+        `request_cancel`, which is why the helper knows the app's four spellings instead
+        of one; the close uses the same verb as the Stop button rather than inventing a
+        second way out. Returns the runs still owed when the wait gave up.
+        """
+        return len(drain_attributes(self, ('worker',), timeout_ms))
+
     def cancel_processing(self):
         """Request cancellation of current processing."""
         if self.worker is not None:

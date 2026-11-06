@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QIcon, QPixmap
 from ..features.texture_engine import TextureGenerationThread
+from ..utils.run_teardown import drain_attributes
 
 class TextureGeneratorDialog(QDialog):
     """
@@ -25,7 +26,22 @@ class TextureGeneratorDialog(QDialog):
         self.setWindowTitle("Texture Generator")
         self.setMinimumWidth(500)
         self.generated_image_path = None
+        self.thread = None
         self.init_ui()
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence a generation in flight and wait for the request to come back.
+
+        The dialog is modal, so the main window cannot be closed under it - but it
+        outlives its own `exec()`, because the Rendering tab is its parent, and
+        `progress_update` writes the bar and the button's caption while
+        `generation_finished` writes the preview. A generation asked for and then
+        dismissed is therefore still connected to widgets the close destroys. The engine
+        takes its cancellation through `cancel`, which is one of the four spellings the
+        helper knows, so the request is made before the wait rather than the wait standing
+        in for it. Returns the generations still owed.
+        """
+        return len(drain_attributes(self, ('thread',), timeout_ms))
         
     def init_ui(self):
         layout = QVBoxLayout(self)

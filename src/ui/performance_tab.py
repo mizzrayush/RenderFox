@@ -31,6 +31,7 @@ from ..features.performance_analyzer import (
     PerformanceAnalyzer, BenchmarkRunner
 )
 from ..utils.worker import Worker
+from ..utils.run_teardown import drain
 
 GPU_POWER_NOTE = ("Nothing here measures what power the graphics chip draws - the tool that "
                   "reports how busy it is, its memory and its temperature does not report "
@@ -159,6 +160,42 @@ class PerformanceTab(QWidget):
         self.init_ui()
         self.setup_connections()
         self.start_monitoring()
+
+    # ---- the one way a started run is held and released -------------------------
+
+    def _keep_worker(self, worker):
+        """Hold a started run until it says it is done.
+
+        Without the reference this pane has nothing to take the handlers off of when the
+        window closes, and a run still queued at that moment writes its measurement into
+        labels Qt has already destroyed. The run releases itself through its own
+        `finished`, so a long session does not accumulate every measurement it made.
+        """
+        self._workers.append(worker)
+        worker.signals.finished.connect(lambda: self._release_worker(worker))
+        return worker
+
+    def _release_worker(self, worker):
+        """Let a run go when it says it is done - once, whoever else let go first.
+
+        The removal is guarded because `shutdown_runs` releases the same worker on its way
+        out; a second `list.remove` of it raises inside a slot, and PyQt answers an
+        exception that escapes a slot by ending the process.
+        """
+        if worker in self._workers:
+            self._workers.remove(worker)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence every run this pane started and wait for the pool that runs them.
+
+        The measurements arrive through `result`, fail through `error`, and drive the bar
+        through `progress` - three channels into widgets that are on their way out. These
+        runs are `QRunnable`s on the shared pool rather than threads, so there is no stop
+        to ask of one and the wait is the only question a pool answers: did its queue
+        drain. What has not drained stays held here.
+        Returns the runs still owed to the pool when the wait gave up.
+        """
+        return len(drain(self._workers, timeout_ms, QThreadPool.globalInstance()))
         
     def init_ui(self):
         """Initialize the performance interface."""
@@ -817,6 +854,7 @@ class PerformanceTab(QWidget):
         worker.signals.result.connect(self.show_gpu_report)
         worker.signals.error.connect(self.on_machine_reader_failed)
         worker.signals.finished.connect(lambda: self.detect_gpu_btn.setEnabled(True))
+        self._keep_worker(worker)
         QThreadPool.globalInstance().start(worker)
 
     def show_gpu_report(self, report: dict) -> None:
@@ -851,6 +889,7 @@ class PerformanceTab(QWidget):
         worker = Worker(worker_func)
         worker.signals.result.connect(self.show_storage_info)
         worker.signals.error.connect(self.on_machine_reader_failed)
+        self._keep_worker(worker)
         QThreadPool.globalInstance().start(worker)
 
     def show_storage_info(self, storage: dict) -> None:
@@ -945,7 +984,7 @@ class PerformanceTab(QWidget):
         worker.signals.error.connect(self.on_benchmark_failed)
         worker.signals.progress.connect(self.benchmark_progress.setValue)
         worker.signals.finished.connect(self.finish_benchmark)
-        self._workers.append(worker)
+        self._keep_worker(worker)
         QThreadPool.globalInstance().start(worker)
 
     def set_benchmark_buttons_enabled(self, enabled):
@@ -1018,7 +1057,7 @@ class PerformanceTab(QWidget):
         worker.signals.error.connect(self.on_benchmark_failed)
         worker.signals.progress.connect(self.benchmark_progress.setValue)
         worker.signals.finished.connect(self.finish_benchmark)
-        self._workers.append(worker)
+        self._keep_worker(worker)
         QThreadPool.globalInstance().start(worker)
 
     def show_full_benchmark(self, summary):

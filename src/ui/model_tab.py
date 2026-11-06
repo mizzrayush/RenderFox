@@ -25,6 +25,7 @@ from .quality_analyzer_ui import QualityAnalyzerUI
 from .version_control_ui import VersionControlUI
 from ..features.quality_analyzer import QualityAnalyzer
 from ..features.version_control import AssetVersionControl
+from ..utils.run_teardown import drain, drain_attributes
 from .icon_provider import get_icon
 
 # New imports for conversion wiring
@@ -149,6 +150,18 @@ class ModelFormatConverter(QDialog):
         self.resize(520, 440)
         self._thread = None
         self.init_ui()
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence a conversion this dialog started and wait for it to end.
+
+        The dialog is modal, so the main window cannot close underneath it - but it
+        outlives its own `exec()`, because the Models tab is its parent, and the tree the
+        close walks contains it. A dialog dismissed while its conversion runs is left in
+        that tree with a thread writing into its progress bar, its results box and its
+        re-enable lambda. The walk reaches it, and this is the verb it answers. Returns the
+        conversions still owed when the wait gave up.
+        """
+        return len(drain_attributes(self, ('_thread',), timeout_ms))
     
     def init_ui(self):
         """Initialize the converter dialog UI."""
@@ -292,8 +305,52 @@ class ModelTab(QWidget):
         self.library_path = library_path
         self.quality_analyzer_engine = QualityAnalyzer()
         self.version_control_engine = AssetVersionControl(self.library_path)  # Use your library path
+        self.analysis_worker = None
+        self._runs = []
         self.init_ui()
         self.setup_connections()
+
+    # ---- the one way a started run is held and released -------------------------
+
+    def _keep_worker(self, worker):
+        """Hold a started analysis until it says it is done.
+
+        `analyze_selected_model` and `batch_analyze_models` both wrote a fresh worker into
+        `self.analysis_worker` without asking the previous one anything, so starting a
+        second analysis while the first was still reading files dropped the last Python
+        reference of a running QThread - and Qt answers that by ending the process, with
+        no traceback to read. The list keeps each one alive, and its own `finished`
+        releases it.
+        """
+        self._runs.append(worker)
+        worker.finished.connect(lambda: self._release_worker(worker))
+        return worker
+
+    def _release_worker(self, worker):
+        """Let a run go when it says it is done - once, whoever else let go first.
+
+        The removal is guarded because `shutdown_runs` releases the same worker on its way
+        out; a second `list.remove` of it raises inside a slot, and PyQt answers an
+        exception that escapes a slot by ending the process.
+        """
+        if worker in self._runs:
+            self._runs.remove(worker)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence every analysis this tab started and wait for the ones still running.
+
+        `analysis_complete` paints the results table, `progress_updated` drives the bar
+        and `error_occurred` writes the status line, so a run that answers after the tab
+        is gone writes into three widgets Qt has destroyed. These workers declare no
+        cancellation and this pane has no Stop control for one, so the close can only
+        wait - a batch analysis costs up to the timeout - and a
+        run that outlasts it stays in `_runs`: its reference is what keeps Qt from
+        aborting on a live thread. Returns the analyses still owed.
+        """
+        running = drain(self._runs, timeout_ms)
+        if self.analysis_worker not in running:
+            self.analysis_worker = None
+        return len(running)
     
     def init_ui(self):
         """Initialize the model tab UI."""
@@ -2467,7 +2524,7 @@ Is Watertight: {mesh.is_watertight}
         self.progress_bar.setRange(0, 0)  # Indeterminate progress
         
         # Start analysis in thread
-        self.analysis_worker = ModelAnalysisWorker([self.current_model_path])
+        self.analysis_worker = self._keep_worker(ModelAnalysisWorker([self.current_model_path]))
         self.analysis_worker.analysis_complete.connect(self.on_analysis_complete)
         self.analysis_worker.error_occurred.connect(self.on_analysis_error)
         self.analysis_worker.start()
@@ -2485,7 +2542,7 @@ Is Watertight: {mesh.is_watertight}
         self.progress_bar.setRange(0, 100)
         
         # Start batch analysis
-        self.analysis_worker = ModelAnalysisWorker(file_paths)
+        self.analysis_worker = self._keep_worker(ModelAnalysisWorker(file_paths))
         self.analysis_worker.analysis_complete.connect(self.on_batch_analysis_complete)
         self.analysis_worker.progress_updated.connect(self.progress_bar.setValue)
         self.analysis_worker.error_occurred.connect(self.on_analysis_error)

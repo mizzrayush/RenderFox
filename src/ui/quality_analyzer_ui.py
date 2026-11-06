@@ -21,6 +21,7 @@ from ..features.quality_analyzer import QualityAnalyzer
 from .unified_viewer import UnifiedOpen3DViewer
 from ..processing.mesh_processor import MeshProcessor, MeshUV
 from ..utils.worker import Worker
+from ..utils.run_teardown import drain, drain_attributes
 from PyQt6.QtCore import QThreadPool
 from PyQt6.QtWidgets import QMessageBox
 
@@ -181,7 +182,47 @@ class QualityAnalyzerUI(QWidget):
         self.current_model_path = None
         self.original_model_path = None
         self.analysis_result = None
+        self.worker = None
+        self._fix_runs = []
         self.init_ui()
+
+    # ---- the one way a started run is held and released -------------------------
+
+    def _keep_worker(self, worker):
+        """Hold a started fix until the pool says it is done.
+
+        Both fix buttons handed their `Worker` to the pool as a local and forgot it, so
+        the pane had nothing to take the handlers off when it was closed - and those
+        handlers pop a message box, rewrite the suggestion row and reload the model into
+        the viewer. The run releases itself through its own `finished`, so the list does
+        not grow with every fix applied.
+        """
+        self._fix_runs.append(worker)
+        worker.signals.finished.connect(lambda: self._release_worker(worker))
+        return worker
+
+    def _release_worker(self, worker):
+        """Let a run go when it says it is done - once, whoever else let go first.
+
+        The removal is guarded because `shutdown_runs` releases the same worker on its way
+        out; a second `list.remove` of it raises inside a slot, and PyQt answers an
+        exception that escapes a slot by ending the process.
+        """
+        if worker in self._fix_runs:
+            self._fix_runs.remove(worker)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence the analysis thread and every fix run, then wait for both shapes.
+
+        The analysis writes the score, the table and the suggestions through
+        `analysis_done` and `error_occurred`; a fix writes through `result` and `error`
+        into a message box and the model path the viewer is showing. The analysis is a
+        thread and the fixes are pool work on this pane's own pool, so each is waited on
+        the way its kind answers. Returns the runs still owed when the wait gave up.
+        """
+        running = drain(self._fix_runs, timeout_ms, self.threadpool)
+        running.extend(drain_attributes(self, ('worker',), timeout_ms))
+        return len(running)
     
     def init_ui(self):
         """Initialize the user interface."""
@@ -626,6 +667,7 @@ class QualityAnalyzerUI(QWidget):
                 
         worker.signals.result.connect(on_result)
         worker.signals.error.connect(self.on_fix_failed)
+        self._keep_worker(worker)
         self.threadpool.start(worker)
 
     def on_fix_failed(self, error):
@@ -694,6 +736,7 @@ class QualityAnalyzerUI(QWidget):
                 
         worker.signals.result.connect(on_result)
         worker.signals.error.connect(self.on_fix_failed)
+        self._keep_worker(worker)
         self.threadpool.start(worker)
 
     def show_comparison(self):

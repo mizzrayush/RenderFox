@@ -29,6 +29,7 @@ from ..processing.pipeline_engine import (
     get_nodes_by_category
 )
 from ..utils.file_utils import get_temp_directory
+from ..utils.run_teardown import drain
 from .icon_provider import get_icon
 
 
@@ -1185,6 +1186,21 @@ class PipelineEditorTab(QWidget):
         """
         if thread in self._workers:
             self._workers.remove(thread)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Stop the run this pane started, and make sure it reports no more.
+
+        A node's row, its log line and the run's summary are three separate channels into
+        three separate widgets, and a run that answers after the window is gone writes
+        into memory Qt has freed - which ends the process with a heap fault instead of a
+        traceback. So all of them come off before anything waits, and the buttons are not
+        reopened here: `_reopen_pane` is a receiver like the rest, and the pane is going
+        away. Returns the workers this pane still cannot let go of, because the reference
+        of a running thread is what keeps Qt from aborting.
+        """
+        running = drain(self._workers, timeout_ms)
+        self._active_thread = None
+        return len(running)
 
     def _reopen_pane(self) -> None:
         self._active_thread = None

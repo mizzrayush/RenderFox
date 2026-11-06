@@ -603,6 +603,342 @@ class TestAllTabsHeadless(unittest.TestCase):
                 thread.wait(20000)
         print("✓ A run that refused the stop was counted and kept alive.")
 
+    # ---- #42: the close-over-a-live-run verb ------------------------------------------
+
+    def slow_seam(self, owner, name, seconds=2.0):
+        """Replace one backend verb with that same verb after a delay, and say how to undo it.
+
+        The answer stays the backend's. A stub verdict of a shape this test invented is the
+        only thing a handler that should have been disconnected could trip over, and then
+        the suite would be measuring its own invention - so the delay goes around the real
+        call, exactly as in test_20.
+        """
+        real = getattr(owner, name)
+        owned = name in vars(owner)
+
+        def delayed(*args, **kwargs):
+            time.sleep(seconds)
+            return real(*args, **kwargs)
+
+        setattr(owner, name, delayed)
+
+        def restore():
+            if owned:
+                setattr(owner, name, real)
+            else:
+                delattr(owner, name)
+        return restore
+
+    def test_22_every_holder_silences_counts_and_holds_what_it_cannot_finish(self):
+        """One table over the shapes of run: a real run in flight, the verb, three answers.
+
+        Each row drives a pane's own entry point with its own backend delayed, because the
+        five panes reached by the old tab loop and the ones embedded inside others are
+        different shapes - `QThread`s held in a list, `QThread`s held in one attribute, and
+        `QRunnable`s on a pool that answers only whether its queue drained. Three facts have
+        to come back the same way for all of them: the run that was still working is counted
+        as owed rather than reported as stopped, it is still referenced afterwards, and
+        nothing is left connected that could write into a widget the close destroys. Then the
+        poll down to zero shows the release path, not just the hold path, and prints how long
+        each real backend actually took.
+        """
+        from src.features.diagnostic_engine import SystemInfo
+        from src.utils.run_teardown import silence
+
+        perf = self.window.performance_tab
+        diag = self.window.diagnostics_tab
+        mesh = self.window.mesh_tools_tab
+        library = self.window.library_tab
+        tagger = self.window.library_tab.ai_tagger_tab
+
+        rows = [
+            ('Performance storage read', perf, lambda: perf.refresh_storage_info(),
+             lambda: perf._workers, SystemInfo, 'get_storage_info'),
+            ('Diagnostics object walk', diag, lambda: diag.take_memory_snapshot(),
+             lambda: diag._measure_workers, SystemInfo, 'live_object_counts'),
+            ('Mesh Tools clustering simplify', mesh, lambda: mesh.simplify_cluster(),
+             lambda: mesh._runs, mesh.mesh_processor, 'simplify'),
+            ('Library scan', library, lambda: library.start_scan_worker(),
+             lambda: [held for held in (library.scanner_worker,) if held is not None],
+             library.library, 'scan'),
+            ('AI tagger auto-tag', tagger, lambda: tagger.auto_generate_tags(),
+             lambda: [held for held in (getattr(tagger, 'tag_worker', None),)
+                      if held is not None],
+             tagger.tagger, 'analyze_model'),
+        ]
+
+        mesh.current_model_path = self.assets['clean_manifold']
+        tagger.current_model_path = self.assets['clean_manifold']
+        timings = {}
+
+        for label, pane, start, holders, owner, verb in rows:
+            restore = self.slow_seam(owner, verb)
+            try:
+                before = list(holders())
+                start()
+                new = [worker for worker in holders() if worker not in before]
+                self.assertEqual(1, len(new),
+                                 f'{label}: the pane did not keep the run it just started')
+
+                owed = pane.shutdown_runs(timeout_ms=100)
+                self.assertGreaterEqual(owed, 1,
+                                        f'{label}: a run still working was reported as stopped')
+                self.assertIn(new[0], holders(),
+                              f'{label}: the reference of a running worker was dropped')
+                self.assertEqual([], silence(new[0]),
+                                 f'{label}: a channel survived the close verb')
+
+                # Poll to zero instead of naming a wait: the run has to finish on its own
+                # before the release path can be seen, and how long that takes here is a
+                # property of this machine at this moment, not of the pane. A verb that
+                # never settles fails below with the seconds it took.
+                spent = 0.0
+                while True:
+                    began = time.time()
+                    settled = pane.shutdown_runs(timeout_ms=1000)
+                    spent += time.time() - began
+                    if settled == 0:
+                        break
+                    self.assertLess(spent, 180.0,
+                                    f'{label}: the run was still owed after {spent:.0f}s; '
+                                    f'the rows before it took {timings}')
+                    self.app.processEvents()
+                timings[label] = spent
+                self.assertNotIn(new[0], holders(),
+                                 f'{label}: a finished run was never released')
+            finally:
+                restore()
+        print('✓ Every holder silenced, counted and released its run: '
+              f'{len(rows)} shapes across the tabs and the embedded panes; '
+              + ', '.join(f'{label} {spent:.1f}s' for label, spent in sorted(timings.items())))
+
+    def test_23_the_channels_come_from_qt_rather_than_from_this_files_memory(self):
+        """`channels()` names what an object can emit - including the two awkward shapes.
+
+        A `QThread` subclass that declares its own `finished` carrying a payload shadows Qt's
+        signal of the same name, and the tagger does exactly that; the house `Worker` is a
+        `QRunnable`, so it has no meta-object at all and its channels live on `worker.signals`.
+        A hand-written list beside each pane gets both wrong in silence, which is why the
+        Pipeline pane's two-signal tuple is what this replaced.
+        """
+        from PyQt6.QtCore import QObject
+        from src.ui.ai_asset_tagger_ui import BulkTaggingWorker, TaggingWorker
+        from src.ui.model_tab import ModelAnalysisWorker
+        from src.ui.pipeline_editor_tab import PipelineRunThread
+        from src.ui.point_clouds_tab import CloudRunThread
+        from src.utils.run_teardown import _PRIVATE, _signal_names, channels, silence
+        from src.utils.worker import Worker
+
+        names_by_class = {}
+        for cls, kwargs in ((TaggingWorker, {'model_path': 'x.obj', 'tagger': None}),
+                            (BulkTaggingWorker, {'model_paths': ['x.obj'], 'tagger': None}),
+                            (ModelAnalysisWorker, {'file_paths': []})):
+            runner = cls(**kwargs)
+            names = [name for name, _ in channels(runner)]
+            names_by_class[cls.__name__] = names
+            expected = [name for name in _signal_names(runner) if name not in _PRIVATE]
+            self.assertEqual(expected, names,
+                             f'{cls.__name__}: the channels are not the ones Qt declares')
+            self.assertIn('finished', names,
+                          f'{cls.__name__} shadows QThread.finished and must still lose it')
+
+        pipeline = PipelineRunThread(None)
+        for name in ('log_line', 'node_state', 'run_finished'):
+            self.assertIn(name, _signal_names(pipeline),
+                          f'the Pipeline run declares {name}; a list beside the pane forgets it')
+
+        runner = Worker(lambda progress_callback=None: 1)
+        self.assertFalse(isinstance(runner, QObject),
+                         'the house Worker is a QRunnable; its signals are on .signals')
+        self.assertEqual({'finished', 'error', 'result', 'progress'},
+                         {name for name, _ in channels(runner)})
+
+        threaded = CloudRunThread(None, 'analyze', {})
+        threaded.verdict_ready.connect(lambda verdict: None)
+        self.assertIn('verdict_ready', silence(threaded),
+                      'the verb that carries the verdict is the one that must come off')
+
+    def test_24_a_cancellation_verb_the_helper_does_not_know_fails_here(self):
+        """`_STOP_VERBS` is a list of the app's own spellings, so a fifth one is a defect.
+
+        A run whose verb this list misses is not stopped by the close - it is only waited on,
+        quietly, and the pane reports a number that looks like an answer. Reading the source
+        is the only way to keep that list from drifting behind the code.
+        """
+        import ast
+        import pathlib
+
+        from src.utils.run_teardown import _STOP_VERBS
+
+        candidates = {'stop', 'cancel', 'abort', 'halt', 'stop_work', 'stop_run',
+                      'request_stop', 'request_cancel', 'cancel_run', 'cancel_processing'}
+        run_bases = ('QThread', 'SafeWorker', 'Worker', 'Thread')
+        offenders = []
+        for path in sorted(pathlib.Path('src').rglob('*.py')):
+            tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = [ast.unparse(base) for base in node.bases]
+                if not any(base.split('.')[-1] in run_bases for base in bases):
+                    continue
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name in candidates:
+                        if item.name not in _STOP_VERBS:
+                            offenders.append(f'{path}:{item.lineno} {node.name}.{item.name}')
+        self.assertEqual([], offenders,
+                         'a run class asks to be stopped by a verb the helper never calls: '
+                         + '; '.join(offenders))
+
+    def test_25_the_close_asks_every_holder_in_the_tree_not_only_the_fifteen_tabs(self):
+        """A flat tab loop is what left the embedded panes answering to nobody.
+
+        The Quality pane lives inside Models, the Open3D preview inside Mesh Tools and Point
+        Clouds, the tagger inside Library, and a dialog outlives its own `exec()` as a child
+        of the pane that opened it. The walk is replaced here by a spy on every holder that
+        answers, and the assertion is that the set asked equals the set that exists - so a
+        regression back to the loop fails on a name rather than on a crash. It is the set of
+        *instances*, because a walk scoped to the tab pages still asks one
+        `TextureGeneratorDialog` and misses the one parented to the window itself, and a
+        comparison of class names cannot see the difference. The window is shown first
+        because an earlier test closed it, and Qt answers a close of a window that is already
+        hidden by doing nothing at all; the second close measures that fact instead of
+        trusting it.
+        """
+        from PyQt6.QtWidgets import QWidget
+        from src.ui.texture_generator import TextureGeneratorDialog
+
+        TextureGeneratorDialog(self.window.rendering_tab)
+        TextureGeneratorDialog(self.window)
+
+        holders = [pane for pane in [self.window] + self.window.findChildren(QWidget)
+                   if hasattr(pane, 'shutdown_runs')]
+        self.assertGreaterEqual(len(holders), 14,
+                                'the tree holds fewer runs than the app starts them')
+        dialogs = [pane for pane in holders if isinstance(pane, TextureGeneratorDialog)]
+        self.assertEqual(2, len(dialogs),
+                         'the two dialogs were not both found as children of this window, so '
+                         'the test cannot ask the walk a question about its scope')
+
+        asked = []
+        originals = {}
+        for pane in holders:
+            originals[pane] = pane.shutdown_runs
+
+            def spy(target=pane):
+                def asked_runs(timeout_ms: int = 5000):
+                    asked.append(target)
+                    return originals[target](timeout_ms)
+                return asked_runs
+            pane.shutdown_runs = spy()
+
+        self.window.show()
+        self.app.processEvents()
+        self.window.close()
+        self.app.processEvents()
+
+        asked_names = [type(pane).__name__ for pane in asked]
+        missing = sorted({type(pane).__name__ for pane in holders if pane not in asked})
+        self.assertEqual([], missing, 'the close never asked these holders: ' + ', '.join(missing))
+        for expected in ('QualityAnalyzerUI', 'UnifiedOpen3DViewer', 'MeshToolsTab',
+                         'TextureGeneratorDialog', 'ModelTab'):
+            self.assertIn(expected, asked_names, f'{expected} is not reached by the close')
+        self.assertEqual(2, sum(1 for pane in asked if pane in dialogs),
+                         'a holder parented to the window instead of to a tab page was left '
+                         'out, which is the tab loop coming back with a different spelling')
+
+        asked_once = len(asked)
+        self.window.close()
+        self.app.processEvents()
+        self.assertEqual(asked_once, len(asked),
+                         'a hidden window was closed a second time and the runs were asked again')
+        print('✓ The close asked every holder instance in the tree, embedded ones included: '
+              f'{len(set(asked_names))} kinds across {asked_once} instances.')
+
+    def test_26_the_wait_answers_for_each_kind_of_runner_it_was_given(self):
+        """Threads, pool work, and pool work with no pool named: three shapes, three answers.
+
+        `QThreadPool.waitForDone` answers whether the queue drained, not whether one named
+        run ended, so a pool row can only be classified with the pool in hand. A caller that
+        hands over pool work and no pool is not told it finished - that answer would let the
+        close delete the widgets the run is still going to write into - and the only way to
+        know the refusal is real is to ask it.
+        """
+        from PyQt6.QtCore import QThreadPool
+        from src.utils.run_teardown import wait_for_runs
+        from src.utils.worker import Worker
+
+        pool = QThreadPool.globalInstance()
+        holder = Worker(lambda progress_callback=None: time.sleep(1.0))
+        pool.start(holder)
+
+        ended, running = wait_for_runs([holder], 10, pool=None)
+        self.assertEqual([], ended,
+                         'work that needs a pool was called finished with no pool named')
+        self.assertEqual([holder], running, 'the same run was not counted as owed')
+
+        ended, running = wait_for_runs([holder], 20000, pool)
+        self.assertEqual([holder], ended, 'the pool said its queue drained and the helper said no')
+        self.assertEqual([], running, 'a drained run stayed owed')
+        print('✓ The wait told a thread, a drained pool and an unnamed pool apart.')
+
+    def test_27_the_attribute_holder_silences_asks_waits_and_clears(self):
+        """`drain_attributes` is a different shape from `drain`: one attribute, one guard.
+
+        Panes that keep a single run in a named attribute read that attribute from their own
+        Cancel button, so a run that outlasts the wait has to leave it holding the thread -
+        dropping that reference is Qt's way of ending the process - and a run that ended has
+        to leave it None so the next Cancel finds nothing. The worker here belongs to this
+        file because the helper is the thing under test: it is a `QThread` that records the
+        request it is given, ignores it, and posts a verdict either way.
+        """
+        from PyQt6.QtCore import QThread, pyqtSignal
+        from src.utils.run_teardown import drain_attributes
+
+        class Deaf(QThread):
+            """A run that says it was asked and carries on regardless."""
+
+            verdict = pyqtSignal(str)
+
+            def __init__(self):
+                super().__init__()
+                self.asked = False
+
+            def request_stop(self):
+                self.asked = True
+
+            def run(self):
+                time.sleep(1.0)
+                self.verdict.emit('the answer')
+
+        class Holder:
+            run = None
+
+        holder = Holder()
+        holder.run = Deaf()
+        seen = []
+        holder.run.verdict.connect(seen.append)
+        holder.run.start()
+        while not holder.run.isRunning():
+            self.app.processEvents()
+
+        owed = drain_attributes(holder, ('run',), timeout_ms=80)
+
+        self.assertTrue(holder.run.asked, 'the attribute holder never asked the run to stop')
+        self.assertEqual([holder.run], owed, 'a run that was still working was reported as ended')
+        self.assertIsNotNone(holder.run,
+                             'the attribute of a run still working was cleared, and the '
+                             'reference Qt needs kept is the one the pane dropped')
+
+        holder.run.wait(15000)
+        self.app.processEvents()
+        self.assertEqual([], seen, 'the verdict reached the pane after the close had taken it off')
+
+        self.assertEqual([], drain_attributes(holder, ('run',), timeout_ms=5000),
+                         'a run that had ended was still counted')
+        self.assertIsNone(holder.run, 'the ended run still owns the attribute its Cancel reads')
+        print('✓ The attribute holder asked, kept the live run, dropped the verdict and cleared it.')
+
     @classmethod
     def tearDownClass(cls):
         """Close the window, then take the asset tree with it - and say so if anything stays.

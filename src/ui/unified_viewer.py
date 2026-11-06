@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QSize
 from PyQt6.QtGui import QImage, QPixmap, QColor
 from src.core.worker_base import SafeWorker
+from ..utils.run_teardown import drain_attributes
 
 try:
     import open3d as o3d
@@ -137,6 +138,19 @@ class UnifiedOpen3DViewer(QWidget):
         self.preview_worker = None
         
         self.init_ui()
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence the preview render in flight and wait for it to finish.
+
+        This widget is embedded - in Mesh Tools, in Point Clouds, in the Quality
+        pane - so the tab that hosts it can be closed while its own `refresh_preview` is
+        still off-screen rendering, and `image_ready` then writes a pixmap into a label
+        that has already gone. The render takes one image and cannot be stopped part-way,
+        so it is waited on; a render that outlasts the wait stays in `preview_worker`,
+        because its reference is what keeps Qt from aborting on a live thread.
+        Returns the previews still owed when the wait gave up.
+        """
+        return len(drain_attributes(self, ('preview_worker',), timeout_ms))
 
     def init_ui(self):
         layout = QVBoxLayout(self)

@@ -20,6 +20,7 @@ from ..processing.scene_optimizer import SceneOptimizer
 from ..processing.texture_optimizer import TextureOptimizer, available_formats
 from .model_viewer import ModelViewerWidget
 from ..processing.texture_baker import TextureBakerThread
+from ..utils.run_teardown import drain
 import os
 
 
@@ -346,8 +347,41 @@ class PreProcessingTab(QWidget):
         own `finished` signal is what releases it.
         """
         self._workers.append(thread)
-        thread.finished.connect(lambda: self._workers.remove(thread))
+        thread.finished.connect(lambda: self._release_worker(thread))
         return thread
+
+    def _release_worker(self, thread):
+        """Let a worker go when it says it is done - once, whoever else let go first.
+
+        The removal has to be guarded because `shutdown_runs` releases the same thread from
+        the list on its way out; a second `list.remove` of the same worker raises inside a
+        slot, and PyQt answers an exception that escapes a slot by ending the process.
+        """
+        if thread in self._workers:
+            self._workers.remove(thread)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Stop every run this pane started, and make sure none of them reports again.
+
+        This pane starts seven kinds of worker and each one writes to different widgets, so
+        a verdict that arrives after the window is gone is delivered into memory Qt has
+        already freed - which ends the process with a heap fault, not a traceback. The
+        channels therefore come off first, the stop is asked second, and a worker that
+        outlasts the wait stays in `_workers`, because its reference is the only thing
+        between this process and Qt's abort. The dialogs go with the runs they were
+        tracking, so a close does not leave a Cancel button waiting on an answer that will
+        never come. Returns the workers this pane still cannot let go of.
+        """
+        running = drain(self._workers, timeout_ms)
+        for name in ('lod_thread', 'extraction_thread', 'conversion_thread',
+                     'optimization_thread', 'baking_thread', '_export_thread',
+                     'lod_progress', 'extraction_progress', 'conversion_progress',
+                     'optimization_progress', 'progress_dialog', 'bake_message'):
+            held = getattr(self, name, None)
+            if isinstance(held, QProgressDialog):
+                held.close()
+            setattr(self, name, None)
+        return len(running)
 
     def init_ui(self):
         """Initialize the enhanced pre-processing UI."""

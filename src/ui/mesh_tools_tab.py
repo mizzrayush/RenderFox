@@ -18,6 +18,7 @@ from ..processing.mesh_processor import (
 )
 from .unified_viewer import UnifiedOpen3DViewer
 from ..utils.worker import Worker
+from ..utils.run_teardown import drain
 from .icon_provider import get_icon
 
 class MeshToolsTab(QWidget):
@@ -37,16 +38,18 @@ class MeshToolsTab(QWidget):
         self.undo_steps = []
         self._pending_source = None
         self._pending_label = "Mesh operation"
+        self._runs = []
+
         # Current model header
         # Initialize layout
         main_layout = QVBoxLayout(self)
-        
+
         self.model_header = self.create_model_header()
         main_layout.addWidget(self.model_header)
-        
+
         # Create main splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
+
         # Left panel - Tools
         left_panel = self.create_left_panel()
         scroll_left = QScrollArea()
@@ -54,14 +57,53 @@ class MeshToolsTab(QWidget):
         scroll_left.setWidgetResizable(True)
         scroll_left.setFrameShape(QFrame.Shape.NoFrame)
         splitter.addWidget(scroll_left)
-        
+
         # Right panel - Preview and results
         right_panel = self.create_right_panel()
         splitter.addWidget(right_panel)
-        
+
         splitter.setSizes([380, 820])
         main_layout.addWidget(splitter)
-        
+
+    # ---- the one way a started run is held and released -------------------------
+
+    def _keep_worker(self, worker):
+        """Hold a started operation until the pool says it is done.
+
+        Both paths here - the read-only measurements and `execute_async`, which every
+        real mesh operation goes through - handed a local `Worker` to this pane's own
+        pool and forgot it. Nothing was left that a close could take the handlers off of,
+        and those handlers rewrite the mesh, the history list and the undo stack when the
+        answer lands. The run releases itself through its own `finished`, so the list does
+        not grow with every operation of a long session.
+        """
+        self._runs.append(worker)
+        worker.signals.finished.connect(lambda: self._release_worker(worker))
+        return worker
+
+    def _release_worker(self, worker):
+        """Let a run go when it says it is done - once, whoever else let go first.
+
+        The removal is guarded because `shutdown_runs` releases the same worker on its way
+        out; a second `list.remove` of it raises inside a slot, and PyQt answers an
+        exception that escapes a slot by ending the process.
+        """
+        if worker in self._runs:
+            self._runs.remove(worker)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence every mesh operation in flight and wait for this pane's own pool.
+
+        A pymeshlab filter on a real model runs for tens of seconds, and its answer is
+        applied by reloading the result into the viewer, so a close that let it report
+        would write into a destroyed viewer rather than merely print late. These are
+        `QRunnable`s on a pool this pane owns, so there is no stop to ask of one and the
+        pool answers only whether its queue drained - which, for a run longer than the
+        wait, it has not. What has not drained stays in `_runs`.
+        Returns the operations still owed when the wait gave up.
+        """
+        return len(drain(self._runs, timeout_ms, self.threadpool))
+
     def create_model_header(self):
         """Create the current model header."""
         frame = QFrame()
@@ -1042,6 +1084,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         worker.signals.result.connect(show_result)
         worker.signals.error.connect(self.on_operation_error)
         worker.signals.finished.connect(self.on_measurement_finished)
+        self._keep_worker(worker)
         self.threadpool.start(worker)
 
     def on_measurement_finished(self):
@@ -1875,6 +1918,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         worker.signals.result.connect(self.on_operation_completed)
         worker.signals.error.connect(self.on_operation_error)
         worker.signals.finished.connect(self.on_operation_finished)
+        self._keep_worker(worker)
         self.threadpool.start(worker)
         
     def on_operation_completed(self, result):

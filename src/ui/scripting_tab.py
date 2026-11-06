@@ -18,6 +18,7 @@ from PyQt6.QtGui import QFont, QColor, QTextCharFormat, QSyntaxHighlighter, QAct
 import keyword
 import builtins
 from .icon_provider import get_icon
+from ..utils.run_teardown import drain_attributes
 
 class PythonSyntaxHighlighter(QSyntaxHighlighter):
     """Python syntax highlighter for the code editor."""
@@ -848,6 +849,19 @@ if __name__ == "__main__":
         else:
             self.output_display.appendPlainText("=== Script Execution Failed ===")
         
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Ask a script still executing to stop, silence it, and wait for it to end.
+
+        `output_ready`, `error_occurred` and `execution_finished` all write into the
+        output pane, and a user script can run for its whole timeout - so this is the one
+        run holder the close cannot be quick about. The executor's `stop` is the same
+        request the Stop button already makes, and the handlers come off first either
+        way: a script that finishes after the tab is gone would append its closing line to
+        a text box that is no longer there. Returns the scripts still owed when the wait
+        gave up.
+        """
+        return len(drain_attributes(self, ('executor',), timeout_ms))
+
     def stop_script(self):
         """Stop script execution."""
         if self.executor and self.executor.isRunning():

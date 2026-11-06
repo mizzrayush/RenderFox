@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QFileDialog, QMessageBox)
 
 from ..features.ai_asset_tagger import AIAssetTagger
+from ..utils.run_teardown import drain_attributes
 from .icon_provider import get_icon
 
 logger = logging.getLogger(__name__)
@@ -795,6 +796,21 @@ class AIAssetTaggerUI(QWidget):
         except Exception as e:
             logger.error(f"Error updating statistics: {e}")
     
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence the tagging run in flight and wait for it to end.
+
+        This pane is embedded in the Library tab, so the close reaches it through the
+        walk of the window's children rather than through the tab loop. Both workers
+        declare their own `finished` carrying the analysis - which is why the helper reads
+        the channels off the object instead of a list written beside this pane - and each
+        one writes into widgets that go away with it: the tag list, the confidence bar,
+        the bulk status line. Neither worker can be asked to stop, so the close waits;
+        what outlasts the wait stays in `tag_worker` or `bulk_worker`, because the
+        reference of a running thread is what keeps Qt from aborting.
+        Returns the runs still owed when the wait gave up.
+        """
+        return len(drain_attributes(self, ('tag_worker', 'bulk_worker'), timeout_ms))
+
     def bulk_auto_tag(self):
         """Perform bulk auto-tagging on a directory."""
         dir_path = QFileDialog.getExistingDirectory(self, "Select Directory to Auto-Tag")

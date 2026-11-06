@@ -188,6 +188,13 @@ SUITES = [
         "timeout_seconds": 240
     },
     {
+        "id": "run_teardown_contract",
+        "name": "Run Teardown Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_run_teardown_contract.py")],
+        "description": "Asks the two close-over-a-live-run questions in a process that never starts a run, so a defect that Qt otherwise answers with an access violation or a fail-fast arrives as a named test: a runner with nothing connected silences to nothing rather than raising out of closeEvent, and every run a pane keeps is filed in the bucket its shutdown_runs drains and emptied by it - both of the Diagnostics lists included",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

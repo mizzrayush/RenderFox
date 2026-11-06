@@ -458,12 +458,16 @@ class MainWindow(QMainWindow):
 
         # A worker that is still running when the window goes posts its result into widgets
         # Qt has already destroyed, and Qt answers that with a heap fault rather than a
-        # traceback. Every pane that can start work is asked to stop it first, so a close in
-        # the middle of a measure leaves nothing to deliver.
-        for index in range(self.tab_widget.count()):
-            pane = self.tab_widget.widget(index)
-            if hasattr(pane, 'shutdown_runs'):
-                pane.shutdown_runs()
+        # traceback. Every holder of a run is asked to stop it first, so a close in the
+        # middle of a measure leaves nothing to deliver. The walk covers the whole tree
+        # rather than the fifteen tabs, because the runs are not only in the tabs: the
+        # Quality pane lives inside Models, the Open3D preview inside Mesh Tools and Point
+        # Clouds, the tagger inside Library, and a dismissed dialog outlives its own
+        # `exec()` as a child of the pane that opened it. Asking each object whether it
+        # answers is the one list of holders that cannot forget a pane.
+        for holder in [self] + self.findChildren(QWidget):
+            if hasattr(holder, 'shutdown_runs'):
+                holder.shutdown_runs()
 
         # Auto-save settings if enabled
         if hasattr(self, 'settings_tab') and hasattr(self.settings_tab, 'auto_save_workspace'):

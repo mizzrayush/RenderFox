@@ -21,6 +21,7 @@ from ..features.ai_asset_tagger import AIAssetTagger
 from src.ui.icon_provider import get_icon
 # Import our library manager
 from src.core.library_manager import LibraryManager, LibraryScannerWorker, SearchQuery
+from ..utils.run_teardown import drain_attributes
 
 class ModelCard(QFrame):
     """Visual card widget for displaying a model in grid view."""
@@ -1041,6 +1042,19 @@ class LibraryTab(QWidget):
         """Start background import worker."""
         self.scanner_worker = LibraryScannerWorker(self.library, files)
         self.scanner_worker.start()
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Wait for a scan or import that is still walking the library folders.
+
+        This run answers nothing into the interface - `start_scan_worker` and
+        `start_import_worker` connect no signal - so the close is not waiting to keep a
+        verdict out of a dead widget. It waits because the worker is writing the library
+        itself: `LibraryManager.scan` and `import_files` add rows, and an exit in the
+        middle of them leaves the index part-filled with nothing said about it. What
+        outlasts the wait stays referenced by `scanner_worker`, which is also the guard
+        the pane's own re-entry check reads. Returns the scans still owed.
+        """
+        return len(drain_attributes(self, ('scanner_worker',), timeout_ms))
     
     def update_scan_progress(self, percent, message):
         """Update progress during scanning."""

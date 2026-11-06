@@ -25,6 +25,7 @@ from ..features.diagnostic_engine import (
 from ..features.performance_analyzer import BenchmarkRunner, benchmark_engine
 from ..utils.frame_clock import shared_clock
 from ..utils.worker import Worker
+from ..utils.run_teardown import drain
 from .icon_provider import get_icon
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
@@ -153,6 +154,47 @@ class DiagnosticsTab(QWidget):
         self.init_ui()
         self.setup_connections()
         self.setup_logging()
+
+    # ---- the one way a started run is held and released -------------------------
+
+    def _keep_worker(self, bucket, worker):
+        """Hold a started run in the list that names what it was for.
+
+        Without the reference this pane has nothing to take the handlers off of when the
+        window closes, and a run still queued at that moment writes its answer into the
+        report view Qt has already destroyed. Each run releases itself through its own
+        `finished`, so a long session does not accumulate every measurement it made.
+        """
+        bucket.append(worker)
+        worker.signals.finished.connect(lambda: self._release_worker(bucket, worker))
+        return worker
+
+    def _release_worker(self, bucket, worker):
+        """Let a run go when it says it is done - once, whoever else let go first.
+
+        The removal is guarded because `shutdown_runs` releases the same worker on its way
+        out; a second `list.remove` of it raises inside a slot, and PyQt answers an
+        exception that escapes a slot by ending the process.
+        """
+        if worker in bucket:
+            bucket.remove(worker)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Silence every measurement and benchmark this pane started, then drain the pool.
+
+        Both lists hold `QRunnable`s on the shared pool, so one wait covers them all and
+        the second list is not asked to wait a second time; what has not drained by the
+        deadline stays in its list, because a run's reference is what keeps this process
+        alive while it is still working. These runs have no stop to ask of them - the
+        pool only answers whether its queue emptied.
+        Returns the runs still owed when the wait gave up.
+        """
+        pool = QThreadPool.globalInstance()
+        held = self._benchmark_workers + self._measure_workers
+        running = drain(held, timeout_ms, pool)
+        for bucket in (self._benchmark_workers, self._measure_workers):
+            bucket[:] = [worker for worker in bucket if worker in running]
+        return len(running)
         
     def init_ui(self):
         """Initialize the diagnostics interface."""
@@ -1043,7 +1085,7 @@ Overall Status: {overall}"""
         worker = Worker(worker_func)
         worker.signals.result.connect(receiver)
         worker.signals.error.connect(self.on_benchmark_failed)
-        self._benchmark_workers.append(worker)
+        self._keep_worker(self._benchmark_workers, worker)
         QThreadPool.globalInstance().start(worker)
 
     @staticmethod
@@ -1175,7 +1217,7 @@ Overall Status: {overall}"""
         worker = Worker(worker_func)
         worker.signals.result.connect(receiver)
         worker.signals.error.connect(self.on_measurement_failed)
-        self._measure_workers.append(worker)
+        self._keep_worker(self._measure_workers, worker)
         QThreadPool.globalInstance().start(worker)
 
     def on_measurement_failed(self, error):
