@@ -1821,16 +1821,36 @@ class ModelViewer3D(QOpenGLWidget):
         self._clear_meshes()
         self.update()
 
+    @staticmethod
+    def _read_texture_file(file_path: str):
+        """Read a texture file into RGBA bytes, releasing the file on the way out.
+
+        Pillow keeps a file open from Image.open until close, and a texture this app still
+        has open is a texture Blender or Unity cannot re-export over.
+        """
+        from PIL import Image
+        img = Image.open(file_path)
+        try:
+            return np.array(img.convert('RGBA'), dtype=np.uint8)
+        finally:
+            img.close()
+
     def set_material_texture(self, texture_type: str, file_path: str):
-        """Load and assign a texture to all meshes."""
+        """Read a texture file, then assign it to every mesh the viewer holds.
+
+        The read comes before the GL gate so a wrong path is reported whether or not a
+        context is up; only the upload needs one.
+        """
+        try:
+            img_data = self._read_texture_file(file_path)
+        except Exception as e:
+            print(f"Failed to load texture: {file_path} ({e})")
+            return
         if not self.isValid() or not self.gl_ready:
             return
-            
+
         try:
-            # Load image using PIL
-            from PIL import Image
-            img = Image.open(file_path)
-            texture_id = self._load_gl_texture(img)
+            texture_id = self._load_gl_texture(img_data)
             
             if texture_id is None:
                 print(f"Failed to load texture: {file_path}")
@@ -2466,48 +2486,9 @@ class ModelViewerWidget(QWidget):
     
     # Expose controls for settings tab
     def set_material_texture(self, texture_type: str, file_path: str):
-        """Load and assign a texture to all meshes."""
-        if not self.isValid() or not self.gl_ready:
-            return
-            
-        try:
-            # Load image using PIL
-            from PIL import Image
-            img = Image.open(file_path)
-            texture_id = self._load_gl_texture(img)
-            
-            if texture_id is None:
-                print(f"Failed to load texture: {file_path}")
-                return
-                
-            self.makeCurrent()
-            
-            # Assign to all meshes
-            for m in self.meshes:
-                if texture_type == 'albedo':
-                    m['texture'] = texture_id
-                    m['has_texture'] = True
-                elif texture_type == 'normal':
-                    m['normal_tex'] = texture_id
-                elif texture_type == 'metallic':
-                    m['metallic_tex'] = texture_id
-                elif texture_type == 'roughness':
-                    # We use the same texture for metallic/roughness (GLTF standard)
-                    # But if loaded separately, we might need to handle channel packing.
-                    # For simplicity, let's assume the user provides a packed map or we just use it as is.
-                    # If we want to support separate maps, we'd need shader changes to read from different channels.
-                    # For now, let's map 'roughness' to the metallic slot as well, assuming it's a combined map or the user knows.
-                    # Or better, let's just map it to metallic_tex and rely on the shader using it.
-                    m['metallic_tex'] = texture_id
-                elif texture_type == 'occlusion':
-                    m['occlusion_tex'] = texture_id
-                elif texture_type == 'emissive':
-                    m['emissive_tex'] = texture_id
-            
-            self.update()
-            
-        except Exception as e:
-            print(f"Error setting material texture: {e}")
+        """Assign a texture file to the mesh the inner viewer is showing."""
+        if hasattr(self.viewer_3d, 'set_material_texture'):
+            self.viewer_3d.set_material_texture(texture_type, file_path)
 
     def set_render_mode(self, mode: str):
         if hasattr(self.viewer_3d, 'set_render_mode'):
@@ -2561,39 +2542,6 @@ class ModelViewerWidget(QWidget):
         """Toggle grid and axes display."""
         if hasattr(self.viewer_3d, 'set_show_grid'):
             self.viewer_3d.set_show_grid(show)
-
-    
-    def _load_gl_texture(self, img):
-        if img is None: return None
-        try:
-            from PIL import Image
-            if not isinstance(img, np.ndarray):
-                img = Image.fromarray(np.array(img)) if not isinstance(img, Image.Image) else img
-                img = img.convert('RGBA')
-                img_data = np.array(img, dtype=np.uint8)
-            else:
-                if img.ndim == 2:  # grayscale
-                    img = np.stack([img, img, img, np.full_like(img, 255)], axis=-1)
-                if img.shape[-1] == 3:
-                    alpha = np.full((img.shape[0], img.shape[1], 1), 255, dtype=img.dtype)
-                    img = np.concatenate([img, alpha], axis=-1)
-                img_data = img.astype(np.uint8)
-            
-            tex = np.array([0], dtype=np.uint32)
-            glGenTextures(1, tex)
-            texture_id = int(tex[0])
-            glBindTexture(GL_TEXTURE_2D, texture_id)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img_data.shape[1], img_data.shape[0], 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data.tobytes())
-            glGenerateMipmap(GL_TEXTURE_2D)
-            glBindTexture(GL_TEXTURE_2D, 0)
-            return texture_id
-        except Exception:
-            return None
 
     def load_model(self, file_path: str) -> bool:
         """Load a model file with automatic retry until GL is ready.

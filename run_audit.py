@@ -35,7 +35,7 @@ SUITES = [
         "id": "baseline_stability",
         "name": "Core Backend & Regression Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "verify_all_fixes.py")],
-        "description": "Validates database integrity, translation matrices, process handles, and engine bindings"
+        "description": "Validates database integrity, translation matrices, process handles, engine bindings, and that a shut window leaves no file a DCC cannot re-export over"
     },
     {
         "id": "lod_mesh_pipeline",
@@ -184,7 +184,7 @@ SUITES = [
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
-        "description": "Runs full Qt offscreen driver across all 15 tabs using procedural edge-case 3D meshes"
+        "description": "Runs full Qt offscreen driver across all 15 tabs using procedural edge-case 3D meshes, every file reader's release, and a close driven over a run still in flight"
     }
 ]
 

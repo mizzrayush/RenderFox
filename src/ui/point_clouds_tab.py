@@ -205,8 +205,45 @@ class PointCloudsTab(QWidget):
         therefore released only by its own `finished` signal.
         """
         self._workers.append(thread)
-        thread.finished.connect(lambda: self._workers.remove(thread))
+        thread.finished.connect(lambda: self._release_worker(thread))
         return thread
+
+    def _release_worker(self, thread):
+        """Let a worker go when it says it is done - once, whoever else let go first.
+
+        The removal has to be guarded because `shutdown_runs` releases the same thread from
+        the list on its way out; a second `list.remove` of the same worker raises inside a
+        slot, and PyQt answers an exception that escapes a slot by ending the process.
+        """
+        if thread in self._workers:
+            self._workers.remove(thread)
+
+    def shutdown_runs(self, timeout_ms: int = 5000) -> int:
+        """Stop every run this pane started, and make sure none of them reports again.
+
+        A verdict that is already in the queue when the window goes is delivered into widgets
+        Qt has torn down, and Qt answers that with a heap fault instead of a traceback, so the
+        handlers come off before anything waits. Returns the threads the wait gave up on; those
+        stay held by the pane, because dropping a running QThread is the other way this
+        process ends.
+        """
+        still_running = 0
+        for thread in list(self._workers):
+            for signal in (thread.verdict_ready, thread.finished):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass  # already reported and let go; nothing left to take off
+            thread.request_stop()
+            if thread.wait(timeout_ms):
+                if thread in self._workers:
+                    self._workers.remove(thread)
+            else:
+                still_running += 1
+        self._active_thread = None
+        self._dismiss(self._run_progress)
+        self._run_progress = None
+        return still_running
 
     def _no_file_message(self):
         QMessageBox.warning(self, "No point cloud loaded",

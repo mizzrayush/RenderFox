@@ -4,8 +4,10 @@ Tests all stability, UI, routing, and backend fixes implemented across the codeb
 """
 
 import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 import json
 import trimesh
@@ -145,13 +147,46 @@ class TestRenderFoxRectification(unittest.TestCase):
         self.assertEqual(data['tags'], 'prop, game')
         self.assertEqual(data['rating'], 4)
 
+    def close_window_and_empty_tree(self, window, root, tries=8):
+        """Shut a window, then take the directory it read from, and name whatever stays.
+
+        `tempfile.TemporaryDirectory` tries the removal exactly once, on interpreter
+        housekeeping terms, so a Windows refusal surfaced as an error attached to the
+        cleanup rather than to this test. The window closes first - a pane that still holds
+        a model it was shown is a defect worth naming - and the tries after that are for
+        the scanner that reads every file this machine writes.
+        """
+        if window is not None:
+            window.close()
+            window.deleteLater()
+        self.app.processEvents()
+
+        held = []
+        for attempt in range(tries):
+            held = []
+            for dirpath, _dirs, names in os.walk(root):
+                for name in names:
+                    path = os.path.join(dirpath, name)
+                    try:
+                        os.remove(path)
+                    except OSError as problem:
+                        held.append(f'{name} (winerror={problem.winerror})')
+            if not held:
+                break
+            time.sleep(0.25)
+            self.app.processEvents()
+        shutil.rmtree(root, ignore_errors=True)
+        return held
+
     def test_09_main_window_tabs_and_routing(self):
         """Test MainWindow instantiation, all tabs, shortcuts and cross-tab routes."""
         from unittest.mock import patch
         from PyQt6.QtWidgets import QMessageBox, QFileDialog
         from src.ui.main_window import MainWindow
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = tempfile.mkdtemp()
+        window = None
+        try:
             obj_path = os.path.join(tmpdir, "test.obj")
             trimesh.creation.box().export(obj_path)
             img_path = os.path.join(tmpdir, "test.png")
@@ -165,7 +200,8 @@ class TestRenderFoxRectification(unittest.TestCase):
                  patch.object(QFileDialog, 'getExistingDirectory', return_value=tmpdir):
                 
                 mw = MainWindow()
-                
+                window = mw  # the finally has to shut what the try opened
+
                 # 1. Verify all tab widgets exist
                 self.assertIsNotNone(mw.dashboard_tab)
                 self.assertIsNotNone(mw.model_tab)
@@ -207,6 +243,11 @@ class TestRenderFoxRectification(unittest.TestCase):
                 
                 mw.open_in_postprocessing(img_path)
                 self.assertEqual(mw.tab_widget.currentWidget(), mw.postprocessing_tab)
+        finally:
+            held = self.close_window_and_empty_tree(window, tmpdir)
+
+        self.assertEqual([], held,
+                         'this window is shut and a DCC still cannot re-export these files')
 
     def test_10_script_api_library_resolution(self):
         """Test ScriptAPI get_library_models resolution."""

@@ -456,6 +456,15 @@ class MainWindow(QMainWindow):
                 return
         engine.stop()
 
+        # A worker that is still running when the window goes posts its result into widgets
+        # Qt has already destroyed, and Qt answers that with a heap fault rather than a
+        # traceback. Every pane that can start work is asked to stop it first, so a close in
+        # the middle of a measure leaves nothing to deliver.
+        for index in range(self.tab_widget.count()):
+            pane = self.tab_widget.widget(index)
+            if hasattr(pane, 'shutdown_runs'):
+                pane.shutdown_runs()
+
         # Auto-save settings if enabled
         if hasattr(self, 'settings_tab') and hasattr(self.settings_tab, 'auto_save_workspace'):
             if self.settings_tab.auto_save_workspace.isChecked():
