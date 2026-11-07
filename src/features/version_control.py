@@ -507,17 +507,6 @@ class AssetVersionControl:
         Returns:
             True if successful
         """
-        """
-        Create a new branch for experimental changes.
-        
-        Args:
-            model_path: Model path
-            branch_name: Name of new branch
-            from_version_id: Optional version to branch from (default: latest)
-            
-        Returns:
-            True if successful
-        """
         try:
             # Check if branch already exists
             branches = self.get_branches(model_path)

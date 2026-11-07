@@ -230,10 +230,25 @@ SUITES = [
         "timeout_seconds": 180
     },
     {
+        "id": "view_preset_contract",
+        "name": "Presets, Scripting Surface & Load Verdict Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_view_preset_contract.py")],
+        "description": "Four controls that described a capability instead of reaching it, asked at the control that makes the claim: the Model pane's three Preset buttons are in the widget tree, each connected, and a click moves the Shaders row, the light, the line width and the two data switches through to the state the viewer paints from rather than only the boxes; the fifth Shaders row is the overlay mode the paint already branches on and each row reaches the mode its label names; the Scripting pane's list is the engine's own surface read off the object the executor injects as `rfx`, so all eleven calls carry the prefix, the parameters and the defaults a script needs and none of the fifteen invented names is left, and the documentation panel is built from the same reading; `load_model_file` refuses a path that is not on disk for that reason, opens its success box only when the viewer said yes, names the file it was handed, and never hands the file path to the dict-typed load report the info labels read; and the integrity dialog says the three categories with their counts, five paths and the number left out, and calls an unreadable library unreadable instead of clean",
+        "timeout_seconds": 240
+    },
+    {
+        "id": "unreachable_code_checker",
+        "name": "Three Questions the Tree Can Answer",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_unreachable_code_checker.py")],
+        "description": "The three shapes that compile, import and build nothing are instruments now: a body that continues past the statement that ends it - which is how an edit beside `__init__` can leave a pane with no widgets - a string statement parked below the docstring slot, which is how the Presets group shipped, buttons and all, and a `def` or `class` whose name the same scope already bound, which is how the viewer came to hold two `set_render_mode` methods and the library a `check_integrity` that no caller reached. Each question is answered on a sample that has the shape and on one that only looks like it (an exit that is the body's last line, a docstring in its slot, a property and its setter, the same name in two classes, a string that is an argument or a returned value rather than a statement), the whole reading is then taken over `src`, `tools` and `tests` and has to answer nothing, and the size of the reading is printed beside it: the roots named in the test, the file list compared against an independent `os.walk` count, the eight repaired files shown to be inside what is read. The command's own lines are asked too - the target list handed to `main` rather than `sys.argv`, so one folder is read as one folder and not as the whole app; one message per shape, the earlier binding named by line for a shadow; exit 1 when there is anything to report and the clean sentence naming all three questions so a narrowed reading cannot pass as a clean app - and a file the tree cannot parse is reported rather than skipped",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
-        "description": "Runs full Qt offscreen driver across all 15 tabs using procedural edge-case 3D meshes, every file reader's release, and a close driven over a run still in flight"
+        "description": "Runs full Qt offscreen driver across all 15 tabs using procedural edge-case 3D meshes, every file reader's release, and a close driven over a run still in flight",
+        "timeout_seconds": 240
     }
 ]
 

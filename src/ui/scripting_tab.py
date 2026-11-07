@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import traceback
+from html import escape as html_escape
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QPushButton, QComboBox, QLabel, QGroupBox, QFormLayout, 
                              QSpinBox, QDoubleSpinBox, QSlider, QTabWidget, QCheckBox,
@@ -516,19 +517,13 @@ if __name__ == "__main__":
         
         self.api_docs_display = QTextEdit()
         self.api_docs_display.setReadOnly(True)
-        self.api_docs_display.setHtml("""
-        <h3>RenderFox API Documentation</h3>
-        <p>Select a function from the list to view its documentation.</p>
-        
-        <h4>Quick Start:</h4>
-        <ul>
-            <li><code>get_loaded_models()</code> - Get all loaded models</li>
-            <li><code>load_model(path)</code> - Load a model from file</li>
-            <li><code>convert_model(model, format)</code> - Convert model format</li>
-            <li><code>generate_lod(model, levels)</code> - Generate LOD variants</li>
-            <li><code>batch_process(models, operation)</code> - Process multiple models</li>
-        </ul>
-        """)
+        self.api_docs_display.setHtml(
+            "<h3>RenderFox API Documentation</h3>"
+            "<p>Select a function from the list to view its documentation.</p>"
+            "<h4>What a script can call - read off the engine's own API object:</h4><ul>"
+            + "".join(f"<li><code>{html_escape(call)}</code></li>"
+                      for call in self.script_engine.api_surface())
+            + "</ul>")
         
         # Insert code button
         self.insert_code_btn = QPushButton("Insert Code")
@@ -544,24 +539,6 @@ if __name__ == "__main__":
         
         return widget
         
-    def populate_api_functions(self):
-        """Populate the API functions list."""
-        self.api_functions_list.clear()
-        
-        # Basic API functions
-        functions = [
-            "load_model(file_path)",
-            "get_library_models(tags=None)",
-            "add_to_job_queue(model_path, **kwargs)",
-            "convert_format(input_file, output_format)",
-            "generate_lod(input_file, levels=3)",
-            "batch_process(files, operation)",
-            "log(message, level='INFO')"
-        ]
-        
-        for func in functions:
-            self.api_functions_list.addItem(func)
-
     def create_console_tab(self):
         """Create interactive Python console."""
         widget = QWidget()
@@ -649,31 +626,10 @@ if __name__ == "__main__":
     #     self.script_tree.expandAll()
         
     def populate_api_functions(self):
-        """Populate API functions list."""
-        api_functions = [
-            "get_loaded_models()",
-            "load_model(file_path)",
-            "save_model(model, file_path)",
-            "convert_model(model, target_format)",
-            "generate_lod(model, levels)",
-            "optimize_textures(model)",
-            "validate_model(model)",
-            "batch_process(models, operation)",
-            "get_model_info(model)",
-            "extract_metadata(model)",
-            "create_render_job(model, settings)",
-            "get_render_engines()",
-            "set_render_settings(engine, settings)",
-            "start_batch_render(jobs)",
-            "get_processing_status()",
-            "log_message(level, message)",
-            "show_notification(title, message)",
-            "get_app_settings()",
-            "set_app_setting(key, value)"
-        ]
-        
-        for func in api_functions:
-            self.api_functions_list.addItem(func)
+        """The pane lists the engine's own surface, so a row the user inserts is a row that runs."""
+        self.api_functions_list.clear()
+        for call in self.script_engine.api_surface():
+            self.api_functions_list.addItem(call)
             
     def setup_connections(self):
         """Setup signal connections."""

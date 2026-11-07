@@ -22,8 +22,9 @@ from ..utils.run_teardown import drain
 from .icon_provider import get_icon
 
 class MeshToolsTab(QWidget):
-    add_to_library_requested = pyqtSignal(str)
     """Advanced mesh processing tools using PyMeshLab."""
+
+    add_to_library_requested = pyqtSignal(str)
     
     mesh_processed = pyqtSignal(str)
     operation_completed = pyqtSignal(str, dict)

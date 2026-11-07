@@ -252,8 +252,9 @@ class ModelTagDialog(QDialog):
         }
 
 class LibraryTab(QWidget):
-    open_rendering_requested = pyqtSignal(str)
     """Centralized model library management with database support."""
+
+    open_rendering_requested = pyqtSignal(str)
     
     model_selected = pyqtSignal(str)  # Emits path when model is selected for work
     library_updated = pyqtSignal()
@@ -3440,14 +3441,26 @@ Accessed: {datetime.fromtimestamp(stats.st_atime).strftime('%Y-%m-%d %H:%M:%S')}
     
     # ...existing code...
     def check_integrity(self):
-        """Check the integrity of the library database."""        
+        """Say what the database reported, in the names the database reports them under."""
         try:
-            issues = self.library.check_integrity()
-            if not issues:
-                QMessageBox.information(self, "Integrity Check", "No integrity issues found!")
+            report = self.library.check_integrity()
+            if not report:
+                self.show_error("Integrity Check",
+                                "The library could not be read, so nothing was checked.")
+                return
+            lines = [f"Models in the library: {report['total_models']}"]
+            for key in ('missing_files', 'orphaned_thumbnails', 'missing_thumbnails'):
+                found = report[key]
+                lines.append(f"{key}: {len(found)}")
+                lines.extend(f"  {item}" for item in found[:5])
+                if len(found) > 5:
+                    lines.append(f"  and {len(found) - 5} more")
+            detail = "\n".join(lines)
+            if report['issues_found'] == 0:
+                QMessageBox.information(self, "Integrity Check",
+                                        f"No integrity issues found.\n{detail}")
             else:
-                issue_text = "\n".join(issues)
-                QMessageBox.warning(self, "Integrity Issues Found", f"The following issues were found:\n{issue_text}")
+                QMessageBox.warning(self, "Integrity Issues Found", detail)
         except Exception as e:
             self.show_error("Integrity Check Error", f"Failed to check integrity: {str(e)}")
 

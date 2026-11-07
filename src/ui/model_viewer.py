@@ -1280,7 +1280,6 @@ class ModelViewer3D(QOpenGLWidget):
             self.shader_program.setUniformValue("use_lighting", bool(self.use_lighting))
             self.shader_program.setUniformValue("use_textures", bool(self.use_textures))
             self.shader_program.setUniformValue("use_vertex_colors", bool(self.use_vertex_colors))
-            self.shader_program.setUniformValue("use_vertex_colors", bool(self.use_vertex_colors))
             self.shader_program.setUniformValue("show_weights", bool(getattr(self, 'show_weights', False)))
             self.shader_program.setUniformValue("base_color", QVector3D(*self.base_color))
             self.shader_program.setUniformValue("wire_color", QVector3D(*self.wire_color))
@@ -1623,11 +1622,6 @@ class ModelViewer3D(QOpenGLWidget):
         """Toggle wireframe rendering."""
         self.wireframe_mode = enabled
         self.update()
-        
-    def set_render_mode(self, mode: str):
-        """Set render mode."""
-        self.render_mode = mode
-        self.update()
     
     def set_auto_rotate(self, enabled: bool):
         """Toggle auto-rotation."""
@@ -1902,10 +1896,6 @@ class ModelViewer3D(QOpenGLWidget):
     def set_render_mode(self, mode: str):
         """Set render mode."""
         self.render_mode = mode
-        self.update()
-    
-    def set_use_vertex_colors(self, enabled: bool):
-        self.use_vertex_colors = bool(enabled)
         self.update()
     
     def set_wire_color(self, r: float, g: float, b: float):

@@ -11,9 +11,12 @@ a reader, and **88 had no reader at all** - a failure caught, described, and wri
 stream the package closes.
 
 Those 88 are now records. Measured the same way on this tree: **12 stream writes** left, 0 of them
-unreadable, and **239 log records** written by 33 of the 71 files where 151 were written by 16 -
+unreadable, and **238 log records** written by 33 of the 71 files where 151 were written by 16 -
 the arithmetic the suite pins, because a report that changed channel rather than vanishing is the
-whole claim. The levels are 103 `warning`, 68 `error`, 60 `info`, 6 `debug` and 2 `logger.exception`.
+whole claim. The levels are 102 `warning`, 68 `error`, 60 `info`, 6 `debug` and 2 `logger.exception`.
+The count moved from the 239 the channel phase recorded because one of the methods that phase
+deleted - the shadowed `update_model_info` in the Model pane, which no caller reached - wrote a
+warning, and a record that cannot run is not a report.
 Rules 5 and 6 found seventeen defects on the tree the sweep landed on, all of them records the
 channel was already losing: three calls written on the root logger, whose rows are named `root`,
 and fourteen sentences that needed a glyph to be understood.
@@ -433,8 +436,8 @@ class TestInstrument(unittest.TestCase):
                 else:
                     through_a_module_logger += 1
         self.assertEqual(0, on_root, 'a record is written on the root logger after all')
-        self.assertEqual(239, sum(levels.values()),
-                         f'the tree writes {sum(levels.values())} records, not the 239 this file '
+        self.assertEqual(238, sum(levels.values()),
+                         f'the tree writes {sum(levels.values())} records, not the 238 this file '
                          'documents: re-measure, then correct the docstring')
         self.assertGreaterEqual(through_a_module_logger, 230, 'rules 5 and 6 have almost nothing to read')
         self.assertGreaterEqual(len(emitters), 30, f'only {len(emitters)} files emit at all')

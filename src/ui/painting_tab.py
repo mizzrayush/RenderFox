@@ -1,8 +1,8 @@
-import sys
 """
 Weight Painting Tab for RenderFox.
 Allows users to paint vertex weights for optimization and other processes.
 """
+import sys
 
 import os
 import numpy as np

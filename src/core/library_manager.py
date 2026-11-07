@@ -546,31 +546,6 @@ class LibraryManager(QObject):
         """Compatibility property for UI accessing db_connection."""
         return self.conn
 
-    def get_collections(self) -> List[Dict[str, Any]]:
-        """Alias for list_collections()."""
-        return self.list_collections()
-
-    def get_models_by_collection(self, collection_name: str) -> List[Dict[str, Any]]:
-        """Alias for get_collection_items()."""
-        return self.get_collection_items(collection_name)
-
-    def check_integrity(self) -> Dict[str, Any]:
-        """Verify database integrity and count valid/missing files."""
-        try:
-            cur = self.conn.cursor()
-            cur.execute("SELECT id, path FROM models")
-            rows = cur.fetchall()
-            missing = 0
-            valid = 0
-            for r in rows:
-                if not os.path.exists(r["path"]):
-                    missing += 1
-                else:
-                    valid += 1
-            return {"total": len(rows), "valid": valid, "missing": missing}
-        except Exception as e:
-            return {"total": 0, "valid": 0, "missing": 0, "error": str(e)}
-
     # ---------------------- Query/Search ----------------------
     def get_models(self, limit: int = 1000) -> List[Dict[str, Any]]:
         cur = self.conn.cursor()

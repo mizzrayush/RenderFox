@@ -6,6 +6,7 @@ Provides Python script execution, API access, and script management for the Scri
 import os
 import sys
 import json
+import inspect
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -804,6 +805,29 @@ class ScriptEngine:
                 'offset': e.offset
             }
     
+    def api_surface(self) -> List[str]:
+        """The calls a script can make, read off the object the executor hands it as `rfx`.
+
+        The Scripting pane lists these and inserts the selected one into the editor, so each
+        line here has to run: the name and every parameter come from the method itself.
+        """
+        calls = []
+        for name, method in inspect.getmembers(self.api, predicate=inspect.ismethod):
+            if name.startswith('_'):
+                continue
+            parts = []
+            for parameter in inspect.signature(method).parameters.values():
+                if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                    parts.append('**' + parameter.name)
+                elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+                    parts.append('*' + parameter.name)
+                elif parameter.default is inspect.Parameter.empty:
+                    parts.append(parameter.name)
+                else:
+                    parts.append(f'{parameter.name}={parameter.default!r}')
+            calls.append(f'rfx.{name}({", ".join(parts)})')
+        return calls
+
     def get_api_documentation(self) -> str:
         """Get comprehensive API documentation."""
         return """

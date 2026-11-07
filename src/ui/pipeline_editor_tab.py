@@ -266,16 +266,6 @@ class PendingWireItem(QGraphicsPathItem):
         self.setZValue(1)
         self.update_to(start)
 
-    def __init__(self, start: QPointF):
-        super().__init__()
-        self.start = start
-        pen = QPen(QColor(WIRE_COLOR))
-        pen.setWidth(2)
-        pen.setStyle(Qt.PenStyle.DashLine)
-        self.setPen(pen)
-        self.setZValue(1)
-        self.update_to(start)
-
     def update_to(self, point: QPointF) -> None:
         reach = max(abs(point.x() - self.start.x()) * 0.5, 40.0)
         path = QPainterPath()

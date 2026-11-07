@@ -1,7 +1,7 @@
-import sys
 """
 Model tab for RenderFox - using OpenGL viewer for better performance and compatibility.
 """
+import sys
 
 import os
 import logging
@@ -550,7 +550,7 @@ class ModelTab(QWidget):
                 self.painting_tab.set_model(self.current_model_path)
 
     def _on_shader_changed(self, row):
-        # 0: Wireframe, 1: Shaded, 2: Visualized, 3: Point Cloud
+        # 0: Wireframe, 1: Shaded, 2: Visualized, 3: Point Cloud, 4: Overlay
         self.viz_details_widget.setVisible(row == 2)
         if row == 0:
             self.model_viewer.set_render_mode("wireframe")
@@ -568,6 +568,12 @@ class ModelTab(QWidget):
             self._on_viz_mode_changed(self.viz_combo.currentText())
         elif row == 3:
             self.model_viewer.set_render_mode("point_cloud")
+            self.analysis_list.blockSignals(True)
+            self.analysis_list.setCurrentRow(0)
+            self.analysis_list.blockSignals(False)
+            self._on_analysis_changed(0)
+        elif row == 4:
+            self.model_viewer.set_render_mode("overlay")
             self.analysis_list.blockSignals(True)
             self.analysis_list.setCurrentRow(0)
             self.analysis_list.blockSignals(False)
@@ -620,8 +626,8 @@ class ModelTab(QWidget):
         shaders_layout = QVBoxLayout()
         
         self.shader_list = QListWidget()
-        self.shader_list.addItems(["Wireframe", "Shaded", "Visualized", "Point Cloud"])
-        self.shader_list.setFixedHeight(95) # Approx 4 items tall
+        self.shader_list.addItems(["Wireframe", "Shaded", "Visualized", "Point Cloud", "Overlay"])
+        self.shader_list.setFixedHeight(118) # Approx 5 items tall
         self.shader_list.setCurrentRow(1) # Default to Shaded
         self.shader_list.currentRowChanged.connect(self._on_shader_changed)
         shaders_layout.addWidget(self.shader_list)
@@ -859,32 +865,32 @@ class ModelTab(QWidget):
         layout.addWidget(view_group)
         
         # Presets group
-        """presets_group = QGroupBox("Presets")
+        presets_group = QGroupBox("Presets")
         presets_layout = QVBoxLayout()
-        
+
         presets_row1 = QHBoxLayout()
         preset_wireframe_btn = QPushButton("Wireframe")
         preset_wireframe_btn.clicked.connect(self.apply_wireframe_preset)
-        
+
         preset_solid_btn = QPushButton("Solid")
         preset_solid_btn.clicked.connect(self.apply_solid_preset)
-        
+
         presets_row1.addWidget(preset_wireframe_btn)
         presets_row1.addWidget(preset_solid_btn)
         presets_layout.addLayout(presets_row1)
-        
+
         presets_row2 = QHBoxLayout()
         preset_debug_btn = QPushButton("Debug View")
         preset_debug_btn.clicked.connect(self.apply_debug_preset)
-        
+
         presets_row2.addWidget(preset_debug_btn)
         presets_row2.addStretch()
         presets_layout.addLayout(presets_row2)
-        
+
         presets_group.setLayout(presets_layout)
         layout.addWidget(presets_group)
-        
-        layout.addStretch()"""
+
+        layout.addStretch()
         
         # Set up scroll area
         scroll_area.setWidget(scroll_widget)
@@ -898,21 +904,21 @@ class ModelTab(QWidget):
         return widget
     
     def apply_wireframe_preset(self):
-        """Apply wireframe viewing preset."""
-        self.render_mode_combo.setCurrentText("Wireframe")
+        """Edges only: the Shaders row, the light and the line width set together."""
+        self.shader_list.setCurrentRow(0)
         self.lighting_enable_cb.setChecked(False)
         self.line_width_spin.setValue(1.5)
-        
+
     def apply_solid_preset(self):
-        """Apply solid/filled viewing preset."""
-        self.render_mode_combo.setCurrentText("Fill")
+        """Shaded with light, textures and vertex colours all on."""
+        self.shader_list.setCurrentRow(1)
         self.lighting_enable_cb.setChecked(True)
         self.textures_cb.setChecked(True)
         self.vcolors_cb.setChecked(True)
-        
+
     def apply_debug_preset(self):
-        """Apply debug viewing preset with wireframe overlay."""
-        self.render_mode_combo.setCurrentText("Overlay")
+        """Shaded with the wireframe over it - the viewer's own overlay mode."""
+        self.shader_list.setCurrentRow(4)
         self.lighting_enable_cb.setChecked(True)
         self.line_width_spin.setValue(2.0)
 
@@ -1989,7 +1995,7 @@ class ModelTab(QWidget):
         self.compare_all_models()
     
     def clear_comparison_table(self):
-        """Clear the comparison table."""
+        """Legacy method - redirects to new multi-model system."""
         self.clear_all_comparison_models()
 
     def setup_connections(self):
@@ -2284,12 +2290,12 @@ class ModelTab(QWidget):
         lines.append(" • For full material fidelity, consider converting to GLB/GLTF and previewing textures in the 3D viewer.")
         return "\n".join(lines)
     
-    def load_model(self):
-        """Load a 3D model from file dialog."""
-        # ...existing code...
-    
     def load_model_file(self, file_path):
-        """Load a model file directly (called from other tabs)."""
+        """Load a model file directly (called from other tabs).
+
+        This is the pane's own load path - the one its Load button reaches - so the info
+        labels, the Quality tab and the Versions tab all see the file the caller named.
+        """
         if not os.path.exists(file_path):
             QMessageBox.warning(self, "Error", f"File not found:\n{file_path}")
             return
@@ -2297,17 +2303,13 @@ class ModelTab(QWidget):
         try:
             # Load using the model viewer
             if hasattr(self, 'model_viewer') and self.model_viewer:
-                self.model_viewer.load_model(file_path)
-                
-                # Update info display
                 file_name = os.path.basename(file_path)
-                self.update_model_info(file_path)
-                
-                QMessageBox.information(
-                    self,
-                    "Success",
-                    f"Model loaded successfully!\n\nFile: {file_name}"
-                )
+                if self.load_model_in_viewer(file_path):
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"Model loaded successfully!\n\nFile: {file_name}"
+                    )
             else:
                 QMessageBox.warning(self, "Error", "Model viewer not initialized!")
                 
@@ -2317,29 +2319,6 @@ class ModelTab(QWidget):
                 "Error",
                 f"Failed to load model:\n{str(e)}"
             )
-    
-    def update_model_info(self, file_path):
-        """Update model information display."""
-        try:
-            import trimesh
-            mesh = trimesh.load(file_path)
-            
-            info = f"""
-Model Information:
-━━━━━━━━━━━━━━━━━━━━━━━━
-File: {os.path.basename(file_path)}
-Vertices: {len(mesh.vertices):,}
-Faces: {len(mesh.faces):,}
-Bounds: {mesh.bounds}
-Volume: {mesh.volume:.2f}
-Is Watertight: {mesh.is_watertight}
-            """
-            
-            if hasattr(self, 'model_info_text'):
-                self.model_info_text.setPlainText(info.strip())
-                
-        except Exception as e:
-            logger.warning("Error updating model info: %s", e)
     
     def load_model(self, file_path=None):
         """Load a single model file."""
@@ -2450,10 +2429,12 @@ Is Watertight: {mesh.is_watertight}
                     self.painting_tab.set_model(file_path)
             except Exception as e:
                 logger.warning("Error updating features: %s", e)
+            return True
         else:
             self.operation_label.setText("Failed to load model")
             QMessageBox.warning(self, "Load Error", 
                               f"Failed to load model: {os.path.basename(file_path)}")
+            return False
     
     def update_model_info(self, model_info):
         """Update model information display."""
@@ -2490,13 +2471,6 @@ Is Watertight: {mesh.is_watertight}
                 self.tex_specular_label.setText(str(tex_data.get('Specular/Metallic', 0)))
                 self.tex_occlusion_label.setText(str(tex_data.get('Occlusion', 0)))
                 self.tex_emissive_label.setText(str(tex_data.get('Emissive', 0)))
-            
-            tex_data = model_info.get('texture_data', {})
-            self.tex_albedo_label.setText(str(tex_data.get('Albedo', 0)))
-            self.tex_normal_label.setText(str(tex_data.get('Normal', 0)))
-            self.tex_specular_label.setText(str(tex_data.get('Specular/Metallic', 0)))
-            self.tex_occlusion_label.setText(str(tex_data.get('Occlusion', 0)))
-            self.tex_emissive_label.setText(str(tex_data.get('Emissive', 0)))
         else:
             self.vertices_label.setText("-")
             self.faces_label.setText("-")
@@ -3001,48 +2975,6 @@ Is Watertight: {mesh.is_watertight}
                 QMessageBox.information(self, "Export Complete", f"Analysis report exported to {file_path}")
             except Exception as e:
                 QMessageBox.warning(self, "Export Error", f"Failed to export report: {str(e)}")
-    
-    def add_current_to_comparison(self):
-        """Add current model to comparison table."""
-        if not self.current_model_path:
-            QMessageBox.warning(self, "No Model", "Please select a model to add to comparison.")
-            return
-        
-        # Check if model is already in comparison
-        for row in range(self.comparison_table.rowCount()):
-            if self.comparison_table.item(row, 0).text() == os.path.basename(self.current_model_path):
-                QMessageBox.information(self, "Already Added", "This model is already in the comparison table.")
-                return
-        
-        try:
-            # Load and analyze the model
-            mesh_obj = trimesh.load(self.current_model_path)
-            mesh = _as_trimesh(mesh_obj)
-            if mesh is None:
-                QMessageBox.warning(self, "Error", "Could not analyze the current model.")
-                return
-            
-            # Add row to comparison table
-            row_count = self.comparison_table.rowCount()
-            self.comparison_table.insertRow(row_count)
-            
-            # Fill in the data
-            self.comparison_table.setItem(row_count, 0, QTableWidgetItem(os.path.basename(self.current_model_path)))
-            self.comparison_table.setItem(row_count, 1, QTableWidgetItem(f"{len(mesh.vertices):,}"))
-            self.comparison_table.setItem(row_count, 2, QTableWidgetItem(f"{len(mesh.faces):,}"))
-            self.comparison_table.setItem(row_count, 3, QTableWidgetItem(f"{os.path.getsize(self.current_model_path) / (1024*1024):.1f} MB"))
-            
-            # Resize columns to fit content
-            self.comparison_table.resizeColumnsToContents()
-            
-            QMessageBox.information(self, "Added", "Model added to comparison table.")
-            
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to add model to comparison: {str(e)}")
-    
-    def clear_comparison_table(self):
-        """Clear the comparison table."""
-        self.comparison_table.setRowCount(0)
     
     def refresh_library(self):
         """Refresh the model library."""
