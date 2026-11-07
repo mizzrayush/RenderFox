@@ -6,6 +6,7 @@ Provides task scheduling, workflow automation, batch processing, and trigger-bas
 import os
 import time
 import json
+import logging
 import fnmatch
 import calendar
 import subprocess
@@ -18,6 +19,12 @@ import schedule
 import uuid
 
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
+# only reader these threads have: the scheduler loop, the directory watcher and the task/workflow
+# files all run where no pane is attached, and a failure here would otherwise be unrecoverable
+# silence - a task that never ran, or a saved task list that never loaded.
+logger = logging.getLogger(__name__)
 
 
 class TaskStatus(Enum):
@@ -83,7 +90,7 @@ class ActionRegistry:
         cls._param_specs[action_id] = params or {}
         cls._batch_specs[action_id] = tuple(batch) if batch else None
         cls._batch_extensions[action_id] = str(batch_extension or '').strip().lstrip('.').lower()
-        print(f"Registered action: {action_id}")
+        logger.debug("Registered action: %s", action_id)
         
     @classmethod
     def get_action(cls, action_id: str) -> Optional[Callable]:
@@ -944,7 +951,7 @@ class TaskScheduler(QObject):
             else:
                 return False
         except Exception as error:
-            print(f"Could not schedule task {task_id} as {schedule_time!r}: {error}")
+            logger.warning("Could not schedule task %s as %r: %s", task_id, schedule_time, error)
             return False
 
         self.scheduled_tasks[task_id] = job
@@ -986,7 +993,7 @@ class TaskScheduler(QObject):
             try:
                 callback()
             except Exception as error:
-                print(f"Scheduled task {task_id} raised: {error}")
+                logger.warning("Scheduled task %s raised: %s", task_id, error)
         return run
 
     def next_run(self, task_id: str):
@@ -1023,7 +1030,7 @@ class TaskScheduler(QObject):
             try:
                 self._jobs.run_pending()
             except Exception as error:
-                print(f"Scheduler error: {error}")
+                logger.error("Scheduler error: %s", error)
             # Ten short sleeps rather than one long one: stop_scheduler() sets a
             # flag and joins, so a full second of sleep makes every teardown wait.
             for _ in range(10):
@@ -1270,7 +1277,7 @@ class FileWatcher(QObject):
                     for event, path, other in self._diff(info, current):
                         self._report(path, event, other)
                 except Exception as e:
-                    print(f"Error watching directory {directory}: {e}")
+                    logger.warning("Error watching directory %s: %s", directory, e)
 
             time.sleep(self.poll_seconds)
 
@@ -1294,7 +1301,7 @@ class FileWatcher(QObject):
             try:
                 callback(file_path, event)
             except Exception as error:
-                print(f"Watch callback failed for {file_path}: {error}")
+                logger.warning("Watch callback failed for %s: %s", file_path, error)
 
 class WorkflowExecutor:
     """Run a workflow's steps in order, honouring each step's own error policy."""
@@ -1621,7 +1628,7 @@ class AutomationEngine(QObject):
             with open(self._tasks_file(), 'w', encoding='utf-8') as handle:
                 json.dump(data, handle, indent=2)
         except Exception as error:
-            print(f"Could not save tasks: {error}")
+            logger.error("Could not save tasks: %s", error)
 
     def _load_tasks(self):
         """Read the tasks back and put the ones that are due on the scheduler.
@@ -1637,18 +1644,18 @@ class AutomationEngine(QObject):
             with open(path, encoding='utf-8') as handle:
                 data = json.load(handle)
         except Exception as error:
-            print(f"Could not read {path}: {error}")
+            logger.error("Could not read %s: %s", path, error)
             return
 
         if not isinstance(data, list):
-            print(f"Ignoring {path}: expected a list of task records")
+            logger.error("Ignoring %s: expected a list of task records", path)
             return
 
         for record in data:
             try:
                 task = AutomationTask.from_dict(record)
             except Exception as error:
-                print(f"Skipping an unreadable task record: {error}")
+                logger.error("Skipping an unreadable task record: %s", error)
                 continue
             self.tasks[task.task_id] = task
             if task.enabled and task.schedule_time and not self.schedule_task(task.task_id, task.schedule_time):
@@ -2068,7 +2075,7 @@ class AutomationEngine(QObject):
             with open(self._workflows_file(), 'w', encoding='utf-8') as handle:
                 json.dump(data, handle, indent=2)
         except Exception as error:
-            print(f"Could not save workflows: {error}")
+            logger.error("Could not save workflows: %s", error)
 
     def _load_workflows(self):
         """Rebuild saved workflows through `Workflow.from_dict`.
@@ -2087,4 +2094,4 @@ class AutomationEngine(QObject):
             for wid, record in (data or {}).items():
                 self.workflows[wid] = Workflow.from_dict(record)
         except Exception as error:
-            print(f"Could not read workflows from {path}: {error}")
+            logger.error("Could not read workflows from %s: %s", path, error)

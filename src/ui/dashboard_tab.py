@@ -17,7 +17,12 @@ from ..processing.render_engines import DEFAULT_IMAGE_FORMATS, image_format_choi
 from .icon_provider import get_icon
 import json
 import os
+import logging
 from datetime import datetime
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 class AddJobDialog(QDialog):
     """Dialog for adding a new render job."""
@@ -855,7 +860,7 @@ class DashboardTab(QWidget):
                         imported_count += 1
                         
                     except Exception as e:
-                        print(f"Error importing job: {e}")
+                        logger.error("Error importing job: %s", e)
                         continue
                 
                 QMessageBox.information(self, "Import Complete", 

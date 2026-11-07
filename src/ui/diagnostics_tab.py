@@ -24,9 +24,16 @@ from ..features.diagnostic_engine import (
 )
 from ..features.performance_analyzer import BenchmarkRunner, benchmark_engine
 from ..utils.frame_clock import shared_clock
+from ..utils import early_log
 from ..utils.worker import Worker
 from ..utils.run_teardown import drain
 from .icon_provider import get_icon
+
+# What each level the filter combo offers means, for the floor comparison in
+# `_entry_matches_filters`. The pane owns this table because the combo's items are the pane's
+# vocabulary; `logging.getLevelName` goes the other way and has no use for a name it does not
+# know.
+LEVEL_FLOOR = {'DEBUG': 10, 'INFO': 20, 'WARNING': 30, 'ERROR': 40, 'CRITICAL': 50}
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
     """Syntax highlighter for log messages."""
@@ -234,17 +241,18 @@ class DiagnosticsTab(QWidget):
         controls_group = QGroupBox("Log Controls")
         controls_layout = QHBoxLayout()
         
-        # Log level filter
+        # Log level filter. A floor, not an equality: see `_entry_matches_filters`.
         self.log_level_combo = QComboBox()
         self.log_level_combo.addItems(["ALL", "DEBUG", "INFO", "WARNING", "ERROR"])
         self.log_level_combo.setCurrentText("INFO")
         
-        # Component filter
+        # Component filter. The nine names this offered - "3D Viewer", "Model Loader",
+        # "Renderer", "File System", "GPU", "Memory", "UI", "Processing" - matched no emitter:
+        # a record's component is `record.name`, a dotted module path such as
+        # `src.ui.model_viewer`, so choosing any of them filtered to an empty list. The entries
+        # are now the components that have actually written a record this session.
         self.component_filter_combo = QComboBox()
-        self.component_filter_combo.addItems([
-            "All Components", "3D Viewer", "Model Loader", "Renderer", 
-            "File System", "GPU", "Memory", "UI", "Processing"
-        ])
+        self.component_filter_combo.addItem("All Components")
         
         # Search filter
         self.log_search_edit = QLineEdit()
@@ -731,6 +739,13 @@ class DiagnosticsTab(QWidget):
             return
         self._log_handler = PaneLogHandler(self)
         logging.getLogger().addHandler(self._log_handler)
+        # The startup reports written before this pane existed were held by `early_log` instead of
+        # reaching `logging.lastResort`, and are played back here in the order they arrived. Each
+        # row is stamped with the moment the pane read it rather than the moment the event
+        # happened: at startup those are the same second, and the accurate version would need a
+        # timestamp argument `add_log_entry` has no caller for.
+        for record in early_log.take():
+            self._log_handler.emit(record)
         # The handler outlives nothing: as soon as this pane's Qt object is destroyed it
         # is taken off the root logger, because a record arriving afterwards would be
         # delivered to a widget that no longer exists.
@@ -740,7 +755,8 @@ class DiagnosticsTab(QWidget):
         """Add a new log entry."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_text = f"[{timestamp}] {level}: [{component}] {message}"
-        
+
+        self._note_component(component)
         self.log_entries.append({
             'timestamp': timestamp,
             'level': level,
@@ -766,13 +782,41 @@ class DiagnosticsTab(QWidget):
         self.update_log_statistics()
         
         
+    def _note_component(self, component):
+        """Put an emitter this pane has not seen yet into the component filter.
+
+        The choices have to be the components that actually write records, because a choice
+        that matches nothing is not a filter, it is an empty table - which is what the nine
+        names this combo used to ship were, since a record's component is its module path.
+        Signals are blocked on purpose: adding an item is not the user choosing it, and a
+        rebuild per new emitter would repaint the whole log at startup.
+        """
+        combo = self.component_filter_combo
+        for index in range(combo.count()):
+            if combo.itemText(index) == component:
+                return
+        combo.blockSignals(True)
+        combo.addItem(component)
+        combo.blockSignals(False)
+
     def _entry_matches_filters(self, level, component, message):
-        """Check if a log entry matches current filters."""
+        """Check if a log entry matches current filters.
+
+        The level is a floor, not an equality. It used to be `level != target_level`, which
+        made the default of "INFO" a filter that hid every row the app writes: a failure is
+        recorded at WARNING or ERROR, so the one view the pane offers of its own contents was
+        empty by construction, and stayed empty however many rows arrived behind it.
+        """
         # Level filter
         target_level = self.log_level_combo.currentText()
-        if target_level != "ALL" and level != target_level:
-            return False
-            
+        if target_level != "ALL":
+            floor = LEVEL_FLOOR.get(target_level, 0)
+            arrived = LEVEL_FLOOR.get(level)
+            # A level name this table does not know is not ordered against anything, so it
+            # is shown rather than hidden behind a floor it cannot be compared to.
+            if arrived is not None and arrived < floor:
+                return False
+
         # Component filter
         target_component = self.component_filter_combo.currentText()
         if target_component != "All Components" and component != target_component:

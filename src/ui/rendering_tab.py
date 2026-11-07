@@ -11,6 +11,7 @@ Architecture:
 """
 
 import os
+import logging
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTabWidget, QLabel, QFrame, QToolBar, QStatusBar,
@@ -27,6 +28,10 @@ from .rendering.node_graph import NodeGraphWidget
 from ..core.material_data import Material
 from .texture_generator import TextureGeneratorDialog
 from .icon_provider import get_icon
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # STYLES
@@ -292,7 +297,8 @@ class MaterialEditorPanel(BasePanel):
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.information(self, "Texture Applied", f"Applied texture to {slot_name.title()} slot:\n{os.path.basename(file_path)}")
         else:
-            print(f"Error: Slot '{slot_name}' not found in texture_slots: {list(self.texture_slots.keys())}")
+            logger.warning("Error: Slot '%s' not found in texture_slots: %s",
+                           slot_name, list(self.texture_slots.keys()))
 
 class LightingPanel(BasePanel):
     """Panel for Lighting and Environment controls."""
@@ -896,7 +902,7 @@ class RenderingTab(QWidget):
             from ..processing.postprocessor import ImageDenoiser
             done = ImageDenoiser().denoise_image(path, temporary)
         except Exception as error:
-            print(f"Denoising unavailable: {error}")
+            logger.warning("Denoising unavailable: %s", error)
             done = False
         if done and os.path.isfile(temporary):
             os.replace(temporary, path)

@@ -3,12 +3,18 @@ Model extractor for extracting individual models from complex scenes.
 """
 
 import os
+import logging
 import trimesh
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Union, Callable
 from dataclasses import dataclass, field
 from sklearn.cluster import DBSCAN
 import json
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
+# only reader a batch extraction has left: it is the row that says which part was refused and
+# why, when the pane's own table only counted what arrived.
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ExtractedModel:
@@ -490,7 +496,7 @@ class ModelExtractor:
             return True
             
         except Exception as e:
-            print(f"Failed to export report: {str(e)}")
+            logger.warning("Failed to export report: %s", e)
             return False
     
     def analyze_extraction_quality(self, original_mesh: trimesh.Trimesh, 
@@ -562,17 +568,19 @@ def batch_extract_models(input_directory: str, output_directory: str,
             verdict = extractor.export_selected_models(models, file_output_dir, ".obj")
             results[file_path] = verdict['exported']
             for name, reason in verdict['failed']:
-                print(f"! {filename}: {name} was not written - {reason}")
+                logger.warning("%s: %s was not written - %s", filename, name, reason)
             
             # Export extraction report
             report_path = os.path.join(file_output_dir, "extraction_report.json")
             extractor.export_extraction_report(models, report_path)
             
-            print(f"Extracted {len(models)} models from {filename} "
-                  f"({len(verdict['exported'])} written, {len(verdict['failed'])} refused)")
+            logger.info("Extracted %d models from %s "
+                        "(%d written, %d refused)",
+                        len(models), filename,
+                        len(verdict['exported']), len(verdict['failed']))
             
         except Exception as e:
-            print(f"Failed to extract from {filename}: {str(e)}")
+            logger.warning("Failed to extract from %s: %s", filename, e)
             results[file_path] = []
     
     return results

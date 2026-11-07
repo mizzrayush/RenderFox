@@ -21,10 +21,22 @@ The viewer has two export methods and the two panes call different ones, so `Exp
 written twice and corrected once; the entries put the line back in the one that was missed, and
 put back the two refusals that answered `False` while the pane's copy promised a row.
 
+The 51 entries below are of three kinds, because the phase ended up being three things. One group
+puts a report back into the closed stream, or takes one out of the channel. Another breaks the
+*instrument* - `tools/check_stdout_quiet.py` - since a rule nobody can break is not evidence:
+rules 5 and 6 are each bypassed at their own filter, at their constant, and at the line that
+reports a finding, rule 4's hand-run exemption is widened until it reaches a function body, one of
+its exemptions is left matching nothing, and the summary line is made to count two rules into keys
+it never builds. Thirteen land on the sweep's own judgement rather than on its arithmetic: they
+change the *level* a record carries, drop one of its arguments, put a glyph back in a sentence,
+hide a row behind the table's level filter or a component name no module has ever emitted, or move
+`early_log.install()`, its drain and the two `setLevel` calls in `main.py` - and every one of those
+is caught by a test that reads the level, the formatted row or the startup order, not by the checker.
+
 Run:
     python -X utf8 tools/mutation_check.py tests/test_stdout_quiet_contract.py \
         tools/mutations_stdout_quiet.py
-( twenty-six entries )
+( 51 entries )
 """
 
 MV = 'src/ui/model_viewer.py'
@@ -33,6 +45,11 @@ RT = 'src/ui/rendering_tab.py'
 MP = 'main.py'
 MW = 'src/ui/main_window.py'
 DG = 'src/ui/diagnostics_tab.py'
+EL = 'src/utils/early_log.py'
+WK = 'src/utils/worker.py'
+TB = 'src/processing/texture_baker.py'
+AE = 'src/features/automation_engine.py'
+AT = 'src/features/ai_asset_tagger.py'
 CK = 'tools/check_stdout_quiet.py'
 
 MUTATIONS = [
@@ -238,5 +255,209 @@ MUTATIONS = [
         'replace': '                pass',
         'expect': 'test_11_a_logger_that_was_never_bound_is_reported',
         'note': 'rule 3 walks the whole tree, finds everything and reports nothing',
+    },
+
+    # ---- the sweep: a record at the wrong level is a different sentence ------------------------
+    {
+        'file': WK,
+        'find': '            logger.error("%s failed: %s", getattr(self.fn, \'__name__\', repr(self.fn)), text)',
+        'replace': '            logger.warning("%s failed: %s", getattr(self.fn, \'__name__\', repr(self.fn)), text)',
+        'expect': 'test_56_a_report_is_written_at_the_level_its_sentence_claims',
+        'note': 'a task that ended in its except arm is reported as one the app answered; the '
+                'tree stays clean, so only the level pin can see this',
+    },
+    {
+        'file': TB,
+        'find': '            logger.error("Baking failed: %s", e)',
+        'replace': '            logger.warning("Baking failed: %s", e)',
+        'expect': 'test_56_a_report_is_written_at_the_level_its_sentence_claims',
+        'note': 'the batch records a map it did not write and calls that a refusal',
+    },
+    {
+        'file': AE,
+        'find': '        logger.debug("Registered action: %s", action_id)',
+        'replace': '        logger.info("Registered action: %s", action_id)',
+        'expect': 'test_56_a_report_is_written_at_the_level_its_sentence_claims',
+        'note': 'per-item chatter moves above the floor, so every action the start registers '
+                'becomes a row in the table a failure is meant to stand out in',
+    },
+    {
+        'file': MV,
+        'find': '            logger.warning("Model export to %s failed: %s", file_path, e)',
+        'replace': '            logger.warning("Model export to %s failed: %s", file_path)',
+        'expect': 'test_24_a_failed_export_names_the_file_and_still_answers',
+        'note': 'one slot left empty: `logging` raises while formatting the record and the row '
+                'never arrives, which is the failure the checker\'s rule 5a reads for',
+    },
+    {
+        'file': AT,
+        'find': '                    logger.info("Local CLIP model loaded successfully!")',
+        'replace': '                    logger.info("\u2705 Local CLIP model loaded successfully!")',
+        'expect': 'test_43_the_counts_are_measured_against_emitters_the_tree_has',
+        'note': 'the status glyph the sweep took out of fourteen sentences goes back into one, '
+                'and the report line that counts them stops being zero',
+    },
+
+    # ---- the table a record arrives at ---------------------------------------------------------
+    {
+        'file': DG,
+        'find': '            if arrived is not None and arrived < floor:',
+        'replace': '            if arrived is not None and arrived != floor:',
+        'expect': 'test_45_a_warning_is_visible_under_the_default_level',
+        'note': 'the floor becomes an equality again against its own INFO default, so every '
+                'WARNING and ERROR row is stored and displayed as nothing',
+    },
+    {
+        'file': DG,
+        'find': '        self.component_filter_combo.addItem("All Components")',
+        'replace': '        self.component_filter_combo.addItems(["All Components", "Renderer"])',
+        'expect': 'test_47_the_component_list_offers_only_emitters_that_wrote',
+        'note': 'one of the nine names no module has ever emits is back on the list, where '
+                'choosing it is one click away from an empty table',
+    },
+    {
+        'file': DG,
+        'find': '        for record in early_log.take():',
+        'replace': '        for record in []:',
+        'expect': 'test_52_a_pane_shows_what_was_held_before_it_existed',
+        'note': 'the queue is filled at startup and never read, which is a quieter way of '
+                'losing the same five reports than writing them to stderr',
+    },
+
+    # ---- the records written before the pane exists ---------------------------------------------
+    {
+        'file': EL,
+        'find': '        if len(_records) < EARLY_LIMIT:',
+        'replace': '        if True:',
+        'expect': 'test_51_the_buffer_stops_at_its_cap_and_keeps_the_earliest',
+        'note': 'a startup that fails in a loop grows a list nothing will ever read',
+    },
+    {
+        'file': EL,
+        'find': '    del _records[:]',
+        'replace': '    pass',
+        'expect': 'test_50_the_held_records_come_back_oldest_first_and_only_once',
+        'note': 'the buffer is peeked at instead of drained, so the second pane shows the first '
+                'pane\'s startup and every pane after it shows it again',
+    },
+    {
+        'file': EL,
+        'find': '    if any(isinstance(handler, EarlyLogHandler) for handler in root.handlers):',
+        'replace': '    if False:',
+        'expect': 'test_49_a_second_install_adds_no_second_queue',
+        'note': 'a second main() in one process stacks a queue in front of the first, and each '
+                'record is now held twice',
+    },
+    {
+        'file': MP,
+        'find': '    early_log.install()',
+        'replace': '    pass  # early_log.install()',
+        'expect': 'test_59_the_queue_is_installed_before_main_reports_or_levels_anything',
+        'note': 'the entry point opens with something else, so the icon, splash and registration '
+                'reports go back to the stream the package closes',
+    },
+    {
+        'file': MP,
+        'find': "    logging.getLogger('src').setLevel(logging.INFO)",
+        'replace': '    logging.getLogger().setLevel(logging.INFO)',
+        'expect': 'test_58_main_opens_its_own_two_namespaces_and_nobody_elses',
+        'note': 'the floor moves onto the root logger, so every dependency in the process can '
+                'write rows into a table capped at 10,000',
+    },
+
+    # ---- the instrument, part two: rules 4, 5 and 6 --------------------------------------------
+    {
+        'file': CK,
+        'find': '        if want != have:',
+        'replace': '        if False and want != have:',
+        'expect': 'test_35_a_message_and_its_arguments_that_disagree_are_reported',
+        'note': 'rule 5a compares the two numbers and then refuses to say anything about it',
+    },
+    {
+        'file': CK,
+        'find': "        want = len([m for m in FORMAT_SLOT.finditer(text) if m.group('type')])",
+        'replace': '        want = len(list(FORMAT_SLOT.finditer(text)))',
+        'expect': 'test_37_a_literal_percent_is_not_counted_as_a_slot',
+        'note': 'the escape stops being an escape, so `(%.1f%% reduction)` counts three slots where '
+                'it has two and the correct LOD row is reported as a broken one',
+    },
+    {
+        'file': CK,
+        'find': '        if call and call[1]:',
+        'replace': '        if False and call[1]:',
+        'expect': 'test_39_a_record_written_on_the_root_logger_is_reported',
+        'note': 'rule 5b finds the root call and drops it, so every row those three sites write '
+                'is named `root` and cannot be filtered',
+    },
+    {
+        'file': CK,
+        'find': '        return func.attr, False',
+        'replace': '        return func.attr, True',
+        'expect': 'test_40_the_same_call_through_a_module_logger_keeps_its_name',
+        'note': 'a module logger becomes the root logger, so every emitter in the app is reported '
+                'as a defect - which is how a rule that cries wolf ends up switched off',
+    },
+    {
+        'file': CK,
+        'find': '        for text in _message_literals(node):',
+        'replace': '        for text in []:',
+        'expect': 'test_41_a_glyph_written_into_a_record_is_reported',
+        'note': 'rule 6 walks the tree, asks for a message it never reads and finds none',
+    },
+    {
+        'file': CK,
+        'find': "NON_ASCII = re.compile(r'[^\\x00-\\x7f]')",
+        'replace': "NON_ASCII = re.compile(r'^\\s*[^\\x00-\\x7f]')",
+        'expect': 'test_41_a_glyph_written_into_a_record_is_reported',
+        'note': 'the rule reads the first character of the sentence, which is where none of the '
+                'fourteen real ones were',
+    },
+    {
+        'file': CK,
+        'find': '        if in_main_guard:',
+        'replace': '        if False and in_main_guard:',
+        'expect': 'test_31_a_write_inside_a_hand_run_block_is_not_reported',
+        'note': 'the exemption stops applying, and a rule that reports a developer\'s own smoke '
+                'test is a rule somebody turns off',
+    },
+    {
+        'file': CK,
+        'find': '    for node in tree.body:',
+        'replace': '    for node in ast.walk(tree):',
+        'expect': 'test_32_a_guard_written_inside_a_function_is_not_a_hand_run_block',
+        'note': 'the hand-run block is found anywhere in the file, so a guard in a function body '
+                'exempts a write the packaged app can reach',
+    },
+    {
+        'file': CK,
+        'find': '        if entry[0] in walked and entry not in used:',
+        'replace': '        if False and entry not in used:',
+        'expect': 'test_33_an_exemption_that_matches_no_write_is_itself_reported',
+        'note': 'an exemption nobody needs any more is never noticed, and the rule it covers is '
+                'silently gone',
+    },
+    {
+        'file': CK,
+        'find': "              'unformattable': 0, 'root-logger': 0, 'glyph-in-record': 0}",
+        'replace': "              'unformattable': 0}",
+        'expect': 'test_02_the_strict_run_exits_zero_and_says_so',
+        'note': 'the report counts two of its six rules into a key it never makes, so the run '
+                'dies before it prints a single number',
+    },
+    {
+        'file': CK,
+        'find': "LEVEL_CALLS = frozenset({'debug', 'info', 'warning', 'error', 'critical', 'exception', 'log'})",
+        'replace': "LEVEL_CALLS = frozenset({'debug', 'info', 'error', 'critical', 'exception', 'log'})",
+        'expect': 'test_39_a_record_written_on_the_root_logger_is_reported',
+        'note': 'the busiest level in the app is not a log call, so rules 5 and 6 read 103 of '
+                'the 239 records as ordinary code',
+    },
+    {
+        'file': CK,
+        'find': '            elif any(key[0] == rel and key[1] in text for key in VISIBLE_WRITES):',
+        'replace': '            elif False:',
+        'expect': 'test_34_the_writes_the_report_splits_add_up_to_the_writes_it_walked',
+        'note': 'the arithmetic line the report prints stops reconciling, which is how a summary '
+                'figure drifts from the rows under it',
     },
 ]

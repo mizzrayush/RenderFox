@@ -765,7 +765,7 @@ class ModelViewer3D(QOpenGLWidget):
             return True
             
         except Exception as e:
-            print(f"Error loading model: {str(e)}")
+            logger.warning("Error loading model: %s", str(e))
             return False
     
     def _load_obj_vertex_colors(self, file_path: str, expected_vertices: int) -> np.ndarray:
@@ -842,7 +842,7 @@ class ModelViewer3D(QOpenGLWidget):
             return None
             
         except Exception as e:
-            print(f"Error reading OBJ vertex colors: {e}")
+            logger.warning("Error reading OBJ vertex colors: %s", e)
             return None
             
     def export_scene(self, output_path: str, material_data: dict = None) -> bool:
@@ -917,7 +917,8 @@ class ModelViewer3D(QOpenGLWidget):
                     profile_mask = int(pm[0] if isinstance(pm, (list, tuple, np.ndarray)) else pm)
                 except Exception:
                     pass
-                print(f"OpenGL Info -> Version: {version_s}, Renderer: {renderer_s}, Vendor: {vendor_s}, ProfileMask: 0x{profile_mask:08X}")
+                logger.info("OpenGL Info -> Version: %s, Renderer: %s, Vendor: %s, ProfileMask: 0x%08X",
+                            version_s, renderer_s, vendor_s, profile_mask)
             except Exception:
                 pass
 
@@ -951,7 +952,7 @@ class ModelViewer3D(QOpenGLWidget):
             self.gl_ready = self.shader_program is not None
             
         except Exception as e:
-            print(f"initializeGL failed: {e}")
+            logger.warning("initializeGL failed: %s", e)
             self.gl_ready = False
         self.pending_model_path = None
 
@@ -1194,19 +1195,19 @@ class ModelViewer3D(QOpenGLWidget):
         try:
             self.shader_program = QOpenGLShaderProgram()
             if not self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, vertex_shader):
-                print("Vertex shader compile failed:", self.shader_program.log())
+                logger.warning("Vertex shader compile failed: %s", self.shader_program.log())
                 self.shader_program = None
                 return
             if not self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, fragment_shader):
-                print("Fragment shader compile failed:", self.shader_program.log())
+                logger.warning("Fragment shader compile failed: %s", self.shader_program.log())
                 self.shader_program = None
                 return
             if not self.shader_program.link():
-                print("Shader link failed:", self.shader_program.log())
+                logger.warning("Shader link failed: %s", self.shader_program.log())
                 self.shader_program = None
                 return
         except Exception as e:
-            print(f"Shader compilation exception: {e}")
+            logger.warning("Shader compilation exception: %s", e)
             self.shader_program = None
     
     def paintGL(self):
@@ -1857,7 +1858,7 @@ class ModelViewer3D(QOpenGLWidget):
         try:
             img_data = self._read_texture_file(file_path)
         except Exception as e:
-            print(f"Failed to load texture: {file_path} ({e})")
+            logger.warning("Failed to load texture: %s (%s)", file_path, e)
             return
         if not self.isValid() or not self.gl_ready:
             return
@@ -1866,7 +1867,7 @@ class ModelViewer3D(QOpenGLWidget):
             texture_id = self._load_gl_texture(img_data)
             
             if texture_id is None:
-                print(f"Failed to load texture: {file_path}")
+                logger.warning("Failed to load texture: %s", file_path)
                 return
                 
             self.makeCurrent()
@@ -1896,7 +1897,7 @@ class ModelViewer3D(QOpenGLWidget):
             self.update()
             
         except Exception as e:
-            print(f"Error setting material texture: {e}")
+            logger.warning("Error setting material texture: %s", e)
 
     def set_render_mode(self, mode: str):
         """Set render mode."""
@@ -1970,7 +1971,7 @@ class ModelViewer3D(QOpenGLWidget):
             # Load image using QImage
             image = QImage(file_path)
             if image.isNull():
-                print(f"Failed to load environment map: {file_path}")
+                logger.warning("Failed to load environment map: %s", file_path)
                 return
                 
             image = image.convertToFormat(QImage.Format.Format_RGBA8888)
@@ -1987,7 +1988,7 @@ class ModelViewer3D(QOpenGLWidget):
             self.update()
             
         except Exception as e:
-            print(f"Error loading environment map: {e}")
+            logger.warning("Error loading environment map: %s", e)
 
     def create_skybox_geometry(self):
         """Create a large cube for the skybox."""
@@ -2242,7 +2243,7 @@ class ModelViewer3D(QOpenGLWidget):
                 if not self.isValid():
                     return
             except Exception as e:
-                print(f"Error checking viewer validity: {e}")
+                logger.warning("Error checking viewer validity: %s", e)
                 return
                 
             self.makeCurrent()
@@ -2597,7 +2598,7 @@ class ModelViewerWidget(QWidget):
             self.viewer_3d.model_loaded.connect(self.update_model_info)
             self._using_fallback = True
         except Exception as e:
-            print(f"Failed to switch to fallback viewer: {e}")
+            logger.error("Failed to switch to fallback viewer: %s", e)
     
     def update_model_info(self, info: dict):
         """Update model information display."""
@@ -2618,7 +2619,7 @@ class ModelViewerWidget(QWidget):
             self.info_label.setText("No model loaded")
             self.cleared.emit()
         except Exception as e:
-            print(f"Viewer clear failed: {e}")
+            logger.error("Viewer clear failed: %s", e)
 
 
     def apply_color(self, mesh_idx: int, vert_idx: int, color: list, radius: float, mode: str = "Mix"):

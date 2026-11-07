@@ -5,6 +5,7 @@ Provides a static preview with an option to launch a full interactive window.
 """
 
 import os
+import logging
 import numpy as np
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QFrame, QSizePolicy, QProgressBar)
@@ -18,6 +19,10 @@ try:
     OPEN3D_AVAILABLE = True
 except ImportError:
     OPEN3D_AVAILABLE = False
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 class PreviewWorker(SafeWorker):
     """Background worker to render the Open3D preview to an image."""
@@ -58,7 +63,7 @@ class PreviewWorker(SafeWorker):
                         # Point cloud or other
                         vis.add_geometry(geom)
                 except Exception as e:
-                    print(f"Wireframe conversion failed: {e}")
+                    logger.warning("Wireframe conversion failed: %s", e)
                     vis.add_geometry(geom)
             else:
                 # Solid Mode
@@ -250,7 +255,7 @@ class UnifiedOpen3DViewer(QWidget):
                 self.add_geometry(cloud)
                 return True
         except Exception as e:
-            print(f"Failed to load {file_path}: {e}")
+            logger.warning("Failed to load %s: %s", file_path, e)
         return False
 
     def fit_to_view(self):
@@ -348,7 +353,7 @@ class UnifiedOpen3DViewer(QWidget):
         try:
             run_vis()
         except Exception as e:
-            print(f"Interactive viewer error: {e}")
+            logger.warning("Interactive viewer error: %s", e)
 
     def set_point_size(self, size):
         self.current_settings['point_size'] = float(size)

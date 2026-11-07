@@ -13,9 +13,14 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication
 import os
 import json
+import logging
 from ..core.models import SoftwareConfiguration, SoftwareType, AppSettings
 from .icon_provider import get_icon
 from .styles import AVAILABLE_THEMES, get_theme_stylesheet, MODERN_DARK_THEME, MODERN_LIGHT_THEME, MODERN_MIDNIGHT_THEME
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 class SettingsTab(QWidget):
     """Enhanced settings tab with comprehensive configuration options."""
@@ -906,7 +911,7 @@ class SettingsTab(QWidget):
                 with open(self.CONFIG_FILE, 'r') as f:
                     settings_data = json.load(f)
             except Exception as e:
-                print(f"Error loading config.json: {e}")
+                logger.error("Error loading config.json: %s", e)
         
         # Load Software Settings
         software_settings = settings_data.get("software", {})
@@ -1147,7 +1152,7 @@ class SettingsTab(QWidget):
             from ..utils.telemetry import get_telemetry
             get_telemetry().update_settings()
         except Exception as e:
-            print(f"Failed to update telemetry settings: {e}")
+            logger.warning("Failed to update telemetry settings: %s", e)
     
     def export_settings(self):
         """Export settings to a JSON file."""
@@ -1361,7 +1366,7 @@ class SettingsTab(QWidget):
             self.theme_changed.emit(theme_name)
             
         except Exception as e:
-            print(f"Error applying theme: {e}")
+            logger.warning("Error applying theme: %s", e)
     
     def apply_dark_theme(self, app):
         """Apply dark theme stylesheet."""
@@ -1390,4 +1395,4 @@ class SettingsTab(QWidget):
             app.setFont(font)
             
         except Exception as e:
-            print(f"Error applying font size: {e}")
+            logger.warning("Error applying font size: %s", e)

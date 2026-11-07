@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import hashlib
+import logging
 import uuid
 import threading
 import time
@@ -14,6 +15,11 @@ from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from .models import Priority, RenderJob, JobStatus, SoftwareType
 from ..processing.render_engines import (create_render_engine, detect_available_software,
                                          _get_user_configured_path)
+
+# The one report channel the packaged build has: `diagnostics_tab.setup_logging` puts a
+# PaneLogHandler on the root logger, and every record that reaches it becomes a row. A write
+# to stdout is not a report there - `RenderFox.spec` builds the app with `console=False`.
+logger = logging.getLogger(__name__)
 
 # `Priority` is an Enum of strings, which has no order of its own; the queue needs
 # one, and it is this table rather than the declaration order so that adding a
@@ -224,11 +230,11 @@ class JobManager(QObject):
             try:
                 engine.resume()
             except Exception as e:
-                print(f"Error waking paused job {job.id}: {e}")
+                logger.warning("Error waking paused job %s: %s", job.id, e)
         try:
             engine.stop()
         except Exception as e:
-            print(f"Error stopping render engine: {e}")
+            logger.warning("Error stopping render engine: %s", e)
 
     def pause_job(self, job_id: str) -> bool:
         """Pause one job's renderer, leaving the others alone."""
@@ -245,7 +251,7 @@ class JobManager(QObject):
             self.job_updated.emit(job)
             return True
         except Exception as e:
-            print(f"Error pausing job: {e}")
+            logger.warning("Error pausing job: %s", e)
             return False
 
     def resume_job(self, job_id: str) -> bool:
@@ -263,7 +269,7 @@ class JobManager(QObject):
             self.job_updated.emit(job)
             return True
         except Exception as e:
-            print(f"Error resuming job: {e}")
+            logger.warning("Error resuming job: %s", e)
             return False
     
     def _swap_in_queue(self, job_id: str, offset: int) -> bool:
@@ -458,7 +464,7 @@ class JobManager(QObject):
             job.progress = 0
             self._hold_after_failure = policy['pause_on_error']
             self.job_updated.emit(job)
-            print(f"Error processing job {job.id}: {error}")
+            logger.warning("Error processing job %s: %s", job.id, error)
 
         finally:
             self._release(job, engine)
@@ -506,7 +512,7 @@ class JobManager(QObject):
             try:
                 engine.cleanup()
             except Exception as error:
-                print(f"Error cleaning up render engine: {error}")
+                logger.warning("Error cleaning up render engine: %s", error)
         with self._lock:
             self._running.pop(job.id, None)
             self._workers.pop(job.id, None)
@@ -534,7 +540,7 @@ class JobManager(QObject):
             self._cache_timestamp = current_time
             self._cache_stamp = stamp
         except Exception as e:
-            print(f"Error detecting available software: {e}")
+            logger.warning("Error detecting available software: %s", e)
             # Return empty dict if detection fails
             self._available_software_cache = {}
         
@@ -583,7 +589,7 @@ class JobManager(QObject):
             return None
             
         except Exception as e:
-            print(f"Error getting executable path for {software_type}: {e}")
+            logger.warning("Error getting executable path for %s: %s", software_type, e)
             return None
 
     def _update_progress(self) -> None:

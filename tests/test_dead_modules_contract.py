@@ -21,7 +21,10 @@ other claim in this file; that its second question, the word search that decides
 reads the files it lists and skips the file it was asked about; that the walk really reaches the
 panes the app shows - an instrument that silently reached nothing would otherwise pass everything
 after it; that its resolver answers absolute, one-dot and two-dot imports the way the interpreter
-does; that `get_temp_directory` creates the folder it names and is idempotent, because four modules
+does, and that a module named *after* the word `import` - `from src.utils import early_log` - is
+reached by the file that names it, which is an edge the first draft of the walk could not see and
+reported instead as a dead file; that `get_temp_directory` creates the folder it names and is
+idempotent, because four modules
 now lean on one answer instead of each keeping a copy; that `src/utils/file_utils.py` has exactly
 one public name and the 22 functions and one class it carried are gone; that the Painting feature
 the deleted `weight_painting_tab.py` was a second copy of is still on screen, tab label and all,
@@ -234,6 +237,55 @@ class WalkAndDeletionContract(unittest.TestCase):
             self.assertIn(caller, hits, f'the word search missed {caller}: {hits}')
         self.assertNotIn('src/utils/file_utils.py', hits,
                          'a file was credited with naming the definition it holds')
+
+    def test_19_a_module_named_after_import_rather_than_before_it_is_live(self):
+        # `from src.utils import early_log` puts the package before `import` and the file after
+        # it, so a walk that reads only the part before `import` arrives at `src.utils` - a
+        # package whose file is `__init__.py` - and reports the module as dead. That is the same
+        # mistake this whole checker was written to stop, made in the other direction: the grep
+        # that could not see a relative import, now the graph that cannot see a package import.
+        # Two planted files answer it in both directions, because a walk that simply reached
+        # everything would pass the first half. The target's name is the same one test_15 plants,
+        # reached here through the importer rather than left orphaned, and it stays spelled in
+        # pieces: this file writing the whole word would be the thing that made it look named.
+        target = os.path.join(ROOT, 'src', 'utils', DEAD_TAIL + '.py')
+        importer = os.path.join(ROOT, 'src', 'utils', '_probe' + '_pkg_importer.py')
+        for path in (importer, target):
+            self.assertFalse(os.path.exists(path), f'an earlier run left {path} behind')
+        with open(target, 'w', encoding='utf-8') as handle:
+            handle.write('MARKER = 1\n')
+        self.addCleanup(os.remove, target)
+        with open(importer, 'w', encoding='utf-8') as handle:
+            handle.write(f'from src.utils import {DEAD_TAIL}\n'
+                         'from src.utils.file_utils import get_temp_directory\n')
+        self.addCleanup(os.remove, importer)
+
+        main = Path(ROOT) / 'main.py'
+        _, reached_alone, _ = checker.collect([main])
+        self.assertNotIn(f'src.utils.{DEAD_TAIL}', reached_alone,
+                         'the walk invented an edge from a file nothing imports')
+
+        _, reached_with_root, _ = checker.collect([main, Path(importer)])
+        self.assertIn(f'src.utils.{DEAD_TAIL}', reached_with_root,
+                      'a module named after `import` was not reached by the file that imports it')
+
+        # The two edges above are read at the graph; these are read at the statement, which is
+        # where the resolved base has to be right. The second is the form this app's panes use -
+        # a relative import of a package - and hanging the alias off the importing file's own
+        # package instead of the resolved base would still reach the first one.
+        self.assertIn(f'src.utils.{DEAD_TAIL}', checker.imports_of(Path(importer)))
+        self.assertIn('src.utils.early_log',
+                      checker.imports_of(Path(ROOT) / 'src' / 'ui' / 'diagnostics_tab.py'))
+
+        src_modules, _, _ = checker.collect([main])
+        self.assertNotIn('src.utils.file_utils.get_temp_directory', src_modules,
+                         'a function name offered as a module became a module the walk could reach')
+
+        # And the form the app itself uses: `early_log` is imported by `main.py` at module scope
+        # and by the Diagnostics pane relatively, with neither file's path in the statement.
+        self.assertIn('src.utils.early_log', src_modules)
+        self.assertIn('src.utils.early_log', reached_alone,
+                      'the startup buffer the entry point installs is reported as a dead file')
 
 
 class TempFolderContract(unittest.TestCase):

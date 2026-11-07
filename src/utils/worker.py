@@ -1,6 +1,13 @@
+import logging
 import sys
 import traceback
 from PyQt6.QtCore import QRunnable, pyqtSlot, QObject, pyqtSignal
+
+# The packaged build has no console (`RenderFox.spec`: console=False), and this is the one
+# place every `Worker` run lands when the function it wraps raises. The `error` signal below
+# is still what a pane connects to; this record is what the Diagnostics table gets when
+# nothing is connected to it.
+logger = logging.getLogger(__name__)
 
 class WorkerSignals(QObject):
     """
@@ -53,9 +60,13 @@ class Worker(QRunnable):
         try:
             result = self.fn(*self.args, **self.kwargs)
         except:
-            traceback.print_exc()
             exctype, value = sys.exc_info()[:2]
-            self.signals.error.emit((exctype, value, traceback.format_exc()))
+            # One traceback, read twice: the record the Diagnostics pane turns into a row, and
+            # the tuple a connected pane catches. The write this replaces went to the stream the
+            # build has no reader for and formatted the same traceback a second time.
+            text = traceback.format_exc()
+            logger.error("%s failed: %s", getattr(self.fn, '__name__', repr(self.fn)), text)
+            self.signals.error.emit((exctype, value, text))
         else:
             self.signals.result.emit(result)  # Return the result of the processing
         finally:

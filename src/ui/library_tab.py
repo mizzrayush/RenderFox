@@ -5,6 +5,7 @@ Library tab for centralized model management with database support.
 import os
 import json
 import datetime
+import logging
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QTreeWidget, QTreeWidgetItem, QLineEdit, QPushButton, 
                              QComboBox, QLabel, QGroupBox, QFormLayout, QTextEdit,
@@ -22,6 +23,10 @@ from src.ui.icon_provider import get_icon
 # Import our library manager
 from src.core.library_manager import LibraryManager, LibraryScannerWorker, SearchQuery
 from ..utils.run_teardown import drain_attributes
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 class ModelCard(QFrame):
     """Visual card widget for displaying a model in grid view."""
@@ -1324,7 +1329,7 @@ class LibraryTab(QWidget):
                     # Final fallback - return empty list
                     return []
         except Exception as e:
-            print(f"Error getting models with {method_name}: {e}")
+            logger.warning("Error getting models with %s: %s", method_name, e)
             # Return basic models list as fallback
             try:
                 return self.library.get_models() if hasattr(self.library, 'get_models') else []
@@ -1720,7 +1725,7 @@ class LibraryTab(QWidget):
             with open(file_path, 'w') as f:
                 json.dump(searches, f, indent=4)
         except Exception as e:
-            print(f"Error saving search: {e}")
+            logger.error("Error saving search: %s", e)
 
     def _load_searches_from_file(self):
         """Load searches from file."""
@@ -1733,7 +1738,7 @@ class LibraryTab(QWidget):
             with open(file_path, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Error loading searches: {e}")
+            logger.error("Error loading searches: %s", e)
             return {}
 
     def refresh_saved_searches_list(self):
@@ -2264,7 +2269,7 @@ class LibraryTab(QWidget):
                     )
                     success_count += 1
                 except Exception as e:
-                    print(f"Failed to generate thumbnail for {file_path}: {e}")
+                    logger.warning("Failed to generate thumbnail for %s: %s", file_path, e)
             
             progress.close()
             

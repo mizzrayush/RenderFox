@@ -12,6 +12,10 @@ import uuid
 from datetime import datetime
 from PyQt6.QtCore import QObject, QSettings
 
+# The packaged build has no console (`RenderFox.spec`: console=False): the line this module
+# used to print on a failed write was written where nobody could read it.
+logger = logging.getLogger(__name__)
+
 class TelemetryManager(QObject):
     """Manages application telemetry and logging."""
     
@@ -68,8 +72,10 @@ class TelemetryManager(QObject):
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(event_data) + "\n")
         except Exception as e:
-            # Fail silently to not disrupt user experience
-            print(f"Telemetry error: {e}")
+            # Nothing reaches the user's screen from here: the write is recorded on the log
+            # channel and the event is dropped. It used to be printed to a stream the packaged
+            # build does not have, which was silent in a way that could not be read.
+            logger.warning("Telemetry error: %s", e)
 
     def track_error(self, error_type, message, stack_trace=None):
         """Log an error event."""

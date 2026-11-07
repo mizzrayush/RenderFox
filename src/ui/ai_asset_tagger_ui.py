@@ -102,9 +102,9 @@ class AIAssetTaggerUI(QWidget):
     def _show_ai_status(self):
         """Show status message about AI model availability."""
         if self.tagger.use_clip:
-            logger.info("✅ AI tagging enabled with CLIP model")
+            logger.info("AI tagging enabled with CLIP model")
         else:
-            logger.warning("⚠️ AI tagging disabled - using geometric analysis only")
+            logger.warning("AI tagging disabled - using geometric analysis only")
     
     def init_ui(self):
         """Initialize the user interface."""

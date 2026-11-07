@@ -33,6 +33,13 @@ from typing import List, Dict, Tuple, Optional, Callable
 import logging
 from PIL import Image
 
+# The named logger, so a record this module writes carries `src.features.ai_asset_tagger` in the
+# Diagnostics component column instead of `root`. It is bound before the CLIP probe below only so
+# the sentence there is attributable; that probe runs at import, before `setup_logging` puts the
+# pane's handler on the root logger, so the row is dropped today whatever level it carries. The
+# pane's own status line (`ai_asset_tagger_ui._show_ai_status`) is the version a user can read.
+logger = logging.getLogger(__name__)
+
 # CLIP Model imports (NEW!)
 try:
     from transformers import CLIPProcessor, CLIPModel
@@ -40,9 +47,7 @@ try:
     CLIP_AVAILABLE = True
 except ImportError:
     CLIP_AVAILABLE = False
-    logging.warning("CLIP not available. Install with: pip install transformers torch")
-
-logger = logging.getLogger(__name__)
+    logger.warning("CLIP not available. Install with: pip install transformers torch")
 
 
 class AIAssetTagger:
@@ -79,7 +84,7 @@ class AIAssetTagger:
     def _initialize_clip_model(self):
         """Initialize CLIP model for AI-powered tagging."""
         try:
-            logger.info("🤖 Loading CLIP model (this may take a minute)...")
+            logger.info("Loading CLIP model (this may take a minute)...")
             
             # Use GPU if available, else CPU
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -116,32 +121,32 @@ class AIAssetTagger:
             model_name = "openai/clip-vit-base-patch32"
             
             if local_path:
-                logger.info(f"📂 Loading local CLIP model from: {local_path}")
+                logger.info(f"Loading local CLIP model from: {local_path}")
                 try:
                     # Try loading from local path
                     self.clip_model = CLIPModel.from_pretrained(local_path).to(self.device)
                     self.clip_processor = CLIPProcessor.from_pretrained(local_path)
-                    logger.info("✅ Local CLIP model loaded successfully!")
+                    logger.info("Local CLIP model loaded successfully!")
                 except Exception as local_e:
                     logger.error(f"Failed to load local model: {local_e}")
-                    logger.info("⬇️ Falling back to downloading from Hugging Face...")
+                    logger.info("Falling back to downloading from Hugging Face...")
                     self.clip_model = CLIPModel.from_pretrained(model_name).to(self.device)
                     self.clip_processor = CLIPProcessor.from_pretrained(model_name)
             else:
                 # Download from Hub
-                logger.info(f"⬇️ Downloading CLIP model: {model_name}")
+                logger.info(f"Downloading CLIP model: {model_name}")
                 self.clip_model = CLIPModel.from_pretrained(model_name).to(self.device)
                 self.clip_processor = CLIPProcessor.from_pretrained(model_name)
             
             # Set to evaluation mode
             self.clip_model.eval()
             
-            logger.info("✅ CLIP model loaded successfully!")
+            logger.info("CLIP model loaded successfully!")
             
         except Exception as e:
             logger.error(f"Failed to load CLIP model: {e}")
             self.use_clip = False
-            logger.warning("⚠️ Falling back to geometric analysis only")
+            logger.warning("Falling back to geometric analysis only")
     
     def _render_model_preview(self, model_path: str,
                               resolution: Tuple[int, int] = (224, 224)) -> Optional[Image.Image]:
@@ -392,7 +397,7 @@ class AIAssetTagger:
             
             # AI-powered analysis using CLIP (NEW!)
             if self.use_clip:
-                logger.info("🤖 Running AI analysis with CLIP...")
+                logger.info("Running AI analysis with CLIP...")
                 
                 # Render model preview for CLIP
                 preview_image = self._render_model_preview(model_path)
@@ -414,11 +419,11 @@ class AIAssetTagger:
                         # Use AI category if confidence > 0.5, else use geometric
                         if best_ai_category[1] > 0.5:
                             analysis['category'] = best_ai_category[0]
-                            logger.info(f"✨ AI detected category: {best_ai_category[0]} ({best_ai_category[1]:.2%} confidence)")
+                            logger.info(f"AI detected category: {best_ai_category[0]} ({best_ai_category[1]:.2%} confidence)")
                         else:
                             # Fallback to geometric analysis
                             analysis['category'] = self._classify_category(mesh)
-                            logger.info(f"📐 Using geometric category (AI confidence too low): {analysis['category']}")
+                            logger.info(f"Using geometric category (AI confidence too low): {analysis['category']}")
                     else:
                         # No AI results, use geometric
                         analysis['category'] = self._classify_category(mesh)
@@ -426,7 +431,7 @@ class AIAssetTagger:
                     # Get descriptive tags from AI
                     ai_tags = self._clip_generate_descriptive_tags(preview_image)
                     analysis['ai_descriptive_tags'] = ai_tags
-                    logger.info(f"✨ AI generated {len(ai_tags)} descriptive tags")
+                    logger.info(f"AI generated {len(ai_tags)} descriptive tags")
                 else:
                     # Rendering failed, fallback to geometric category
                     analysis['category'] = self._classify_category(mesh)
@@ -443,7 +448,7 @@ class AIAssetTagger:
             analysis['tags'] = self._generate_tags(analysis)
             analysis['confidence'] = self._calculate_confidence(analysis)
             
-            logger.info(f"✅ Analysis complete: {len(analysis['tags'])} tags generated")
+            logger.info(f"Analysis complete: {len(analysis['tags'])} tags generated")
             return analysis
             
         except Exception as e:

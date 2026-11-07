@@ -4,9 +4,14 @@ Defines the core structures for storing and manipulating animation data.
 """
 
 import json
+import logging
 import math
 from enum import Enum
 from typing import List, Dict, Any, Optional, Union
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so a report written to
+# stdout reaches nobody; the root logger is the one channel the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 class EasingType(Enum):
     LINEAR = "Linear"
@@ -244,7 +249,7 @@ class AnimationClip:
                 json.dump(self.to_dict(), f, indent=4)
             return True
         except Exception as e:
-            print(f"Error saving animation: {e}")
+            logger.warning("Error saving animation: %s", e)
             return False
             
     @classmethod
@@ -255,5 +260,5 @@ class AnimationClip:
                 data = json.load(f)
             return cls.from_dict(data)
         except Exception as e:
-            print(f"Error loading animation: {e}")
+            logger.warning("Error loading animation: %s", e)
             return None

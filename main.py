@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import QSplashScreen
 from PyQt6.QtCore import Qt
 # from src.ui.main_window import MainWindow  # Moved inside main()
 from src.utils.telemetry import get_telemetry
+from src.utils import early_log
 
 
 logger = logging.getLogger(__name__)
@@ -42,14 +43,14 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
         from src.features.diagnostic_engine import ErrorLogger
         ErrorLogger().log_error(exc_type.__name__, str(exc_value), error_msg)
     except (OSError, ImportError) as failed:
-        print(f"Could not write the crash record: {failed}", file=sys.stderr)
+        logger.error("Could not write the crash record: %s", failed)
 
     # Telemetry is an opt-in copy of the same event; a disabled or failing telemetry run
     # must not hide the crash from the file above, so it is reported, not passed over.
     try:
         get_telemetry().track_error(exc_type.__name__, str(exc_value), error_msg)
     except Exception as failed:
-        print(f"Could not record the crash in telemetry: {failed}", file=sys.stderr)
+        logger.error("Could not record the crash in telemetry: %s", failed)
 
     # Show error dialog
     app = QApplication.instance()
@@ -66,6 +67,28 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 
 def main():
     """Main entry point for RenderFox application."""
+    # Before the first report this function writes. The Diagnostics pane that reads the root
+    # logger is built by `MainWindow`, several statements below the icon and splash checks, so
+    # without the buffer every startup report would go to `logging.lastResort` - stderr, which
+    # `console=False` discards, exactly the channel this phase removed from the rest of the app.
+    early_log.install()
+
+    # The app's own records at INFO, and nobody else's.
+    #
+    # `diagnostics_tab.setup_logging` puts a `PaneLogHandler` on the root logger, so what
+    # reaches it is decided by the level - and until here nothing in `main.py` or `src/` called
+    # `setLevel` or `basicConfig` (measured: zero matches), so root sat at its default WARNING
+    # and every `logger.info` the app writes was dropped before any handler existed. Measured
+    # on this machine with the *root* logger opened to INFO: one window build and six seconds
+    # of an idle event loop produced 12 records, all 12 named `src.*`, and no third-party
+    # library contributed one. The level is therefore set on the app's own two namespaces and
+    # not on root, so a dependency that starts chattering at INFO cannot fill a table capped
+    # at 10,000 rows, and a library's WARNING reaches the pane exactly as it did before.
+    # `logger.debug` stays dropped: INFO is the floor, which is what the per-action
+    # registration line in `automation_engine` is written at.
+    logging.getLogger('src').setLevel(logging.INFO)
+    logging.getLogger('__main__').setLevel(logging.INFO)
+
     # Set AppUserModelID for Windows Taskbar Icon - MUST be before QApplication
     import ctypes
     
@@ -112,7 +135,7 @@ def main():
         app.processEvents()
     else:
         splash = None
-        print(f"Warning: Splash screen not found at {splash_path}")
+        logger.warning("Splash screen not found at %s", splash_path)
 
     # Check for installer model download flag
     if "--download-models" in sys.argv:
@@ -153,12 +176,12 @@ def main():
         for action_id, func, description, params, batch in processor.automation_actions():
             ActionRegistry.register(action_id, func, description, params, batch=batch)
             registered_point_cloud += 1
-        print(f"{registered_point_cloud} point cloud automation actions registered.")
-        
-        print("Core automation actions registered.")
+        logger.info("%d point cloud automation actions registered", registered_point_cloud)
+
+        logger.info("Core automation actions registered")
 
     except Exception as e:
-        print(f"Failed to register automation actions: {e}")
+        logger.error("Automation actions were not registered: %s", e)
 
     # Create main window
     # Import here to allow splash screen to show first

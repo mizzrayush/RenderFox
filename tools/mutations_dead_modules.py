@@ -11,6 +11,15 @@ and `tests/test_dead_modules_contract.py` runs it, plants an unreachable module 
 prove the report says so, and asks the second question (does the word appear anywhere) prove it
 reads files.
 
+The instrument has since answered a fourth form wrong of its own. `src/utils/early_log.py` -
+written by the phase that gave every unread report a channel - is imported as
+`from src.utils import early_log`, where the dotted name sits before `import` only as far as the
+package and the file's own name comes after it. The walk read the part before `import`, arrived at
+`src.utils`, and reported the new module dead: three of this suite's tests failed over it in the
+chain run that closed that phase, which is how a graph built from a half-read statement shows up.
+Two entries at the end of this list plant that defect back, one at the graph and one at the
+statement, because the second is the form the panes actually write.
+
 So the defects worth planting are these: the one live helper of the reduced utility file naming a
 folder it does not create, or creating it the way that makes a second caller fail; the feedback
 dialog answering with a name it then opens in overwrite mode, a retry that tries one name, a
@@ -38,7 +47,7 @@ suite, so it gets a test rather than a pass.
 Run:
     python -X utf8 tools/mutation_check.py tests/test_dead_modules_contract.py \
         tools/mutations_dead_modules.py
-( thirty-three entries )
+( thirty-five entries )
 """
 
 FU = 'src/utils/file_utils.py'
@@ -319,5 +328,22 @@ MUTATIONS = [
         'expect': 'test_15',
         'note': 'the report prints the total twice, so "reachable" is a word about the number of '
                 'files rather than about the import graph',
+    },
+    {
+        'file': CK,
+        'find': "            found.update(f'{base}.{alias.name}' for alias in node.names if base)",
+        'replace': '            pass  # only the part before `import` is an edge',
+        'expect': 'test_19',
+        'note': '`from src.utils import early_log` reaches `src.utils` and stops, which reports '
+                'the module the entry point installs at startup as a file nothing imports',
+    },
+    {
+        'file': CK,
+        'find': "            found.update(f'{base}.{alias.name}' for alias in node.names if base)",
+        'replace': "            found.update(f'{package}.{alias.name}' for alias in node.names)",
+        'expect': 'test_19',
+        'note': 'the aliases are hung off the importing file\'s own package instead of the '
+                'resolved base, so a dotted name is only right by accident and an import written '
+                'from `main.py` resolves to `.early_log`',
     },
 ]

@@ -6,8 +6,10 @@ every source file, resolves relative imports to the module they really mean, and
 edges out of the entry points. The grep is the thing that got this wrong - `from ..utils.file_utils
 import get_temp_directory` and `from .feedback_dialog import FeedbackDialog` hold neither module's
 dotted name, so a search for `src.utils.file_utils` in `src/` answers "nothing imports it" about a
-file four modules call on every run. Anything under ``src/`` the walk never arrives at is printed
-as dead.
+file four modules call on every run. A third form the graph has to answer for is
+`from src.utils import early_log`, where the module part is a package and the *name* is the file;
+reading only the part before `import` called that module dead on the day it was written. Anything
+under ``src/`` the walk never arrives at is printed as dead.
 
 A name can also be reached without an import node - ``importlib.import_module('...')``, a
 ``QPluginLoader`` path, a string in a spec file - so every unreachable module gets a second
@@ -67,7 +69,14 @@ def imports_of(path: Path) -> set:
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            found.add(resolve(node.module or '', package, node.level))
+            base = resolve(node.module or '', package, node.level)
+            found.add(base)
+            # `from src.utils import early_log` runs `src/utils/early_log.py`, and the base alone
+            # is `src.utils` - a package whose own file is `__init__.py`. Reading only the base
+            # would report a module reached that way as dead, which is a file the next phase
+            # deletes. Every imported name is therefore offered as `<base>.<name>` as well; a
+            # name that is a function rather than a module matches no file and `collect` drops it.
+            found.update(f'{base}.{alias.name}' for alias in node.names if base)
     return found
 
 

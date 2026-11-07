@@ -35,6 +35,11 @@ except ImportError:
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+# `logging.warning(...)`, the module-level call, writes a record named `root`, so the row it
+# makes carries no component and cannot be traced to this module. The named logger is the one
+# the Diagnostics pane can attribute.
+logger = logging.getLogger(__name__)
+
 
 class _Stopped(Exception):
     """The user asked for a stop between maps - not a failure of the rasteriser."""
@@ -146,7 +151,7 @@ class TextureBaker(QObject):
                 try:
                     self._bake_one(kind, path, resolution)
                 except Exception as error:
-                    logging.warning(f"{kind} bake failed: {error}")
+                    logger.warning("%s bake failed: %s", kind, error)
                     failures[kind] = str(error).splitlines()[0]
                 else:
                     results[kind] = path
@@ -170,7 +175,7 @@ class TextureBaker(QObject):
             self.baking_complete.emit(False, results)
             return results
         except Exception as e:
-            logging.error(f"Baking failed: {e}")
+            logger.error("Baking failed: %s", e)
             self.error_occurred.emit(str(e))
             self.baking_complete.emit(False, results)
             return {}

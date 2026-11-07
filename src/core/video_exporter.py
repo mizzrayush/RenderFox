@@ -6,12 +6,17 @@ Handles capturing frames and stitching them into a video file using ffmpeg.
 import os
 import sys
 import shutil
+import logging
 import subprocess
 import tempfile
 from typing import Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPainter
 from PyQt6.QtWidgets import QWidget, QApplication
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so a render that failed
+# has one place to say so: the root logger, which the Diagnostics pane turns into rows.
+logger = logging.getLogger(__name__)
 
 
 def find_ffmpeg_executable() -> str:
@@ -158,7 +163,7 @@ class VideoExporter(QObject):
             stdout, stderr = process.communicate()
             
             if process.returncode != 0:
-                print(f"FFmpeg Error: {stderr.decode()}")
+                logger.warning("FFmpeg Error: %s", stderr.decode())
                 self.finished.emit(False, f"FFmpeg failed: {stderr.decode()[:100]}...")
                 return
                 
@@ -166,7 +171,7 @@ class VideoExporter(QObject):
             self.finished.emit(True, f"Render saved to {output_path}")
             
         except Exception as e:
-            print(f"Render Error: {e}")
+            logger.warning("Render Error: %s", e)
             self.finished.emit(False, str(e))
             
         finally:

@@ -4,6 +4,7 @@ Provides comprehensive mesh processing, repair, optimization, and analysis tools
 """
 
 import os
+import logging
 import numpy as np
 import tempfile
 from typing import Dict, List, Any, Optional, Tuple
@@ -23,6 +24,11 @@ except ImportError:
     PYMESHLAB_AVAILABLE = False
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
+# only reader left when an analysis or a load returns nothing: the caller sees `None`, and this
+# record is the whole of why.
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -140,7 +146,7 @@ class MeshAnalyzer:
                 has_colors=has_colors
             )
         except Exception as e:
-            print(f"Error analyzing mesh: {e}")
+            logger.warning("Error analyzing mesh: %s", e)
             return None
     
     @staticmethod
@@ -1604,7 +1610,7 @@ class MeshProcessor(QObject):
             
             return mesh
         except Exception as e:
-            print(f"Error loading mesh: {e}")
+            logger.warning("Error loading mesh: %s", e)
             return None
     
     def detect_issues(self, mesh_path: str) -> List[Dict[str, str]]:

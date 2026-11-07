@@ -4,6 +4,7 @@ Model tab for RenderFox - using OpenGL viewer for better performance and compati
 """
 
 import os
+import logging
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QPushButton, QFileDialog, QTreeWidget, QTreeWidgetItem,
                              QGroupBox, QFormLayout, QLabel, QLineEdit, QComboBox,
@@ -33,6 +34,10 @@ from src.processing.format_converter import FormatConverter, SupportedFormat
 from src.ui.conversion_results_dialog import show_conversion_results
 from src.ui.painting_tab import PaintingTab
 from .icon_provider import get_icon
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 # Helper to ensure we have a Trimesh instance from a trimesh.Scene or Trimesh
 def _as_trimesh(obj):
@@ -1319,7 +1324,7 @@ class ModelTab(QWidget):
                 added_count += 1
             except Exception as e:
                 failed_count += 1
-                print(f"Failed to add {file_path}: {e}")
+                logger.warning("Failed to add %s: %s", file_path, e)
         
         self.progress_bar.setVisible(False)
         self.operation_label.setText(f"Added {added_count} models to comparison")
@@ -2334,7 +2339,7 @@ Is Watertight: {mesh.is_watertight}
                 self.model_info_text.setPlainText(info.strip())
                 
         except Exception as e:
-            print(f"Error updating model info: {e}")
+            logger.warning("Error updating model info: %s", e)
     
     def load_model(self, file_path=None):
         """Load a single model file."""
@@ -2444,7 +2449,7 @@ Is Watertight: {mesh.is_watertight}
                 if hasattr(self, 'painting_tab'):
                     self.painting_tab.set_model(file_path)
             except Exception as e:
-                print(f"Error updating features: {e}")
+                logger.warning("Error updating features: %s", e)
         else:
             self.operation_label.setText("Failed to load model")
             QMessageBox.warning(self, "Load Error", 
@@ -2917,7 +2922,7 @@ Is Watertight: {mesh.is_watertight}
                             }
                             all_analyses.append(analysis)
                     except Exception as e:
-                        print(f"Error analyzing {model_info['path']}: {e}")
+                        logger.warning("Error analyzing %s: %s", model_info['path'], e)
                 
                 if file_path.endswith('.html'):
                     # Generate HTML report

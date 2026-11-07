@@ -4,6 +4,7 @@ Performance tab for GPU acceleration, monitoring, and optimization.
 
 import os
 import time
+import logging
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QPushButton, QComboBox, QLabel, QGroupBox, QFormLayout, 
                              QSpinBox, QDoubleSpinBox, QSlider, QTabWidget, QCheckBox,
@@ -32,6 +33,10 @@ from ..features.performance_analyzer import (
 )
 from ..utils.worker import Worker
 from ..utils.run_teardown import drain
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the only report
+# channel a failure has is the root logger the Diagnostics pane reads.
+logger = logging.getLogger(__name__)
 
 GPU_POWER_NOTE = ("Nothing here measures what power the graphics chip draws - the tool that "
                   "reports how busy it is, its memory and its temperature does not report "
@@ -1109,7 +1114,7 @@ class PerformanceTab(QWidget):
             self.paint_storage_info()
 
         except Exception as e:
-            print(f"Error updating system info: {e}")
+            logger.warning("Error updating system info: %s", e)
             
     def clear_memory_cache(self):
         """Clear memory cache and garbage collect."""

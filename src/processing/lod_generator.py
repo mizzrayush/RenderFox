@@ -3,6 +3,7 @@ LOD (Level of Detail) generator for mesh optimization.
 """
 
 import os
+import logging
 import numpy as np
 import trimesh
 try:
@@ -12,6 +13,12 @@ except ImportError:
     PYMESHLAB_AVAILABLE = False
 from typing import List, Tuple, Dict, Optional, Callable
 from dataclasses import dataclass
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
+# only reader of the simplification routes that quietly give up: each one below answers with a
+# convex hull or an unprocessed mesh, and without this record nothing says the LOD is not the
+# decimation it was asked for.
+logger = logging.getLogger(__name__)
 
 @dataclass
 class LODSettings:
@@ -88,7 +95,8 @@ class LODGenerator:
         original_face_count = len(mesh.faces)
         original_vertex_count = len(mesh.vertices)
         
-        print(f"Original mesh: {original_vertex_count} vertices, {original_face_count} faces")
+        logger.info("Original mesh %s: %d vertices, %d faces",
+                    base_name, original_vertex_count, original_face_count)
         
         # Generate different LOD levels
         lod_ratios = self._get_lod_ratios()
@@ -127,8 +135,10 @@ class LODGenerator:
                 vertex_reduction = (1 - len(lod_mesh.vertices) / original_vertex_count) * 100
                 face_reduction = (1 - len(lod_mesh.faces) / original_face_count) * 100
                 
-                print(f"Generated LOD{i}: {len(lod_mesh.vertices)} vertices ({vertex_reduction:.1f}% reduction), "
-                      f"{len(lod_mesh.faces)} faces ({face_reduction:.1f}% reduction)")
+                logger.info("Generated LOD%d: %d vertices (%.1f%% reduction), "
+                            "%d faces (%.1f%% reduction)",
+                            i, len(lod_mesh.vertices), vertex_reduction,
+                            len(lod_mesh.faces), face_reduction)
 
                 if progress is not None:
                     progress(len(generated_files), len(lod_ratios),
@@ -137,7 +147,7 @@ class LODGenerator:
                 
             except Exception as e:
                 self.errors.append(f"LOD{i} (ratio {ratio:.2f}): {e}")
-                print(f"Warning: Failed to generate LOD{i}: {str(e)}")
+                logger.warning("Failed to generate LOD%d: %s", i, e)
         
         return generated_files
     
@@ -181,7 +191,7 @@ class LODGenerator:
                 return trimesh.Trimesh(vertices=out_vertices, faces=out_faces)
                 
             except Exception as e:
-                print(f"Warning: PyMeshLab simplification failed: {str(e)}")
+                logger.warning("PyMeshLab simplification failed, using Trimesh: %s", e)
                 # Fall through to Trimesh implementation
         
         # Fallback to Trimesh (Lower Quality but no extra deps)
@@ -190,13 +200,13 @@ class LODGenerator:
             simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
             
             if simplified is None or len(simplified.faces) == 0:
-                print("Warning: Quadric decimation failed, using convex hull")
+                logger.warning("Quadric decimation failed, using convex hull")
                 simplified = mesh.convex_hull
             
             return simplified
             
         except Exception as e:
-            print(f"Warning: Quadric simplification failed: {str(e)}")
+            logger.warning("Quadric simplification failed, using convex hull: %s", e)
             return mesh.convex_hull
     
     def _hybrid_simplify(self, mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
@@ -222,7 +232,7 @@ class LODGenerator:
             return simplified if simplified is not None else mesh.convex_hull
             
         except Exception as e:
-            print(f"Warning: Hybrid simplification failed: {str(e)}")
+            logger.warning("Hybrid simplification failed, using quadric route: %s", e)
             return self._quadric_simplify(mesh, target_faces)
     
     def _cluster_simplify(self, mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
@@ -253,7 +263,7 @@ class LODGenerator:
             return simplified if simplified is not None else merged.convex_hull
             
         except Exception as e:
-            print(f"Warning: Cluster simplification failed: {str(e)}")
+            logger.warning("Cluster simplification failed, using quadric route: %s", e)
             return self._quadric_simplify(mesh, target_faces)
     
     def _post_process_lod(self, mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -280,7 +290,7 @@ class LODGenerator:
             return mesh
             
         except Exception as e:
-            print(f"Warning: Post-processing failed: {str(e)}")
+            logger.warning("Post-processing failed, the LOD is the raw simplification: %s", e)
             return mesh
     
     @property
@@ -542,10 +552,10 @@ def batch_generate_lods(input_directory: str, output_directory: str,
                 lod_files = generator.generate_lods(file_path, model_output_dir)
                 results[file_path] = lod_files
                 
-                print(f"✓ Generated {len(lod_files)} LODs for {filename}")
+                logger.info("Generated %d LODs for %s", len(lod_files), filename)
                 
             except Exception as e:
-                print(f"✗ Failed to generate LODs for {filename}: {str(e)}")
+                logger.warning("Failed to generate LODs for %s: %s", filename, e)
                 results[file_path] = []
     
     return results

@@ -6,12 +6,18 @@ import os
 import shutil
 import subprocess
 import json
+import logging
 import re
 import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple, Callable
 
 from ..core.models import RenderJob, SoftwareType, JobStatus
+
+# The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
+# only reader of a DCC process-control failure - the row a user gets when `stop` raises after the
+# pane already reported the job stopped.
+logger = logging.getLogger(__name__)
 
 # Check for optional dependencies
 try:
@@ -341,7 +347,7 @@ class RenderEngine(ABC):
                     # Fallback to basic termination
                     self.current_process.terminate()
             except Exception as e:
-                print(f"Error stopping process: {e}")
+                logger.warning("Error stopping process: %s", e)
                 try:
                     if PSUTIL_AVAILABLE:
                         parent = psutil.Process(self.current_process.pid)
@@ -361,7 +367,7 @@ class RenderEngine(ABC):
                 for child in children:
                     child.suspend()
             except Exception as e:
-                print(f"Error pausing process: {e}")
+                logger.warning("Error pausing process: %s", e)
     
     def resume(self):
         """Resume the current render process."""
@@ -373,7 +379,7 @@ class RenderEngine(ABC):
                 for child in children:
                     child.resume()
             except Exception as e:
-                print(f"Error resuming process: {e}")
+                logger.warning("Error resuming process: %s", e)
     
     def cleanup(self):
         """Cleanup after render completion."""
@@ -406,7 +412,7 @@ class BlenderEngine(RenderEngine):
             return success
             
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError, Exception) as e:
-            print(f"Blender availability check failed: {e}")
+            logger.warning("Blender availability check failed: %s", e)
             return False
     
     def get_version(self) -> str:
