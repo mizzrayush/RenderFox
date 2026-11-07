@@ -267,6 +267,10 @@ class MainWindow(QMainWindow):
         
         help_menu.addSeparator()
         
+        feedback_action = QAction('Send Feedback', self)
+        feedback_action.triggered.connect(self.open_feedback)
+        help_menu.addAction(feedback_action)
+        
         about_action = QAction('About', self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)

@@ -1458,11 +1458,17 @@ class BatchProcessor(QObject):
                        'succeeded': sum(1 for one in results if one['success']),
                        'failed': sum(1 for one in results if not one['success']),
                        'not_run': total - ran, 'stopped': ran < total}
+            # Posted before the flags fall, in this order on purpose: a reader that polls
+            # ``is_processing`` and then looks at the pane is on the main thread, and the
+            # slot that writes the pane's last line is queued behind this emit. Clear the
+            # flags first and the run reports itself over while the notification ending it
+            # has not even been posted, which is how a batch pane can say "Stopping -" over
+            # a run that already stopped.
+            self.batch_completed.emit(summary)
             self.current_batch = None
             self.is_processing = False
             self._stop = False
             self._pause = False
-            self.batch_completed.emit(summary)
         return results
 
 

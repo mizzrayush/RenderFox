@@ -70,12 +70,13 @@ PICTURE_MAKERS = (
 
 # The windows that stay, each because it is the product rather than a stand-in for a
 # thumbnail: the viewer the Mesh Tools, Point Clouds, Quality and Version panes show, the
-# Pipeline Render node's own capture with its contract suite, the click-to-select point
-# picker, and one dead viewer module #10 has scheduled for deletion.
+# Pipeline Render node's own capture with its contract suite, and the click-to-select point
+# picker. The fourth entry this list carried - `src/ui/model_viewer_open3d.py`, a viewer no
+# pane constructed - was deleted by the dead-module pass, which is the only reason the set
+# shrank.
 WINDOWS_THAT_STAY = {
     'src/processing/point_cloud_processor.py',
     'src/processing/preview_render.py',
-    'src/ui/model_viewer_open3d.py',
     'src/ui/unified_viewer.py',
 }
 

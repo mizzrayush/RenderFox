@@ -591,4 +591,13 @@ MUTATIONS = [
         'expect': 'test_109_the_drawing_function_refuses_a_canvas_it_cannot_allocate',
         'note': 'a size that is not a number reaches QImage instead of a sentence',
     },
+    # --- the order a finished run is reported in -------------------------------
+    {
+        'file': ENGINE,
+        'find': '            self.batch_completed.emit(summary)',
+        'replace': '            self.is_processing = False; self.batch_completed.emit(summary)',
+        'expect': 'test_69b_the_summary_is_posted_before_the_run_is_marked_over',
+        'note': 'the flag falls before the post, so a reader of the flag sees a pane that '
+                'still says the run is stopping - the chain-only flake this order closes',
+    },
 ]

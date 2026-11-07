@@ -32,8 +32,8 @@ Run:
 MUTATIONS = [
     {
         'file': 'src/features/version_control.py',
-        'find': '            thumbnail_path = self._generate_thumbnail(snapshot_path)',
-        'replace': '            thumbnail_path = None',
+        'find': '                thumbnail_path = self._generate_thumbnail(snapshot_path)',
+        'replace': '                thumbnail_path = None',
         'expect': 'test_04',
         'note': 'the commit stops recording a picture at all, so the timeline is rows and '
                 'numbers with nothing to look at',

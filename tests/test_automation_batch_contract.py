@@ -29,6 +29,7 @@ rather than one it measured is exactly the bug this suite was written to catch.
 Run: python -X utf8 tests/test_automation_batch_contract.py
 """
 
+import inspect
 import json
 import os
 import shutil
@@ -1007,6 +1008,33 @@ class PaneCase(DirCase):
         self.assertEqual(self.tab.batch_status_label.text(),
                          'Stopped after 1 of 3: 1 ok, 0 failed, 2 never ran')
         self.assertEqual(self.tab.batch_progress.value(), 33)
+
+    def test_69b_the_summary_is_posted_before_the_run_is_marked_over(self):
+        """The order test_69's label depends on, read where the order is decided.
+
+        ``settle`` asks the engine whether the run is over and then reads a sentence the
+        pane writes in a slot that ``batch_completed`` posts. When the flags fell first, a
+        reader could catch the moment in which the run had ended but the notification
+        ending it had not been sent at all, and test_69 read
+        "Stopping - the file in hand finishes first." over a batch that had stopped - which
+        is what it did inside the 32-suite chain and never on its own, because the gap is a
+        scheduling one. Nothing on this side of that gap can time it: a PyQt receiver lives
+        in the thread that connected it, so a callback attached here is queued behind the
+        same flags it would have to read. The order is therefore read off the function that
+        decides it, and the settled run's own sentence is checked beside it.
+        """
+        source = inspect.getsource(BatchProcessor.process_batch)
+        posted = source.index('self.batch_completed.emit(summary)')
+        marked = source.index('self.is_processing = False')
+        self.assertLess(posted, marked,
+                        'the run reports itself over before its summary is posted')
+
+        self.ready_folder('a.obj')
+        self.tab.start_batch_btn.click()
+        self.settle()
+        self.assertFalse(self.tab.automation_engine.batch_processor.is_processing)
+        self.assertEqual('Finished 1 file(s): 1 ok, 0 failed',
+                         self.tab.batch_status_label.text())
 
     def test_70_pause_holds_the_next_file_until_you_resume(self):
         started, gate = self.slow_probe()

@@ -216,6 +216,13 @@ SUITES = [
         "timeout_seconds": 240
     },
     {
+        "id": "dead_modules_contract",
+        "name": "Reachable Modules & Feedback Record Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_dead_modules_contract.py")],
+        "description": "Which modules the app can reach is an instrument now rather than a grep: the five files no import arrives at stay deleted with nothing spelling their names, the walk reports a planted unreachable module as dead and its two counts as different numbers, its word search reads the files it claims to, and it does not read the build copies; the one helper the reduced utils file keeps makes the folder it names; the Painting pane the deleted second copy duplicated is still the live one on screen; and Help -> Send Feedback opens a dialog the window owns, writes a record carrying exactly the fields the user saw, keeps two records saved in the same second apart, and says which failure stopped it",
+        "timeout_seconds": 240
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
