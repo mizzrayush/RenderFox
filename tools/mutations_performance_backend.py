@@ -244,8 +244,8 @@ MUTATIONS = [
     # ---- the detector: what may become a finding, and what the score may claim --------
     {
         'file': 'src/features/performance_analyzer.py',
-        'find': "            severity = 'High' if over_by >= 0.2 else 'Medium'",
-        "replace": "            severity = 'High'",
+        'find': "            return 'High' if over_by >= 0.2 else 'Medium'",
+        "replace": "            return 'High'",
         'expect': 'test_36',
         'note': 'every finding is High, so the word carries how far past nothing',
     },

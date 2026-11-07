@@ -99,9 +99,11 @@ def code_of(path):
 def metrics(**over):
     """One sample with every field measured, unless the test says otherwise."""
     row = {'timestamp': time.time(), 'window_seconds': 1.0, 'cpu_percent': 10.0,
-           'process_cpu_percent': 5.0, 'memory_percent': 20.0, 'memory_used_mb': 4096.0,
+           'process_cpu_percent': 5.0, 'cpu_frequency_mhz': 1300.0,
+           'memory_percent': 20.0, 'memory_used_mb': 4096.0,
            'memory_available_mb': 8192.0, 'process_rss_mb': 300.0,
-           'gpu_load_percent': 30.0, 'gpu_memory_percent': 25.0, 'gpu_temperature_c': 50.0,
+           'gpu_load_percent': 30.0, 'gpu_memory_percent': 25.0, 'gpu_memory_used_mb': 1024.0,
+           'gpu_temperature_c': 50.0,
            'gpu_reader': 'test reader', 'fps': 60.0, 'frame_time_ms': 16.0,
            'slowest_frame_ms': 20.0, 'frames': 60, 'not_read': {}}
     row.update(over)
@@ -252,6 +254,11 @@ class Test10bCpuPriming(unittest.TestCase):
         def virtual_memory(self):
             return SimpleNamespace(percent=20.0, used=4 * 1024 ** 3, available=8 * 1024 ** 3)
 
+        def cpu_freq(self):
+            # The shape psutil answers on this machine: a live current figure and a
+            # min/max pair the firmware does not fill in.
+            return SimpleNamespace(current=1300.0, min=0.0, max=1300.0)
+
         def Process(self, pid):
             outer = self
 
@@ -302,13 +309,28 @@ class Test11GpuReader(unittest.TestCase):
 
     def test_11_the_readers_own_figures_reach_the_sample(self):
         row = self.monitor(lambda: {'load_percent': 42.5, 'memory_percent': 61.0,
-                                    'temperature_c': 55.0, 'reader': 'GPUtil'}).sample()
+                                    'memory_used_mb': 1024.0, 'temperature_c': 55.0,
+                                    'reader': 'GPUtil'}).sample()
         self.assertEqual(42.5, row.gpu_load_percent)
         self.assertEqual(61.0, row.gpu_memory_percent)
+        self.assertEqual(1024.0, row.gpu_memory_used_mb)
         self.assertEqual(55.0, row.gpu_temperature_c)
         self.assertEqual('GPUtil', row.gpu_reader)
         self.assertEqual([], [line for line in row.unmeasured() if line.startswith('gpu')],
                          'an adapter that answered every field still left a hole in it')
+
+    def test_11b_the_memory_in_use_figure_is_refused_with_the_readers_own_words(self):
+        """A reader that answers load but not memory must not be answered with a zero.
+
+        The Memory pane's adapter card and the Adapter memory finding both read this field,
+        so a sample that silently left it None would let a card say "0 MB" about an adapter
+        that never spoke.
+        """
+        row = self.monitor(lambda: {'load_percent': 42.5, 'reader': 'GPUtil',
+                                    'reason': 'GPUtil answered this adapter but not '
+                                              'memoryUsed'}).sample()
+        self.assertIsNone(row.gpu_memory_used_mb)
+        self.assertIn('memoryUsed', row.not_read['gpu_memory_used_mb'])
 
     def test_12_a_reader_that_raises_is_kept_as_the_failure_it_is(self):
         def explode():
@@ -1507,9 +1529,9 @@ class Test107MetricsShape(unittest.TestCase):
         measured = metrics()
         self.assertEqual([], measured.unmeasured())
         row = measured.to_dict()
-        self.assertEqual(17, len(row), 'a field was added to one place only')
+        self.assertEqual(19, len(row), 'a field was added to one place only')
         for name in ('cpu_percent', 'memory_percent', 'gpu_load_percent', 'fps',
-                     'frame_time_ms', 'not_read'):
+                     'frame_time_ms', 'cpu_frequency_mhz', 'gpu_memory_used_mb', 'not_read'):
             self.assertIn(name, row)
         self.assertEqual({}, PerformanceMetrics(timestamp=time.time()).not_read)
         refused = unmeasured('fps', 'cpu_percent', 'gpu_load_percent', 'memory_percent')

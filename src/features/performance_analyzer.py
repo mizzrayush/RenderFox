@@ -19,6 +19,7 @@ every second; a benchmark score of `int(ops_per_second * 1000)` was painted as
 They are numbers about a machine that was never asked.
 """
 
+import gc
 import json
 import os
 import sys
@@ -34,12 +35,13 @@ import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from ..utils.frame_clock import FrameClock, shared_clock
+from . import performance_controls
 from .diagnostic_engine import SystemInfo
 
 __all__ = ['PerformanceMetrics', 'ProfileResult', 'PerformanceMonitor',
            'FunctionProfiler', 'BottleneckDetector', 'OptimizationSuggester',
            'PerformanceLogger', 'BenchmarkHistory', 'BenchmarkRunner',
-           'PerformanceAnalyzer', 'benchmark_engine', 'data_dir']
+           'PerformanceAnalyzer', 'benchmark_engine', 'data_dir', 'BUDGETS']
 
 # The limits this app checks itself against. They are a policy, not a measurement, so
 # they live in one place and every finding quotes the number it used.
@@ -50,6 +52,11 @@ LIMITS = {
     'fps': 30.0,                  # frames the app's own 3D view finished drawing
     'frame_time_ms': 33.0,        # the same frames as a duration
 }
+
+# The two budgets the Performance panes set for themselves. Unlike LIMITS these are not
+# this app's policy: they are numbers a user typed, so both start as None and a finding
+# against one only exists once the box that owns it has been filled.
+BUDGETS = {'process_memory_budget_mb': None, 'adapter_memory_alert_mb': None}
 
 # How much each limit is allowed to reduce the app's own pressure score. Policy, stated
 # plainly, and a score never spends a field that was not read.
@@ -83,12 +90,14 @@ class PerformanceMetrics:
     window_seconds: Optional[float] = None
     cpu_percent: Optional[float] = None
     process_cpu_percent: Optional[float] = None
+    cpu_frequency_mhz: Optional[float] = None
     memory_percent: Optional[float] = None
     memory_used_mb: Optional[float] = None
     memory_available_mb: Optional[float] = None
     process_rss_mb: Optional[float] = None
     gpu_load_percent: Optional[float] = None
     gpu_memory_percent: Optional[float] = None
+    gpu_memory_used_mb: Optional[float] = None
     gpu_temperature_c: Optional[float] = None
     gpu_reader: Optional[str] = None
     fps: Optional[float] = None
@@ -186,6 +195,17 @@ class PerformanceMonitor(QObject):
         self._gpu_at = now
         return sample
 
+    def set_gpu_reader(self, reader: Optional[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:
+        """Swap the adapter reader and drop the cached answer with the old one.
+
+        The cache belongs to the reader that filled it: leaving it in place would show the
+        previous adapter's figures beside a new one for up to `gpu_cache_seconds`.
+        """
+        self.gpu_reader = reader
+        self._gpu_cache = None
+        self._gpu_at = 0.0
+        return {'reading': reader is not None}
+
     def sample(self) -> PerformanceMetrics:
         """One look at the machine, as it was at this instant."""
         not_read: Dict[str, str] = {}
@@ -217,6 +237,22 @@ class PerformanceMonitor(QObject):
             process_rss_mb = None
             not_read['process_rss_mb'] = f'psutil raised {type(failed).__name__}: {failed}'
 
+        cpu_frequency_mhz = None
+        try:
+            frequency = psutil.cpu_freq()
+        except Exception as failed:
+            frequency = None
+            not_read['cpu_frequency_mhz'] = f'psutil raised {type(failed).__name__}: {failed}'
+        if frequency is not None:
+            if frequency.current:
+                cpu_frequency_mhz = round(frequency.current, 1)
+            else:
+                not_read['cpu_frequency_mhz'] = (
+                    'psutil answered the sensor with current=0.0, which is what it returns '
+                    'when the firmware gives this machine no live clock reading')
+        elif 'cpu_frequency_mhz' not in not_read:
+            not_read['cpu_frequency_mhz'] = 'psutil.cpu_freq() answered nothing at all'
+
         gpu = self._read_gpu()
         gpu_load = gpu.get('load_percent')
         if gpu_load is None:
@@ -224,6 +260,10 @@ class PerformanceMonitor(QObject):
         gpu_memory = gpu.get('memory_percent')
         if gpu_memory is None:
             not_read['gpu_memory_percent'] = gpu.get('reason') or 'the GPU reader answered nothing'
+        gpu_memory_used = gpu.get('memory_used_mb')
+        if gpu_memory_used is None:
+            not_read['gpu_memory_used_mb'] = (
+                gpu.get('reason') or 'the GPU reader answered no memory figure')
 
         frames = self.clock.stats(window_seconds=window or (self.update_interval / 1000.0))
         if frames['fps'] is None:
@@ -234,6 +274,7 @@ class PerformanceMonitor(QObject):
             window_seconds=round(window, 3) if window is not None else None,
             cpu_percent=cpu_percent,
             process_cpu_percent=process_cpu,
+            cpu_frequency_mhz=cpu_frequency_mhz,
             memory_percent=memory_percent,
             memory_used_mb=round(memory_used_mb, 1) if memory_used_mb is not None else None,
             memory_available_mb=(round(memory_available_mb, 1)
@@ -241,6 +282,7 @@ class PerformanceMonitor(QObject):
             process_rss_mb=round(process_rss_mb, 1) if process_rss_mb is not None else None,
             gpu_load_percent=gpu_load,
             gpu_memory_percent=gpu_memory,
+            gpu_memory_used_mb=gpu_memory_used,
             gpu_temperature_c=gpu.get('temperature_c'),
             gpu_reader=gpu.get('reader'),
             fps=frames['fps'],
@@ -270,7 +312,7 @@ class PerformanceMonitor(QObject):
         with the count of samples behind it, and None when that count is zero.
         """
         fields = ('cpu_percent', 'memory_percent', 'gpu_load_percent', 'fps',
-                  'frame_time_ms', 'process_rss_mb')
+                  'frame_time_ms', 'process_rss_mb', 'gpu_memory_used_mb')
         recent = self.get_metrics_history(last_n)
         out: Dict[str, Any] = {'samples': len(recent)}
         for name in fields:
@@ -282,7 +324,7 @@ class PerformanceMonitor(QObject):
     def get_peak_metrics(self) -> Dict[str, Any]:
         """Highest value seen per field, again with the count of samples behind it."""
         fields = ('cpu_percent', 'memory_percent', 'gpu_load_percent',
-                  'memory_used_mb', 'process_rss_mb')
+                  'memory_used_mb', 'process_rss_mb', 'gpu_memory_used_mb')
         out: Dict[str, Any] = {'samples': len(self.metrics_history)}
         for name in fields:
             values = [getattr(m, name) for m in self.metrics_history
@@ -293,6 +335,11 @@ class PerformanceMonitor(QObject):
 
     def clear_history(self) -> None:
         self.metrics_history.clear()
+
+    def drop_gpu_cache(self) -> None:
+        """Forget the adapter sample being held, so the next question really asks."""
+        self._gpu_cache = None
+        self._gpu_at = 0.0
 
 
 class FunctionProfiler:
@@ -355,10 +402,46 @@ class FunctionProfiler:
 
 
 class BottleneckDetector:
-    """Compares measured fields to LIMITS, and names the ones it could not compare."""
+    """Compares measured fields to LIMITS and to the user's budgets, and names neither
+    reading it does not have.
 
-    def __init__(self, limits: Optional[Dict[str, float]] = None) -> None:
+    The two jobs this class does are different kinds of claim. A limit is this app's own
+    policy, so a finding against it always exists once the reading does. A budget is a
+    number typed into a box - the process memory ceiling and the adapter memory alert - so
+    a finding against it exists only while the box has been filled, and the sample keeps
+    its reason in `not_read` when the reader that would answer it never did.
+    """
+
+    def __init__(self, limits: Optional[Dict[str, float]] = None,
+                 budgets: Optional[Dict[str, Any]] = None) -> None:
         self.limits = dict(limits or LIMITS)
+        self.budgets = dict(BUDGETS)
+        for name, value in (budgets or {}).items():
+            self.set_budgets(**{name: value})
+
+    def set_budgets(self, **values) -> Dict[str, Any]:
+        """Type a budget in, or type it out again, and answer with what the check now holds.
+
+        A non-number is refused rather than stored: a budget that compares nothing is how a
+        finding disappears without anybody pressing anything.
+        """
+        refused = []
+        for name, value in values.items():
+            if name not in BUDGETS:
+                refused.append(f'{name}: no budget of this name is checked')
+                continue
+            if value is None:
+                self.budgets[name] = None
+                continue
+            try:
+                amount = float(value)
+            except (TypeError, ValueError):
+                refused.append(f'{name}: {value!r} is not a number in megabytes')
+                continue
+            self.budgets[name] = amount if amount > 0 else None
+            if amount <= 0:
+                refused.append(f'{name}: {value} MB bounds nothing, so the check is off')
+        return dict(self.budgets, refused=refused)
 
     def analyze(self, metrics: PerformanceMetrics) -> List[Dict[str, str]]:
         findings: List[Dict[str, str]] = []
@@ -366,15 +449,34 @@ class BottleneckDetector:
         window = (f'{metrics.window_seconds:.2f} s'
                   if metrics.window_seconds else 'no window')
 
+        def severity_for(over_by):
+            """The one rule that turns 'past' into a word, shared by both kinds below."""
+            return 'High' if over_by >= 0.2 else 'Medium'
+
         def add(kind, label, observed, limit, over_by):
-            severity = 'High' if over_by >= 0.2 else 'Medium'
             findings.append({
                 'kind': kind,
                 'observed': f'{label} {observed}',
                 'limit': f'{limit:g}',
-                'severity': severity,
+                'severity': severity_for(over_by),
                 'because': (f'{observed} is {over_by * 100:.0f}% past the {limit:g} this '
                             f'app checks itself against, measured over {window}'),
+            })
+
+        def add_budget(kind, label, observed, budget, over_by, box, reader):
+            """The same shape as `add`, for a number the user typed rather than a policy.
+
+            The sentence has to say which box owns the figure and which reader answered the
+            observation, because a budget finding is only actionable if the person who set
+            it can find it again.
+            """
+            findings.append({
+                'kind': kind,
+                'observed': f'{label} {observed}',
+                'limit': f'{budget:g}',
+                'severity': severity_for(over_by),
+                'because': (f'{observed} is {over_by * 100:.0f}% past the {budget:g} MB set '
+                            f'in the {box} box, and {reader}'),
             })
 
         if metrics.cpu_percent is not None and metrics.cpu_percent > self.limits['cpu_percent']:
@@ -402,11 +504,53 @@ class BottleneckDetector:
                 f'{metrics.frame_time_ms:.1f} ms between finished frames',
                 self.limits['frame_time_ms'],
                 metrics.frame_time_ms / self.limits['frame_time_ms'] - 1)
+
+        process_budget = self.budgets.get('process_memory_budget_mb')
+        if (process_budget and metrics.process_rss_mb is not None
+                and metrics.process_rss_mb > process_budget):
+            add_budget('Process memory', 'This process',
+                       f'{metrics.process_rss_mb:.1f} MB resident', process_budget,
+                       metrics.process_rss_mb / process_budget - 1, 'Memory Limit',
+                       ('psutil read it from this process at this sample, so it is not an '
+                        'average over the window'))
+        adapter_budget = self.budgets.get('adapter_memory_alert_mb')
+        if (adapter_budget and metrics.gpu_memory_used_mb is not None
+                and metrics.gpu_memory_used_mb > adapter_budget):
+            add_budget('Adapter memory', 'Adapter memory',
+                       f'{metrics.gpu_memory_used_mb:.0f} MB in use', adapter_budget,
+                       metrics.gpu_memory_used_mb / adapter_budget - 1, 'GPU Memory Allocation',
+                       (f'{metrics.gpu_reader or "the GPU reader"} answered it; this app '
+                        f'does not own the adapter\'s memory, only the figure'))
         return findings
 
     def not_measured(self, metrics: PerformanceMetrics) -> List[str]:
         """What this check could not judge, in the readers' own words."""
         return metrics.unmeasured()
+
+    def budget_notes(self, metrics: PerformanceMetrics) -> List[str]:
+        """One line per budget, so a typed-in ceiling is never silent.
+
+        A budget with no finding beside it can mean three different things - under it, over
+        it, or unable to be compared because the reading it needs was refused - and only the
+        first of those is supposed to be quiet.
+        """
+        notes: List[str] = []
+        for name, field, box in (('process_memory_budget_mb', 'process_rss_mb',
+                                  'Memory Limit'),
+                                 ('adapter_memory_alert_mb', 'gpu_memory_used_mb',
+                                  'GPU Memory Allocation')):
+            budget = self.budgets.get(name)
+            if not budget:
+                notes.append(f'{box}: nothing is typed in it, so no figure is compared')
+            elif getattr(metrics, field) is None:
+                notes.append(
+                    f'{box} {budget:g} MB: no comparison, because no reader answered '
+                    f'{field} - {metrics.not_read.get(field, "no reason was recorded")} '
+                    f'(the {box} box bounds a figure this machine has not given)')
+            else:
+                notes.append(f'{box} {budget:g} MB against '
+                             f'{getattr(metrics, field):.1f} MB read from the machine')
+        return notes
 
     def score(self, metrics: PerformanceMetrics) -> Dict[str, Any]:
         """This app's own pressure score, from the fields that were actually read.
@@ -475,11 +619,19 @@ class OptimizationSuggester:
 
     LEVERS = {
         'CPU': ('Run fewer jobs at once',
-                'Settings pane - "Max Concurrent Jobs", and the "Max Threads" boxes in '
-                'the Performance and Post-Processing panes'),
+                'Settings pane - "Max Concurrent Jobs", and the "Max Threads" box, which '
+                'the Performance and Post-Processing panes both read from one stored value'),
         'Memory': ('Free what the app is holding',
                    'Memory pane - Clear Cache and Force GC, which report the measured '
                    'resident size before and after'),
+        'Process memory': ('Hand the pages back, or raise the ceiling',
+                           'Memory pane - Trim Working Set calls K32EmptyWorkingSet and '
+                           'prints the resident size before and after it; the Memory Limit '
+                           'box is the figure this finding was compared against'),
+        'Adapter memory': ('Ask the adapter for less at a time',
+                           'GPU Acceleration pane - GPU Memory Allocation holds the number '
+                           'this was compared against. This app does not own the adapter\'s '
+                           'memory, so the box bounds an alert rather than a reservation'),
         'GPU': ('Ask the adapter for less at a time',
                 'the viewer\'s own settings; this app does not drive the adapter, so the '
                 'change is in the 3D software that owns it'),
@@ -650,6 +802,16 @@ class BenchmarkHistory:
         return {'recorded': True, 'path': self.path,
                 'reason': stored['reason'] or ''}
 
+    def count(self) -> Dict[str, Any]:
+        """How many runs the file keeps, where it is, and whether it could be read.
+
+        The Clear button on the Benchmarks pane empties a table, not this file. This is the
+        answer that lets the button say so, because "cleared" is what a user hears as
+        "the measurements are gone".
+        """
+        stored = self._read()
+        return {'count': len(stored['runs']), 'path': self.path, 'reason': stored['reason']}
+
     def recent_runs(self, kind: str, limit: int = 10) -> Dict[str, Any]:
         """The stored runs of one kind, oldest first, with the read's own reason."""
         stored = self._read()
@@ -740,14 +902,19 @@ class BenchmarkRunner:
 
     def run_all(self, duration: float = 2.0, record: bool = False,
                 should_stop: Optional[Callable[[], bool]] = None,
-                progress_callback: Optional[Callable[..., None]] = None
-                ) -> Dict[str, Any]:
-        """Every kind, each with its own answer or its own reason."""
+                progress_callback: Optional[Callable[..., None]] = None,
+                **work) -> Dict[str, Any]:
+        """Every kind, each with its own answer or its own reason.
+
+        `work` reaches the kinds that take a box - the storage buffer size and the
+        memory-map choice - and is ignored by the ones that do not, so the Full System
+        Benchmark button runs the same settings the individual buttons would.
+        """
         answers = {}
         for index, kind in enumerate(self.KINDS):
             answers[kind] = self.run(kind, duration=duration, record=record,
                                      should_stop=should_stop,
-                                     progress_callback=progress_callback)
+                                     progress_callback=progress_callback, **work)
         refused = [f'{kind}: {a["reason"]}'
                    for kind, a in answers.items() if a['ran'] is None]
         return {'kinds': answers,
@@ -858,13 +1025,26 @@ class BenchmarkRunner:
 
     def storage_benchmark(self, duration: float = 2.0, size_mb: float = 128.0,
                           directory: Optional[str] = None, should_stop=None,
-                          progress_callback=None, **_ignored) -> Dict[str, Any]:
+                          progress_callback=None, buffer_kb: Optional[float] = None,
+                          use_memory_map: Optional[bool] = None,
+                          **_ignored) -> Dict[str, Any]:
         """Write and read back a real file on the volume the app writes to anyway.
 
+        Two of the pane's boxes are read here, which is what makes them settings rather
+        than decoration:
+
+        `buffer_kb` (Buffer Size) is how many bytes each `write()` is handed. The figure
+        is then a figure about a chunked writer, and the number of chunks is reported with
+        it, because the same megabytes written in one call is a different measurement.
+        `use_memory_map` (Memory Mapped Reads) chooses how the bytes come back: an
+        ordinary `read()`, or a mapping the operating system fills a page at a time. Each
+        slice taken out of a mapping is still turned into bytes to be compared, so the
+        mapped figure is the cost of paging *and* copying, and `cache_note` says so.
+
         `buffering=0` and one `fsync` are what make the write figure mean "the disk was
-        given these bytes"; the operating system still keeps pages of the file after
-        the close, so the read figure is labelled as whatever the cache chose to
-        answer. Free space is measured before and after, and the file is verified gone.
+        given these bytes". Free space is measured before and after, and the file is
+        verified gone - which needs the mapping closed first, because on Windows an open
+        map holds the file and the remove would answer `ERROR_ACCESS_DENIED`.
         """
         if size_mb <= 0:
             return self._refusal('storage', f'a file of {size_mb} MB holds nothing')
@@ -874,35 +1054,83 @@ class BenchmarkRunner:
             return self._refusal('storage', f'{folder} is not a folder on this disk, so there '
                                             f'is no volume here to measure a write against')
         payload = os.urandom(max(1, int(float(size_mb) * 1024 * 1024)))
+        size_bytes = len(payload)
+        chunk = size_bytes
+        if buffer_kb is not None:
+            try:
+                asked = int(float(buffer_kb) * 1024)
+            except (TypeError, ValueError):
+                return self._refusal('storage', f'{buffer_kb!r} is not a buffer size in KB')
+            if asked <= 0:
+                return self._refusal(
+                    'storage', f'a buffer of {buffer_kb} KB is {asked} bytes, so nothing '
+                               f'would be handed to the writer')
+            chunk = min(asked, size_bytes)
         path = os.path.join(folder, f'rf_storage_probe_{os.getpid()}.bin')
         free_before = psutil.disk_usage(folder).free
 
         write_started = time.perf_counter()
+        chunks_written = 0
+        stopped = False
         try:
             with open(path, 'wb', buffering=0) as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+                for start in range(0, size_bytes, chunk):
+                    if should_stop is not None and should_stop():
+                        stopped = True
+                        break
+                    handle.write(payload[start:start + chunk])
+                    chunks_written += 1
+                    if progress_callback:
+                        progress_callback(min(45, int(45 * start / size_bytes)))
+                if not stopped:
+                    handle.flush()
+                    os.fsync(handle.fileno())
         except OSError as failed:
             return self._refusal('storage', f'writing {path} failed: '
                                             f'{type(failed).__name__}: {failed}')
         write_elapsed = time.perf_counter() - write_started
+        if stopped:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            left = f'{path} is still on disk' if os.path.exists(path) else (
+                'the partial probe file was removed')
+            return self._refusal(
+                'storage', f'stopped after {chunks_written} chunk(s) of {chunk} bytes; {left}')
         if progress_callback:
             progress_callback(50)
 
         read_started = time.perf_counter()
-        try:
-            with open(path, 'rb', buffering=0) as handle:
-                got = handle.read()
-        except OSError as failed:
-            return self._refusal('storage', f'reading {path} failed: '
-                                            f'{type(failed).__name__}: {failed}')
+        got_bytes = 0
+        if use_memory_map:
+            import mmap
+            read_by = 'memory map'
+            try:
+                with open(path, 'rb') as handle:
+                    with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
+                        for start in range(0, size_bytes, chunk):
+                            piece = mapping[start:start + chunk]
+                            if piece != payload[start:start + chunk]:
+                                break
+                            got_bytes += len(piece)
+            except (OSError, ValueError) as failed:
+                return self._refusal('storage', f'mapping {path} failed: '
+                                                f'{type(failed).__name__}: {failed}')
+        else:
+            read_by = 'read()'
+            try:
+                with open(path, 'rb', buffering=0) as handle:
+                    data = handle.read()
+            except OSError as failed:
+                return self._refusal('storage', f'reading {path} failed: '
+                                                f'{type(failed).__name__}: {failed}')
+            got_bytes = len(data) if data == payload else 0
         read_elapsed = time.perf_counter() - read_started
         if progress_callback:
             progress_callback(100)
 
-        size_bytes = len(payload)
-        intact = len(got) == size_bytes and got == payload
+        intact = got_bytes == size_bytes
         try:
             os.remove(path)
             gone = not os.path.exists(path)
@@ -913,25 +1141,33 @@ class BenchmarkRunner:
         free_after = psutil.disk_usage(folder).free
         write_mb = size_bytes / (1024 * 1024) / write_elapsed if write_elapsed > 0 else None
         read_mb = size_bytes / (1024 * 1024) / read_elapsed if read_elapsed > 0 else None
+        mapped_note = ('; this read went through a memory map, so it is the cost of the '
+                       'operating system paging the file in and of this app copying each '
+                       'slice out of it - a second run of the same file usually answers '
+                       'faster than the disk can')
         return {
             'kind': 'storage',
             'ran': f'wrote and read back {size_bytes / (1024 * 1024):.0f} MB on '
-                   f'{os.path.splitdrive(path)[0] or path}',
+                   f'{os.path.splitdrive(path)[0] or path} in {chunks_written} x '
+                   f'{chunk // 1024} KB chunk(s), read by {read_by}',
             'reason': '' if intact else 'the bytes read back were not the bytes written',
             'measured_at': _stamp(),
-            'work': {'path': path, 'bytes': size_bytes, 'verified_gone': gone},
+            'work': {'path': path, 'bytes': size_bytes, 'verified_gone': gone,
+                     'buffer_kb': round(chunk / 1024), 'read_by': read_by},
             'result': {
                 'write_mb_per_second': round(write_mb, 1) if write_mb else None,
                 'read_mb_per_second': round(read_mb, 1) if read_mb else None,
                 'write_seconds': round(write_elapsed, 4),
                 'read_seconds': round(read_elapsed, 4),
+                'chunks_written': chunks_written,
+                'chunk_bytes': chunk,
                 'read_back_identical': intact,
                 'free_bytes_before': free_before,
                 'free_bytes_after': free_after,
                 'cleanup': cleanup_reason or 'probe file removed',
                 'cache_note': ('the write was flushed and fsync-ed; the read still goes '
                                'through whatever the operating system kept, so the read '
-                               'figure can be higher than the disk'),
+                               'figure can be higher than the disk' + mapped_note),
             },
             'comparison_value': round(write_mb, 1) if write_mb else None,
             'comparison_unit': 'write MB/s',
@@ -1057,6 +1293,55 @@ class BenchmarkRunner:
         return [str(result.get('kind')), str(result['ran']),
                 '; '.join(figures) or 'no figure came out of this work', note]
 
+    EXPORT_HEADERS = ('kind', 'what ran', 'figures', "against this app's own earlier runs")
+
+    def stored_runs(self) -> Dict[str, Any]:
+        """What the history file holds - the sentence a cleared table has to be honest about."""
+        return self.history.count()
+
+    def export(self, results: List[Dict[str, Any]],
+               output_path: Optional[str] = None) -> Dict[str, Any]:
+        """Write the table's own cells out, then read the file back to count the lines.
+
+        A pane that builds its own export rows is a pane that can print a second, different
+        claim about the same run - which is what `row_cells` exists to prevent, so the
+        exporter calls it rather than repeating it. The read-back is the proof: a file that
+        was opened and never written would otherwise be reported as an export.
+        """
+        import csv
+        if output_path is None:
+            output_path = os.path.join(
+                data_dir(),
+                f'benchmark_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        folder = os.path.dirname(output_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        rows = [self.row_cells(result) for result in results]
+        try:
+            with open(output_path, 'w', newline='', encoding='utf-8') as handle:
+                writer = csv.writer(handle)
+                writer.writerow(self.EXPORT_HEADERS)
+                writer.writerows(rows)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as failed:
+            return {'written': False, 'path': output_path, 'rows': len(rows),
+                    'reason': f'the export could not be written: '
+                              f'{type(failed).__name__}: {failed}'}
+        try:
+            with open(output_path, encoding='utf-8', newline='') as handle:
+                lines = len(list(csv.reader(handle)))
+            size = os.path.getsize(output_path)
+        except OSError as failed:
+            return {'written': True, 'path': output_path, 'rows': len(rows),
+                    'reason': f'the file was written but not read back: '
+                              f'{type(failed).__name__}: {failed}'}
+        return {'written': True, 'path': output_path, 'rows': len(rows), 'bytes': size,
+                'lines_read_back': lines, 'headers': list(self.EXPORT_HEADERS),
+                'reason': ('' if lines == len(rows) + 1 else
+                           f'the file answers with {lines} line(s) for {len(rows)} row(s) '
+                           f'plus a header')}
+
 
 def _open3d_has_cuda(o3d_module) -> bool:
     try:
@@ -1080,7 +1365,12 @@ def _blas_thread_note() -> str:
 
 
 class PerformanceAnalyzer:
-    """The performance pane's backend: one monitor, one engine, one place per name."""
+    """The performance panes' backend: one monitor, one engine, one store, one place per name.
+
+    Every control on those panes reaches the machine through this class, and each of them
+    either names the code below that reads it or names why nothing can - the table lives in
+    `performance_controls`, and the verbs live here.
+    """
 
     def __init__(self, gpu_reader: Optional[Callable[[], Dict[str, Any]]] = None,
                  clock: Optional[FrameClock] = None) -> None:
@@ -1090,12 +1380,314 @@ class PerformanceAnalyzer:
         self.suggester = OptimizationSuggester()
         self.logger = PerformanceLogger()
         self.benchmark = benchmark_engine()
+        self.profiles = performance_controls.PerformanceProfiles()
+        self.garbage = performance_controls.GarbageCollectionRunner(profiler=self.profiler)
+        self.adapter_name: Optional[str] = None
+        self.last_trim: Optional[Dict[str, Any]] = None
 
     def start_monitoring(self, interval_ms: int = 1000) -> None:
         self.monitor.start_monitoring(interval_ms)
 
     def stop_monitoring(self) -> None:
         self.monitor.stop_monitoring()
+
+    def stop_everything(self) -> None:
+        """Take the timers off the machine: the monitor's and the collector's.
+
+        The pane calls this on its way out. A timer left running after the widgets it
+        paints are gone is how a closed tab keeps sampling until the process does.
+        """
+        self.monitor.stop_monitoring()
+        self.garbage.stop()
+
+    # ---- the controls: one door in, one table saying what each door opens -------------
+
+    def control_rows(self, widgets: List[str]) -> List[Dict[str, Any]]:
+        """One row per widget the pane shows: what it stores, and what reads it.
+
+        The pane prints these rather than writing its own labels beside its own boxes, so a
+        control cannot look like a setting while behaving like a decoration.
+        """
+        rows = []
+        for name in widgets:
+            item = performance_controls.control(name)
+            if item is None:
+                rows.append({'widget': name, 'known': False, 'wired': False,
+                             'note': 'this control is in neither the table of controls nor '
+                                     'the table of buttons, so nothing here says what it '
+                                     'does'})
+                continue
+            row = {'widget': name, 'label': item.label, 'kind': item.kind, 'known': True,
+                   'wired': item.wired, 'key': item.qualified,
+                   'note': performance_controls.sentence_for(item)}
+            if item.key:
+                row.update({k: v for k, v in
+                            performance_controls.read_control(item).items()
+                            if k in ('stored', 'value')})
+            rows.append(row)
+        return rows
+
+    def uncovered_controls(self, widgets: List[str]) -> List[str]:
+        """The widgets the tables say nothing about - the defect, named."""
+        return performance_controls.uncovered(widgets)
+
+    def apply_control(self, widget: str, value: Any) -> Dict[str, Any]:
+        """Store one control and do whatever this process can do with it now.
+
+        Two different things happen, and the answer keeps them apart: the store is written
+        so the next reader of the value sees it, and the live verb runs so this process
+        changes now. A control whose only effect is stored says so with `live` empty.
+        """
+        item = performance_controls.control(widget)
+        if item is None:
+            return {'widget': widget,
+                    'stored': {'written': False,
+                               'reason': f'"{widget}" is in no control table, so this app '
+                                         f'does not know what it would set'}}
+        outcome = {'widget': widget, 'label': item.label,
+                   'stored': performance_controls.write_control(item, value)}
+        outcome['stored']['label'] = item.label
+        outcome['live'] = self._apply_live(widget, value) if outcome['stored']['written'] \
+            else None
+        return outcome
+
+    def _apply_live(self, widget: str, value: Any) -> Optional[Dict[str, Any]]:
+        """The in-process effect of one value already stored, or None when storing is it.
+
+        Each branch names the verb it calls, because the claim this pane makes is that a
+        box changes the running app - and a box whose value only lands in a file changes
+        nothing until something reads the file.
+        """
+        if widget == 'thread_priority_combo':
+            return performance_controls.set_process_priority(value)
+        if widget == 'affinity_cb':
+            return performance_controls.apply_cpu_affinity(bool(value))
+        if widget == 'stack_size_spin':
+            return performance_controls.apply_stack_size(value)
+        if widget == 'garbage_collection_combo':
+            return self.garbage.set_mode(value)
+        if widget in ('memory_limit_spin', 'gpu_memory_spin'):
+            name = ('process_memory_budget_mb' if widget == 'memory_limit_spin'
+                    else 'adapter_memory_alert_mb')
+            return self.detector.set_budgets(**{name: value})
+        if widget == 'enable_gpu_cb':
+            return self.set_adapter_reader(bool(value), self.adapter_name)
+        if widget == 'gpu_device_combo':
+            # Choosing which adapter to read is not a decision to start reading it. The
+            # helper program runs only while `enable_gpu_cb` holds it on, so the name is
+            # remembered and the reader is swapped only if one is already installed.
+            asked = self.monitor.gpu_reader is not None
+            return self.set_adapter_reader(asked, value)
+        if widget == 'profile_combo':
+            return self.apply_profile(value)
+        return None
+
+    def set_adapter_reader(self, enabled: bool,
+                           adapter_name: Optional[str] = None) -> Dict[str, Any]:
+        """Put the live adapter reader on the per-second sample, or take it off.
+
+        `SystemInfo.live_gpu_sample` starts a helper program to answer, so the box that
+        turns it on is a real decision about cost, not a decoration: while it is off the
+        sample leaves the adapter fields None and carries the reason.
+        """
+        self.adapter_name = (adapter_name or '').strip() or None
+        if not enabled:
+            answer = self.monitor.set_gpu_reader(None)
+            answer.update({'adapter': None,
+                           'reader': None,
+                           'reason': 'the box is off, so no helper program is started each '
+                                     'sample and the adapter fields say why they are empty'})
+            return answer
+        answer = self.monitor.set_gpu_reader(
+            lambda: SystemInfo.live_gpu_sample(adapter_name=self.adapter_name))
+        answer.update({
+            'adapter': self.adapter_name or 'the first adapter the reader answers',
+            'reader': 'SystemInfo.live_gpu_sample',
+            'reason': '' if self.adapter_name else
+                      'no adapter was chosen, so the reader takes the first one it answers '
+                      'for - the device box lists what Windows records here'})
+        return answer
+
+    def refresh_from_settings(self) -> Dict[str, Any]:
+        """Read every stored control back and apply it, so a restart is not a reset.
+
+        The values are read off the store rather than off the widgets: the widgets are what
+        the pane paints from this answer, so applying them would only prove the screen
+        agrees with itself.
+        """
+        applied = []
+        for name, item in performance_controls.CONTROLS.items():
+            if not (item.wired and item.key):
+                continue
+            stored = performance_controls.read_control(item)
+            if not stored['stored']:
+                applied.append({'widget': name, 'value': item.default, 'source': 'default',
+                                'live': None,
+                                'reason': stored['note']})
+                continue
+            applied.append({'widget': name, 'value': stored['value'], 'source': 'store',
+                            'live': self._apply_live(name, stored['value']),
+                            'reason': stored['note']})
+        return {'applied': applied, 'count': len(applied),
+                'reason': 'a control with nothing stored keeps its default and does not run '
+                          'a live verb, so a first run changes nothing on the machine'}
+
+    def apply_profile(self, name: str) -> Dict[str, Any]:
+        """Write the knobs a profile names, then run the live verb each one owns."""
+        outcome = self.profiles.apply(name)
+        for row in outcome.get('written', []):
+            row['live'] = self._apply_live(row['widget'], row['value'])
+        return outcome
+
+    def save_profile(self, name: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Store the current values under a new name and read the entry back."""
+        saved = self.profiles.save(name, values)
+        if saved.get('saved'):
+            saved['read_back'] = self.profiles.read_back(saved['name'])
+        return saved
+
+    # ---- the machine verbs the Memory and Optimization panes ask for -----------------
+
+    def trim_working_set(self) -> Dict[str, Any]:
+        """Hand this process's clean pages back to Windows and keep what it answered."""
+        answer = performance_controls.trim_working_set()
+        self.last_trim = answer
+        return answer
+
+    def collect_garbage(self, trigger: str = 'button') -> Dict[str, Any]:
+        """One collection, timed, with the interpreter's own count beside it."""
+        return self.garbage.collect_now(trigger)
+
+    def clear_caches(self, clear_software_table: Optional[Callable[[], Any]] = None
+                     ) -> Dict[str, Any]:
+        """Empty the caches this app really holds, and say which ones those are.
+
+        'Cache Size' on the pane bounds nothing - no structure in this app is measured in
+        megabytes - so the only honest reading of a Clear Cache button is the two caches
+        that do exist: the adapter sample `PerformanceMonitor` keeps for
+        `gpu_cache_seconds`, and the detected-software table the job manager holds. This
+        process owns the first; the second is handed in as a callable by whoever holds the
+        job manager, because clearing a cache that lives in somebody else's instance is a
+        way of emptying the wrong object.
+        """
+        before = psutil.Process(os.getpid()).memory_info().rss
+        samples = len(self.monitor.metrics_history)
+        self.monitor.clear_history()
+        self.monitor.drop_gpu_cache()
+        profiles = len(self.profiler.profiles)
+        self.profiler.clear_all()
+        if clear_software_table is None:
+            software = ('nothing was handed this app\'s job manager, so the '
+                        'detected-software table was left alone')
+        else:
+            try:
+                clear_software_table()
+            except Exception as failed:
+                software = f'the detected-software table was not cleared: ' \
+                           f'{type(failed).__name__}: {failed}'
+            else:
+                software = 'the detected-software table was emptied; the next question ' \
+                           'about installed software re-detects it'
+        return {'samples_dropped': samples, 'profile_timings_dropped': profiles,
+                'adapter_sample_dropped': True, 'software_table': software,
+                'rss_before_mb': round(before / 1048576, 1),
+                'rss_after_mb': round(
+                    psutil.Process(os.getpid()).memory_info().rss / 1048576, 1)}
+
+    def memory_rows(self) -> Dict[str, Any]:
+        """Every figure the Memory pane paints, each with the reader that answered it.
+
+        The four cards used to be seeded with 16.0 / 8.5 / 7.5 / 2.3 GB and never
+        refreshed. Three of them have a reader; the fourth does not exist on this
+        operating system - `psutil.virtual_memory()` on Windows answers total, available,
+        percent, used and free and carries no `cached` field at all (measured 2026-11-07),
+        so a Cached card can only ever carry the reason it is empty.
+        """
+        metrics = self.monitor.get_current_metrics()
+        rows: Dict[str, Any] = {'machine': [], 'process': [], 'garbage': {},
+                                'adapter': [], 'budgets': [], 'last_trim': self.last_trim,
+                                'reason': ''}
+        try:
+            machine = psutil.virtual_memory()
+        except Exception as failed:
+            rows['reason'] = f'psutil raised {type(failed).__name__}: {failed}'
+            machine = None
+        if machine is not None:
+            for name, value in (('total', machine.total), ('used', machine.used),
+                                ('available', machine.available), ('free', machine.free)):
+                rows['machine'].append({'card': name, 'value': round(value / 1048576, 1),
+                                        'unit': 'MB', 'reader': 'psutil.virtual_memory'})
+            rows['machine'].append({'card': 'percent', 'value': machine.percent,
+                                    'unit': '%', 'reader': 'psutil.virtual_memory'})
+            rows['machine'].append({
+                'card': 'cached', 'value': None, 'unit': 'MB', 'reader': None,
+                'reason': ('psutil.virtual_memory() answers total, available, percent, used '
+                           'and free on Windows and carries no cached field, so no reader '
+                           'here can fill this card')})
+
+        process = psutil.Process(os.getpid())
+        try:
+            info = process.memory_full_info()
+        except Exception as failed:
+            info = None
+            rows['process'] = [{'card': 'this process', 'value': None,
+                                'reason': f'psutil raised {type(failed).__name__}: {failed}'}]
+        if info is not None:
+            for name in ('rss', 'wset', 'peak_wset', 'private', 'pagefile', 'uss'):
+                value = getattr(info, name, None)
+                if value is None:
+                    rows['process'].append(
+                        {'card': name, 'value': None,
+                         'reason': 'this psutil build did not answer the field'})
+                else:
+                    rows['process'].append({'card': name, 'value': round(value / 1048576, 1),
+                                            'unit': 'MB', 'reader': 'psutil.memory_full_info'})
+            rows['process'].append({'card': 'num_page_faults', 'value': info.num_page_faults,
+                                    'unit': 'faults', 'reader': 'psutil.memory_full_info'})
+            rows['process'].append({'card': 'share of machine',
+                                    'value': round(process.memory_percent(), 2),
+                                    'unit': '%', 'reader': 'psutil.Process.memory_percent'})
+
+        rows['garbage'] = {'counts': list(gc.get_count()), 'generations': len(gc.get_stats()),
+                           'uncollectable': len(gc.garbage),
+                           'reader': 'gc.get_count / gc.get_stats / gc.garbage',
+                           'passes': self.garbage.summary()}
+
+        adapter_mb = metrics.gpu_memory_used_mb
+        rows['adapter'].append(
+            {'card': 'adapter memory in use', 'value': adapter_mb, 'unit': 'MB',
+             'reader': metrics.gpu_reader if adapter_mb is not None else None,
+             'reason': '' if adapter_mb is not None else
+                       metrics.not_read.get('gpu_memory_used_mb',
+                                            'the adapter reader answered no memory figure')})
+        rows['budgets'] = self.detector.budget_notes(metrics)
+        return rows
+
+    def benchmark_work_settings(self) -> Dict[str, Any]:
+        """The two boxes the storage benchmark reads, straight off the store.
+
+        The engine takes them as arguments rather than reaching for a widget, so a
+        benchmark run from anywhere - the Diagnostics pane, a test, this pane - gets the
+        same chunking.
+        """
+        buffer_kb = performance_controls.read_control(
+            performance_controls.CONTROLS['buffer_size_spin'])['value']
+        mapped = performance_controls.read_control(
+            performance_controls.CONTROLS['memory_mapping_cb'])['value']
+        return {'buffer_kb': buffer_kb, 'use_memory_map': bool(mapped)}
+
+    def run_benchmark(self, kind: str, duration: float = 2.0, record: bool = False,
+                      should_stop=None, progress_callback=None) -> Dict[str, Any]:
+        """Time one kind of work with the pane's stored settings handed to the engine."""
+        work = self.benchmark_work_settings()
+        return self.benchmark.run(kind, duration=duration, record=record,
+                                  should_stop=should_stop,
+                                  progress_callback=progress_callback, **work)
+
+    def export_benchmark_results(self, results: List[Dict[str, Any]],
+                                 output_path: Optional[str] = None) -> Dict[str, Any]:
+        """Write the table's own cells out - the same words, in a file."""
+        return self.benchmark.export(results, output_path)
 
     def get_current_analysis(self) -> Dict[str, Any]:
         """What one look at the machine supports: figures, findings, score, advice.
@@ -1111,6 +1703,7 @@ class PerformanceAnalyzer:
             'metrics': metrics.to_dict(),
             'findings': findings,
             'not_measured': self.detector.not_measured(metrics),
+            'budgets': self.detector.budget_notes(metrics),
             'score': self.detector.score(metrics),
             'suggestions': self.suggester.get_suggestions(metrics, findings),
             'frames': self.monitor.clock.stats(),
@@ -1126,7 +1719,7 @@ class PerformanceAnalyzer:
                     'reason': 'no sample has been kept yet, so there is no trend'}
         trends = {}
         for name in ('cpu_percent', 'memory_percent', 'gpu_load_percent', 'fps',
-                     'frame_time_ms'):
+                     'frame_time_ms', 'process_rss_mb', 'gpu_memory_used_mb'):
             values = [getattr(m, name) for m in history if getattr(m, name) is not None]
             if not values:
                 trends[name] = {'average': None, 'peak': None, 'current': None,

@@ -487,8 +487,8 @@ class SystemInfo:
         return None
 
     @staticmethod
-    def live_gpu_sample() -> Dict[str, Any]:
-        """What the first adapter is doing now, or the reason this machine does not say.
+    def live_gpu_sample(adapter_name: Optional[str] = None) -> Dict[str, Any]:
+        """What one adapter is doing now, or the reason this machine does not say.
 
         GPUtil runs a helper program for each of these figures, so this is the only GPU
         question the per-second monitor is allowed to ask, and `get_gpu_report()` - which
@@ -497,6 +497,12 @@ class SystemInfo:
         as None with its name in `reason`, never as a zero: this machine has one Intel
         adapter and GPUtil answers no adapter at all here, so a monitored zero would be a
         number about hardware that was never asked.
+
+        `adapter_name` is the device box's choice, matched case-insensitively against the
+        names GPUtil answers for. It is matched rather than indexed because that list is
+        GPUtil's own order and the pane's list comes off Windows - two orders that only
+        agree when there is one adapter. A name that matches nothing is refused; the
+        figures are never quietly taken from a different adapter than the one asked for.
         """
         adapters, why = SystemInfo._gputil_adapters()
         if not adapters:
@@ -504,8 +510,20 @@ class SystemInfo:
                     'memory_used_mb': None, 'reader': 'GPUtil',
                     'reason': why or 'GPUtil answered no adapter'}
 
-        gpu = adapters[0]
-        sample = {'reader': 'GPUtil', 'reason': ''}
+        wanted = (adapter_name or '').strip().lower()
+        chosen = adapters
+        if wanted and wanted != 'auto select':
+            chosen = [entry for entry in adapters if wanted in (entry.name or '').lower()]
+            if not chosen:
+                return {'load_percent': None, 'memory_percent': None,
+                        'temperature_c': None, 'memory_used_mb': None,
+                        'reader': 'GPUtil', 'asked_for': adapter_name,
+                        'reason': (f'GPUtil answered no adapter called {adapter_name!r}; it '
+                                   f'answers for '
+                                   f'{", ".join(repr(entry.name) for entry in adapters)} - '
+                                   f'the figures of another adapter are not handed over')}
+        gpu = chosen[0]
+        sample = {'reader': 'GPUtil', 'reason': '', 'adapter': gpu.name}
         missing = []
         for key, attr, scale in (('load_percent', 'load', 100.0),
                                  ('memory_percent', 'memoryUtil', 100.0)):
@@ -530,8 +548,11 @@ class SystemInfo:
             sample['reason'] = ('GPUtil answered this adapter but not '
                                 + ', '.join(missing))
         if len(adapters) > 1:
-            extra = (f'GPUtil answered {len(adapters)} adapters and these figures are '
-                     f'the first of them')
+            named = (f'GPUtil answered {len(adapters)} adapters and these figures are '
+                     f'those of {gpu.name}')
+            unneeded = (f'GPUtil answered {len(adapters)} adapters, none was chosen, '
+                        f'and these figures are the first of them')
+            extra = named if wanted else unneeded
             sample['reason'] = f'{sample["reason"]}; {extra}' if sample['reason'] else extra
         return sample
 

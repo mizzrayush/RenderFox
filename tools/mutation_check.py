@@ -88,13 +88,23 @@ def main():
 
     mutations = load_mutations(os.path.join(ROOT, args.spec) if not os.path.isabs(args.spec) else args.spec)
     if args.list:
-        for item in mutations:
+        # Every entry is reported, because the question a sweep asks is "how many anchors have
+        # gone stale", and raising on the first answer makes that question cost one run per
+        # stale line. Anchors only; no test runs.
+        broken = []
+        for position, item in enumerate(mutations, 1):
             path = os.path.join(ROOT, item['file'])
-            original = open(path, 'rb').read().decode('utf-8')
-            swap(original.replace('\r\n', '\n'), item['find'], item['replace'], item.get('which'))
-            print(f'anchor ok: {item["file"]}: {item["note"]}')
-        print(f'{len(mutations)} anchors are unique')
-        return 0
+            try:
+                original = open(path, 'rb').read().decode('utf-8')
+                swap(original.replace('\r\n', '\n'), item['find'], item['replace'],
+                     item.get('which'))
+            except (OSError, ValueError) as error:
+                broken.append(position)
+                print(f'anchor BROKEN [{position:02d}] {item["file"]}: {error} '
+                      f'({item["note"]})')
+        print(f'{len(mutations) - len(broken)}/{len(mutations)} anchors of {args.spec} '
+              f'are live and unique')
+        return 1 if broken else 0
 
     if args.only:
         wanted = {int(one) for one in args.only.split(',') if one.strip().isdigit()}
