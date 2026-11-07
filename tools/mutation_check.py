@@ -21,6 +21,12 @@ A mutation that no test catches is a hole in the suite, not a defect in the prod
 mutation that kills the suite before it reports is the same hole in a worse disguise: PyQt6
 aborts the process on an exception raised inside a slot, so no FAIL or ERROR line is ever
 printed and a reader who only counts named failures sees a clean run. Both are called out.
+
+The third disguise is the runner's own: a suite name that does not resolve makes python exit 2
+before any test runs, which is indistinguishable from a suite killed by a mutation, so every
+entry in the list comes back CRASHED and the advice printed under it points at tests that
+already reach the defect. The suite paths are therefore checked before anything is planted, and
+a run that cannot start says so and plants nothing (exit 2).
 """
 
 import argparse
@@ -94,6 +100,19 @@ def main():
         wanted = {int(one) for one in args.only.split(',') if one.strip().isdigit()}
         mutations = [dict(item, number=index) for index, item in enumerate(mutations, 1)
                      if index in wanted]
+
+    # Ask whether the suite is there before anything is planted. A name that does not resolve is
+    # not a neutral mistake: python answers "can't open file" with exit 2, which this runner reads
+    # as a suite that died on a mutation, so every entry in the list comes back CRASHED and the
+    # advice it prints - "the test must reach the defect directly" - sends the reader into tests
+    # that already do. Measured with a mistyped suite name: three entries reported as crash-only
+    # on a machine where all three are caught by a named test.
+    suites = {args.suite} | {one['suite'] for one in mutations if one.get('suite')}
+    missing = sorted(one for one in suites if not os.path.exists(os.path.join(ROOT, one)))
+    if missing:
+        print(f'suite not found: {", ".join(missing)} - nothing was planted')
+        return 2
+
     cache = {}
     survived = []
     crashed = []

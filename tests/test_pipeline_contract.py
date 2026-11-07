@@ -998,7 +998,14 @@ class PaneContract(unittest.TestCase):
         self.run_and_wait(120.0)
         statuses = {name: value[0] for name, value in self.table().items()}
         self.assertEqual('invalid', statuses['Export Model'], str(statuses))
-        self.assertIn('tifff', self.table()['Export Model'][1], self.table()['Export Model'][1])
+        row = self.table()['Export Model']
+        self.assertIn('tifff', row[1], row[1])
+        named = [str(option) for option in next(
+            parameter.options for parameter in NODE_DEFINITIONS['export.model'].parameters
+            if parameter.name == 'format')]
+        self.assertIn('The node offers ' + ', '.join(named), row[1],
+                      f'refused by value alone, so the sentence does not name the {len(named)} '
+                      f'formats the node actually takes: {row[1]}')
         self.assertEqual([], [kind for kind, _ in MODALS],
                          'a knob read wrong opened a dialog as if the run had crashed')
 

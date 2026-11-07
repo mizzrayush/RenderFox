@@ -67,7 +67,7 @@ MUTATIONS = [
         'file': 'src/processing/pipeline_engine.py',
         'find': '        if text in named:',
         'replace': '        if True:',
-        'expect': 'test_60',
+        'expect': 'test_60_the_pane',
         'note': 'a value outside an enum\'s list is accepted instead of refused by name',
     },
     # ---- a file the engine says it wrote --------------------------------------------
@@ -150,5 +150,13 @@ MUTATIONS = [
         'replace': '        self.engine = PipelineEngine()',
         'expect': 'test_59',
         'note': 'the worker stages in the current working directory instead of the app\'s temp',
+    },
+    {
+        'file': 'src/processing/pipeline_engine.py',
+        'find': '                       f"{\', \'.join(named) if named else \'nothing\'}")',
+        'replace': '                       "the node has a list of its own.")',
+        'expect': 'test_60_the_pane',
+        'note': 'the refusal names the value that is wrong and not the values that would have '
+                'worked, so the reader has to open the node to find out what to type',
     },
 ]

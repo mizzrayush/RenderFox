@@ -219,11 +219,28 @@ class Test02WorkingVolume(unittest.TestCase):
                           'a path starting with the letters of a drive counts as that drive')
 
     def test_15_default_path_is_where_the_app_writes(self):
-        from src.utils.file_utils import get_temp_directory
-        st = storage(volume('C:\\'), volume('D:\\'), volume('E:\\'))
-        picked = SystemInfo.working_volume(st)
-        self.assertEqual(os.path.abspath(get_temp_directory())[:2].upper(),
-                         picked['mountpoint'][:2].upper())
+        """The no-path answer is the scratch folder's drive, named by the fixture.
+
+        Reading the real `get_temp_directory()` and hoping it sits on another drive than the
+        process started on pinned this on one machine and left it unpinnable on any machine
+        where the two agree, which is the same assertion written twice. Both sides are
+        therefore set here: the scratch folder is put on a drive the cwd is not on, and the
+        fixture carries both, so the answer can only be right for the reason the code gives.
+        """
+        cwd_drive = os.path.abspath(os.getcwd())[:2].upper()
+        drives = [letter + ':' for letter in 'CDEF']
+        scratch_drive = next(drive for drive in drives if drive != cwd_drive)
+        st = storage(*[volume(drive + '\\') for drive in drives])
+        with mock.patch('src.utils.file_utils.get_temp_directory',
+                        return_value=os.path.join(scratch_drive + '\\', 'renders', 'scratch')):
+            picked = SystemInfo.working_volume(st)
+        self.assertIsNotNone(picked, 'every drive in the fixture is mounted, yet no pick')
+        self.assertEqual(scratch_drive, picked['mountpoint'][:2].upper(),
+                         f'the default write volume is not the drive the app writes into '
+                         f'({scratch_drive})')
+        self.assertNotEqual(cwd_drive, picked['mountpoint'][:2].upper(),
+                            'the answer is the drive the process happened to start on, which '
+                            'is where the exe lives, not where a render lands')
 
 
 class Test03DiskVerdict(unittest.TestCase):
