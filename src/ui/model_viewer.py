@@ -3,6 +3,7 @@
 """
 
 import os
+import logging
 import numpy as np
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QCheckBox, QTextEdit)
@@ -30,6 +31,8 @@ except ImportError:
     OPENGL_AVAILABLE = False
     # Create a dummy QOpenGLWidget class for fallback
     from PyQt6.QtWidgets import QWidget as QOpenGLWidget
+
+logger = logging.getLogger(__name__)
 
 class SimpleModelViewer(QWidget):
     """Simple fallback model viewer when OpenGL is not available."""
@@ -186,7 +189,10 @@ class ModelViewer3D(QOpenGLWidget):
     """3D model viewer using OpenGL (only available when PyOpenGL is installed)."""
     
     model_loaded = pyqtSignal(dict)
-    
+    # On the class, not in `__init__`: that method returns before its attribute block when
+    # PyOpenGL is missing, and the first paint reads this name either way.
+    _last_paint_failure = None
+
     def __init__(self, parent=None):
         super().__init__(parent)
         if not OPENGL_AVAILABLE:
@@ -413,13 +419,11 @@ class ModelViewer3D(QOpenGLWidget):
             
         # Check validity and queue if necessary
         if not self.isValid():
-            print(f"DEBUG: Viewer not valid, queuing model: {file_path}", flush=True)
             self.pending_model_path = file_path
             return True
             
         # If valid but not ready, also queue (or just wait for paintGL)
         if not self.gl_ready:
-             print(f"DEBUG: GL not ready, queuing model: {file_path}", flush=True)
              self.pending_model_path = file_path
              return True
              
@@ -844,6 +848,7 @@ class ModelViewer3D(QOpenGLWidget):
     def export_scene(self, output_path: str, material_data: dict = None) -> bool:
         """Export the current scene with applied materials."""
         if not hasattr(self, 'original_meshes') or not self.original_meshes:
+            logger.warning("Scene export to %s refused: nothing is loaded", output_path)
             return False
             
         try:
@@ -889,12 +894,11 @@ class ModelViewer3D(QOpenGLWidget):
             return True
             
         except Exception as e:
-            print(f"Export failed: {e}")
+            logger.warning("Scene export to %s failed: %s", output_path, e)
             return False
 
     def initializeGL(self):
         """Initialize OpenGL context."""
-        print(f"DEBUG: initializeGL called for viewer {self}", flush=True)
         if not OPENGL_AVAILABLE:
             return
             
@@ -1207,12 +1211,10 @@ class ModelViewer3D(QOpenGLWidget):
     
     def paintGL(self):
         """Render the scene with optional overlay wireframe."""
-        # print(f"DEBUG: paintGL called for viewer {self}", flush=True) # Commented out to avoid spam, but useful if needed
         # Process pending model load
         if hasattr(self, 'pending_model_path') and self.pending_model_path:
             path = self.pending_model_path
             self.pending_model_path = None
-            print(f"DEBUG: Processing queued model load in paintGL: {path}", flush=True)
             self.load_model(path)
             # load_model calls update(), so we might return or continue. 
             
@@ -1278,7 +1280,6 @@ class ModelViewer3D(QOpenGLWidget):
             self.shader_program.setUniformValue("use_textures", bool(self.use_textures))
             self.shader_program.setUniformValue("use_vertex_colors", bool(self.use_vertex_colors))
             self.shader_program.setUniformValue("use_vertex_colors", bool(self.use_vertex_colors))
-            # print(f"DEBUG: show_weights={getattr(self, 'show_weights', 'MISSING')}")
             self.shader_program.setUniformValue("show_weights", bool(getattr(self, 'show_weights', False)))
             self.shader_program.setUniformValue("base_color", QVector3D(*self.base_color))
             self.shader_program.setUniformValue("wire_color", QVector3D(*self.wire_color))
@@ -1519,9 +1520,21 @@ class ModelViewer3D(QOpenGLWidget):
                 
         except Exception as e:
             frame_clock.note_failure(e)
-            print(f"paintGL failed: {e}")
-            import traceback
-            traceback.print_exc()
+            self._report_paint_failure(e)
+
+    def _report_paint_failure(self, error) -> None:
+        """Say once why the paint raised, not once per frame.
+
+        `paintGL` runs at the frame rate, so an exception here repeats on every repaint. A
+        log line per repeat fills the Diagnostics table's 10,000-row cap in under three minutes
+        at 60 fps - 167 seconds - and pushes the first, the only one that explains anything, off
+        the end. A reason that differs from the last one still gets written.
+        """
+        reason = f'{type(error).__name__}: {error}'
+        if reason == self._last_paint_failure:
+            return
+        self._last_paint_failure = reason
+        logger.warning("paintGL failed: %s", reason)
 
     def resizeGL(self, width, height):
         """Handle window resize."""
@@ -2113,7 +2126,6 @@ class ModelViewer3D(QOpenGLWidget):
         
         # Optimization: Only check vertices if we have a reasonable number, otherwise need acceleration structure
         # For now, limit to checking if total vertices < 50k for real-time performance
-        total_verts = sum(len(m['vertices']) for m in self.meshes)
         
         # Construct MVP matrix as numpy array for fast multiplication
         mvp_data = np.array(mvp.data(), dtype=np.float32).reshape(4, 4).T
@@ -2150,12 +2162,6 @@ class ModelViewer3D(QOpenGLWidget):
             min_idx_masked = np.argmin(dists_sq)
             min_dist_sq = dists_sq[min_idx_masked]
             
-            # DEBUG: Print closest vertex info
-            # if min_dist_sq > 400:
-            #     closest_screen_x = screen_x[min_idx_masked]
-            #     closest_screen_y = screen_y[min_idx_masked]
-            #     print(f"DEBUG: Cursor({x}, {win_y}) - Closest Vert Screen({closest_screen_x:.1f}, {closest_screen_y:.1f}) - DistSq: {min_dist_sq:.1f}")
-
             # Threshold (e.g., 100 pixels radius = 10000 sq pixels) - Increased from 50
             if min_dist_sq < 10000: # 100^2
                 # Check depth (z-buffer) to ensure we pick visible vertex
@@ -2176,13 +2182,6 @@ class ModelViewer3D(QOpenGLWidget):
                      best_mesh_idx = m_idx
                      best_vert_idx = real_idx
     
-        if best_mesh_idx != -1:
-            pass
-            # print(f"DEBUG: Hit Mesh {best_mesh_idx}, Vert {best_vert_idx}, Dist {best_dist}")
-        else:
-            # Print debug info if we missed everything but have vertices
-            if total_verts > 0:
-                 print(f"DEBUG: Missed. Min Dist Sq: {min_dist_sq if 'min_dist_sq' in locals() else 'N/A'}")
 
         return best_mesh_idx, best_vert_idx, best_dist
 
@@ -2369,6 +2368,7 @@ class ModelViewer3D(QOpenGLWidget):
     def export_model(self, file_path: str) -> bool:
         """Export the current model with vertex colors/weights to a file."""
         if not self.meshes:
+            logger.warning("Model export to %s refused: nothing is loaded", file_path)
             return False
             
         try:
@@ -2403,13 +2403,10 @@ class ModelViewer3D(QOpenGLWidget):
                 
             # Export
             scene.export(file_path)
-            print(f"DEBUG: Model exported to {file_path}")
             return True
             
         except Exception as e:
-            print(f"Export failed: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning("Model export to %s failed: %s", file_path, e)
             return False
 
 class ModelViewerWidget(QWidget):

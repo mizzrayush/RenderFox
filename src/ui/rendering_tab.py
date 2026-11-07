@@ -1046,4 +1046,4 @@ class RenderingTab(QWidget):
         if success:
             self.status_message.emit(f"Scene exported to {os.path.basename(path)}")
         else:
-            self.status_message.emit("Export failed.")
+            self.status_message.emit("Scene export failed. The reason is in the Diagnostics log.")

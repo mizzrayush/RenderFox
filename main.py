@@ -6,6 +6,7 @@ A cross-platform batch rendering manager for 3D artists.
 
 import sys
 import traceback
+import logging
 from PyQt6.QtWidgets import QApplication, QMessageBox
 import os
 
@@ -19,6 +20,8 @@ from PyQt6.QtCore import Qt
 # from src.ui.main_window import MainWindow  # Moved inside main()
 from src.utils.telemetry import get_telemetry
 
+
+logger = logging.getLogger(__name__)
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
     """Global exception handler to catch unhandled errors."""
@@ -90,9 +93,8 @@ def main():
         
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
-        print(f"DEBUG: Icon loaded from {icon_path}")
     else:
-        print(f"DEBUG: Icon NOT found at {icon_path}")
+        logger.warning("Window icon not found at %s", icon_path)
 
     # Splash Screen
     splash_path = os.path.join(base_dir, "resources", "splash.png")

@@ -223,6 +223,13 @@ SUITES = [
         "timeout_seconds": 240
     },
     {
+        "id": "stdout_quiet_contract",
+        "name": "Report Channels: No Console in the Build",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_stdout_quiet_contract.py")],
+        "description": "The packaged app has no stream anybody reads, so the DEBUG traces in the load, pick and paint paths are gone and stay gone: the checker is run over the real tree and over planted defects (a trace in a pane, one built from an f-string, a write from a repaint and the same line parked in a comment, a `logger` bound in a class body or a sibling function rather than where it is used, an unparsable file), it refuses to call an ordinary message or a `log.debug` record a trace, and the channel the reports use instead is proven end to end - a warning written on this thread and on a worker thread both reach the Diagnostics table, a repaint that raises leaves one row per distinct reason and not one per frame, both of the viewer's export methods name the file they could not write and the refusal that has nothing loaded says that is why, a good export writes a file that reloads, and neither pane sends the user to a console",
+        "timeout_seconds": 180
+    },
+    {
         "id": "headless_gui_15_tabs",
         "name": "15-Tab Headless GUI & Synthetic Asset Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],

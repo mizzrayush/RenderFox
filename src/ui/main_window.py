@@ -3,6 +3,7 @@ Main window for RenderFox application.
 """
 
 import os
+import logging
 from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QVBoxLayout, 
                              QWidget, QMenuBar, QStatusBar, QMessageBox)
 from PyQt6.QtCore import Qt, QSize
@@ -27,6 +28,8 @@ from .rendering_tab import RenderingTab
 from .feedback_dialog import FeedbackDialog
 from .styles import get_theme_stylesheet, MODERN_DARK_THEME
 from .icon_provider import get_tab_icon, get_icon
+
+logger = logging.getLogger(__name__)
 
 class MainWindow(QMainWindow):
     """Main application window with tabbed interface."""
@@ -60,10 +63,9 @@ class MainWindow(QMainWindow):
             icon_path = os.path.join(base_dir, "resources", "icon.ico")
             
         if os.path.exists(icon_path):
-            print(f"DEBUG: MainWindow setting icon from {icon_path}")
             self.setWindowIcon(QIcon(icon_path))
         else:
-            print(f"DEBUG: MainWindow icon NOT found at {icon_path}")
+            logger.warning("Window icon not found at %s", icon_path)
         
         # Create central widget with tab layout
         central_widget = QWidget()

@@ -205,7 +205,6 @@ class PaintingTab(QWidget):
                             reset_colors = True
                 
                 if reset_colors:
-                    print("DEBUG: Resetting dark/missing vertex colors to White (in change_mode)")
                     num_verts = len(mesh['vertices'])
                     mesh['colors'] = np.ones((num_verts, 4), dtype=np.float32)
                     
@@ -242,7 +241,6 @@ class PaintingTab(QWidget):
 
     def set_model(self, model_or_wrapper):
         """Set the model to paint on."""
-        print(f"DEBUG: PaintingTab.set_model called with: {model_or_wrapper}", flush=True)
         
         if isinstance(model_or_wrapper, str):
             # It's a file path
@@ -275,7 +273,6 @@ class PaintingTab(QWidget):
                             reset_colors = True
                 
                 if reset_colors:
-                    print("DEBUG: Resetting dark/missing vertex colors to White")
                     num_verts = len(mesh['vertices'])
                     mesh['colors'] = np.ones((num_verts, 4), dtype=np.float32)
                     
@@ -301,7 +298,6 @@ class PaintingTab(QWidget):
         size = self.brush_size_slider.value()
         strength = self.brush_strength_slider.value() / 100.0
         mode = self.brush_mode_combo.currentText()
-        # print(f"Brush Update: Size={size}, Strength={strength}, Mode={mode}")
 
     def perform_painting(self, pos):
         # Get settings
@@ -314,8 +310,6 @@ class PaintingTab(QWidget):
         
         mesh_idx, vert_idx, dist = self.viewer.get_vertex_at_screen_pos(x, y)
         
-        # print(f"Painting at {x},{y} -> Mesh: {mesh_idx}, Vert: {vert_idx}, Dist: {dist}")
-        
         if mesh_idx != -1:
             if self.paint_mode_combo.currentText() == "Vertex Painting":
                 # Use brush color and "Mix" mode for now (or map Add/Sub)
@@ -324,10 +318,7 @@ class PaintingTab(QWidget):
                 self.viewer.apply_color(mesh_idx, vert_idx, self.brush_color, radius, "Mix")
             else:
                 self.viewer.apply_weight(mesh_idx, vert_idx, strength, radius, mode)
-        else:
-            # print("No vertex found under cursor.")
-            pass
-        
+
     def clear_weights(self):
         """Clear all weights to 0."""
         for mesh in self.viewer.meshes:
@@ -350,19 +341,14 @@ class PaintingTab(QWidget):
         
     def fill_weights(self):
         """Fill all weights to 1."""
-        print("DEBUG: Executing Fill All (1.0)")
-        print(f"DEBUG: Viewer Valid: {self.viewer.isValid()}")
-        print(f"DEBUG: Mesh Count: {len(self.viewer.meshes)}")
         
         for i, mesh in enumerate(self.viewer.meshes):
             has_weights = 'weights' in mesh
             has_vbo = mesh.get('vbo') is not None
-            print(f"DEBUG: Mesh {i} - Has Weights: {has_weights}, Has VBO: {has_vbo}")
             
             if has_weights:
                 mesh['weights'][:] = 1.0
                 if has_vbo and self.viewer.isValid():
-                    print(f"DEBUG: Updating VBO for mesh {i}")
                     self.viewer.makeCurrent()
                     mesh['vbo'].bind()
                     interleaved = np.column_stack((
@@ -393,4 +379,6 @@ class PaintingTab(QWidget):
             if success:
                 QMessageBox.information(self, "Success", f"Model exported successfully to:\n{file_path}")
             else:
-                QMessageBox.critical(self, "Error", "Failed to export model. Check console for details.")
+                QMessageBox.critical(
+                    self, "Error",
+                    "Failed to export model. The reason is in the Diagnostics log.")

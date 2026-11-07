@@ -2409,7 +2409,6 @@ Is Watertight: {mesh.is_watertight}
     def on_model_selected(self, item):
         """Handle model selection in tree."""
         file_path = item.data(0, Qt.ItemDataRole.UserRole)
-        print(f"DEBUG: on_model_selected: {file_path}", flush=True)
         if file_path:
             self.current_model_path = file_path
             # Always load the selected model, freeing any previously loaded content first
@@ -2418,7 +2417,6 @@ Is Watertight: {mesh.is_watertight}
             
             # Update Painting Tab if it's the current tab
             if hasattr(self, 'painting_tab') and self.detail_tabs.currentWidget() == self.painting_tab:
-                print(f"DEBUG: Updating Painting Tab with selected model: {file_path}")
                 self.painting_tab.set_model(file_path)
     
     def on_model_double_clicked(self, item):
