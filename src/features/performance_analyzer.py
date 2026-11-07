@@ -1386,7 +1386,14 @@ class PerformanceAnalyzer:
         self.last_trim: Optional[Dict[str, Any]] = None
 
     def start_monitoring(self, interval_ms: int = 1000) -> None:
+        """Start the sample timer and the collection interval the stored mode names.
+
+        The collector belongs here rather than in the constructor because its timer is a
+        real pause in this process: a pane that was only ever built by a test would otherwise
+        run `gc.collect()` every sixty seconds on somebody else's behalf.
+        """
         self.monitor.start_monitoring(interval_ms)
+        self.garbage.start()
 
     def stop_monitoring(self) -> None:
         self.monitor.stop_monitoring()
@@ -1525,9 +1532,12 @@ class PerformanceAnalyzer:
                                 'live': None,
                                 'reason': stored['note']})
                 continue
+            restart_only = item.key in performance_controls.RESTART_KEYS
             applied.append({'widget': name, 'value': stored['value'], 'source': 'store',
-                            'live': self._apply_live(name, stored['value']),
-                            'reason': stored['note']})
+                            'live': None if restart_only
+                            else self._apply_live(name, stored['value']),
+                            'reason': performance_controls.RESTART_NOTE if restart_only
+                            else stored['note']})
         return {'applied': applied, 'count': len(applied),
                 'reason': 'a control with nothing stored keeps its default and does not run '
                           'a live verb, so a first run changes nothing on the machine'}
@@ -1683,6 +1693,19 @@ class PerformanceAnalyzer:
         return self.benchmark.run(kind, duration=duration, record=record,
                                   should_stop=should_stop,
                                   progress_callback=progress_callback, **work)
+
+    def run_all_benchmarks(self, duration: float = 2.0, record: bool = False,
+                           should_stop=None, progress_callback=None) -> Dict[str, Any]:
+        """Every kind, with the same stored settings a single run would use.
+
+        Without this the Full System Benchmark button would time the storage probe with the
+        engine's own chunk size while the Storage button used the number in the box, and the
+        two rows in one table would answer two different questions.
+        """
+        work = self.benchmark_work_settings()
+        return self.benchmark.run_all(duration=duration, record=record,
+                                      should_stop=should_stop,
+                                      progress_callback=progress_callback, **work)
 
     def export_benchmark_results(self, results: List[Dict[str, Any]],
                                  output_path: Optional[str] = None) -> Dict[str, Any]:

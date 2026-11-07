@@ -26,7 +26,7 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,6 +53,15 @@ PRIORITY_REFUSALS = {
                  'Windows running, so it is not offered here: the app would rather be '
                  'slow than to take the machine'}
 
+# The stored settings that are a record of what happened rather than a setting to redo when
+# the app starts. `applied_profile` is the only one: writing it back at start-up would run
+# the profile again, and the profile's knobs would land on top of the values changed since it
+# was applied - so a restart would undo work the user did after the button. The name is kept
+# so the box shows what was last chosen; the knobs keep what they hold.
+RESTART_KEYS = ('applied_profile',)
+RESTART_NOTE = ('this value records which profile was applied last; the knobs it wrote keep '
+                'the settings you changed since, so this app does not re-apply it on start-up')
+
 
 @dataclass(frozen=True)
 class Control:
@@ -61,6 +70,11 @@ class Control:
     `key` is the settings key the value is persisted under, in the same group the code that
     reads it looks in. It is empty for a control whose reader is a call rather than a stored
     value - the profile name box - and for a refused control, which has neither.
+
+    `value_refusals` holds a value the box lists but this app will never act on, with the
+    sentence for why. `Real-time` priority is that case: refused only inside the win32 call,
+    the store still takes it and the start-up pass asks Windows again for a refusal, so the
+    door that writes the store is the one that has to say no.
     """
     widget: str
     label: str
@@ -69,9 +83,11 @@ class Control:
     key: str = ''
     default: Any = None
     bounds: Optional[Tuple[Any, ...]] = None
+    suffix: str = ''                # the unit the reader compares the number in
     variable: bool = False          # a combo whose items come off the machine
     reader: str = ''
     refusal: str = ''
+    value_refusals: Dict[str, str] = field(default_factory=dict)
 
     @property
     def wired(self) -> bool:
@@ -89,6 +105,8 @@ class Control:
 
     def in_bounds(self, value) -> Tuple[bool, str]:
         """Whether the control offers this value, in the control's own words."""
+        if isinstance(value, str) and value in self.value_refusals:
+            return False, self.value_refusals[value]
         if self.bounds is None or self.variable or value is None:
             return True, ''
         if self.kind == 'spin':
@@ -132,17 +150,27 @@ CONTROLS: Dict[str, Control] = {
                'and a name it does not recognise answers with a sentence naming both lists'),
     'gpu_memory_spin': Control(
         'gpu_memory_spin', 'Memory Allocation', 'spin', PERFORMANCE,
-        'adapter_memory_alert_mb', 4096, (512, 24576),
+        'adapter_memory_alert_mb', 4096, (512, 24576), suffix='MB',
         reader='BottleneckDetector compares the adapter memory the reader answered with '
                'against this figure and produces the Adapter memory finding'),
-    'compute_capability_combo': Control('compute_capability_combo', 'Compute API', 'combo'),
-    'precision_combo': Control('precision_combo', 'Precision', 'combo'),
-    'gpu_rendering_cb': Control('gpu_rendering_cb', 'GPU Rendering', 'check'),
-    'gpu_denoising_cb': Control('gpu_denoising_cb', 'GPU Image Denoising', 'check'),
-    'gpu_mesh_processing_cb': Control('gpu_mesh_processing_cb', 'GPU Mesh Processing', 'check'),
+    # The four rows above name a figure a reader compares; these seven offer a value that
+    # nothing in this app reads. They still carry the range and the default the box offers,
+    # so the pane builds every control from this table and holds no widget of its own.
+    'compute_capability_combo': Control(
+        'compute_capability_combo', 'Compute API', 'combo',
+        default='Auto', bounds=('Auto', 'CUDA 11.8', 'CUDA 12.0', 'OpenCL 3.0', 'Vulkan')),
+    'precision_combo': Control(
+        'precision_combo', 'Precision', 'combo',
+        default='Mixed Precision', bounds=('Mixed Precision', 'FP32', 'FP16', 'INT8')),
+    'gpu_rendering_cb': Control('gpu_rendering_cb', 'GPU Rendering', 'check', default=False),
+    'gpu_denoising_cb': Control('gpu_denoising_cb', 'GPU Image Denoising', 'check',
+                                default=False),
+    'gpu_mesh_processing_cb': Control('gpu_mesh_processing_cb', 'GPU Mesh Processing', 'check',
+                                      default=False),
     'gpu_format_conversion_cb': Control('gpu_format_conversion_cb', 'GPU Format Conversion',
-                                        'check'),
-    'gpu_lod_generation_cb': Control('gpu_lod_generation_cb', 'GPU LOD Generation', 'check'),
+                                        'check', default=False),
+    'gpu_lod_generation_cb': Control('gpu_lod_generation_cb', 'GPU LOD Generation', 'check',
+                                     default=False),
 
     # ---- Optimization: profiles and threading ----------------------------------------
     'profile_combo': Control(
@@ -164,9 +192,10 @@ CONTROLS: Dict[str, Control] = {
         'thread_priority_combo', 'Thread Priority', 'combo', PERFORMANCE, 'process_priority',
         'Normal', ('Low', 'Normal', 'High', 'Real-time'),
         reader='set_process_priority() sets this process Windows priority class and '
-               'GetPriorityClass reads it back; the row beside the box is that read-back'),
+               'GetPriorityClass reads it back; the row beside the box is that read-back',
+        value_refusals=PRIORITY_REFUSALS),
     'multiprocessing_cb': Control(
-        'multiprocessing_cb', 'Enable Multiprocessing', 'check'),
+        'multiprocessing_cb', 'Enable Multiprocessing', 'check', default=True),
     'affinity_cb': Control(
         'affinity_cb', 'Set CPU Affinity', 'check', PERFORMANCE, 'pin_to_first_cores', False,
         reader='apply_cpu_affinity() asks Windows to run this process on the first Max Threads '
@@ -176,7 +205,7 @@ CONTROLS: Dict[str, Control] = {
     # ---- Optimization: memory ---------------------------------------------------------
     'memory_limit_spin': Control(
         'memory_limit_spin', 'Memory Limit', 'spin', PERFORMANCE, 'process_memory_budget_mb',
-        8192, (512, 32768),
+        8192, (512, 32768), suffix='MB',
         reader='BottleneckDetector compares the resident size this process reports against '
                'this figure and produces the Process memory finding'),
     'garbage_collection_combo': Control(
@@ -191,32 +220,39 @@ CONTROLS: Dict[str, Control] = {
         reader='BenchmarkRunner.storage_benchmark reads its probe file back through a memory '
                'map while this is on and with a plain read while it is off, and the row says '
                'which verb answered'),
-    'swap_usage_cb': Control('swap_usage_cb', 'Allow Swap Usage', 'check'),
+    'swap_usage_cb': Control('swap_usage_cb', 'Allow Swap Usage', 'check', default=False),
 
     # ---- Optimization: cache ----------------------------------------------------------
-    'cache_size_spin': Control('cache_size_spin', 'Cache Size', 'spin'),
-    'cache_policy_combo': Control('cache_policy_combo', 'Cache Policy', 'combo'),
-    'preload_cache_cb': Control('preload_cache_cb', 'Preload Common Assets', 'check'),
-    'compress_cache_cb': Control('compress_cache_cb', 'Compress Cache Data', 'check'),
+    'cache_size_spin': Control('cache_size_spin', 'Cache Size', 'spin', default=512,
+                               bounds=(64, 4096), suffix='MB'),
+    'cache_policy_combo': Control('cache_policy_combo', 'Cache Policy', 'combo',
+                                  default='LRU', bounds=('LRU', 'LFU', 'FIFO', 'Random')),
+    'preload_cache_cb': Control('preload_cache_cb', 'Preload Common Assets', 'check',
+                                default=False),
+    'compress_cache_cb': Control('compress_cache_cb', 'Compress Cache Data', 'check',
+                                 default=False),
 
     # ---- Optimization: I/O ------------------------------------------------------------
     'buffer_size_spin': Control(
         'buffer_size_spin', 'Buffer Size', 'spin', PERFORMANCE, 'storage_probe_buffer_kb', 64,
-        (4, 1024),
+        (4, 1024), suffix='KB',
         reader='BenchmarkRunner.storage_benchmark writes and reads its probe file in chunks '
                'of this size and the row counts the writes it made'),
-    'async_io_cb': Control('async_io_cb', 'Enable Async I/O', 'check'),
-    'batch_operations_cb': Control('batch_operations_cb', 'Batch File Operations', 'check'),
+    'async_io_cb': Control('async_io_cb', 'Enable Async I/O', 'check', default=True),
+    'batch_operations_cb': Control('batch_operations_cb', 'Batch File Operations', 'check',
+                                   default=True),
 
     # ---- Memory allocation ------------------------------------------------------------
-    'heap_size_spin': Control('heap_size_spin', 'Heap Size', 'spin'),
+    'heap_size_spin': Control('heap_size_spin', 'Heap Size', 'spin', default=2048,
+                              bounds=(256, 16384), suffix='MB'),
     'stack_size_spin': Control(
         'stack_size_spin', 'Stack Size', 'spin', PERFORMANCE, 'thread_stack_size_mb', 8,
-        (1, 64),
+        (1, 64), suffix='MB',
         reader='apply_stack_size() asks Python for this per-thread stack and reports the bytes '
                'threading.stack_size() answers; a thread already started keeps the stack it '
                'was given'),
-    'pool_size_spin': Control('pool_size_spin', 'Memory Pool', 'spin'),
+    'pool_size_spin': Control('pool_size_spin', 'Memory Pool', 'spin', default=512,
+                              bounds=(64, 4096), suffix='MB'),
 }
 
 # The sentences the refused rows carry. They are written here rather than in the pane so the
@@ -308,8 +344,8 @@ VERBS: Dict[str, Verb] = {
         'every kind the engine performs, each with its answer or its refusal'),
     'export_results_btn': Verb(
         'export_results_btn', 'Export Results', 'export_results',
-        'a JSON file in the app data folder holding these rows, the stored runs and the '
-        'machine note, which the pane reads back and counts'),
+        'a CSV file in the app data folder holding the cells this table shows, which the '
+        'engine re-reads and counts before the pane prints the path'),
     'clear_results_btn': Verb(
         'clear_results_btn', 'Clear Results', 'clear_results',
         'an empty table, plus the number of runs on disk it deliberately did not touch'),
@@ -501,8 +537,11 @@ class PerformanceProfiles:
 
         The refused controls are left out on purpose. A profile that could set them would be
         a way to write a number nothing reads, which is the defect this table exists to end.
+        `applied_profile` is left out for the opposite reason: something does read it, and
+        what it reads is a profile, so a knob of that name would let a profile apply itself.
         """
-        return [item.widget for item in CONTROLS.values() if item.wired and item.key]
+        return [item.widget for item in CONTROLS.values()
+                if item.wired and item.key and item.key not in RESTART_KEYS]
 
     def apply(self, name: str, live_values: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Write the knobs this profile names and report every knob it could not write.
@@ -534,6 +573,9 @@ class PerformanceProfiles:
                 continue
             if not item.wired or not item.key:
                 outcome['refused'].append(f'{item.label} ({widget}): {sentence_for(item)}')
+                continue
+            if item.key in RESTART_KEYS:
+                outcome['refused'].append(f'{item.label} ({widget}): {RESTART_NOTE}')
                 continue
             wrote = write_control(item, value)
             if wrote.get('written'):
@@ -576,6 +618,9 @@ class PerformanceProfiles:
             if not item.wired or not item.key:
                 refused.append(f'{item.label} ({widget}): nothing in this app reads it, so '
                                f'it is not a profile knob')
+                continue
+            if item.key in RESTART_KEYS:
+                refused.append(f'{item.label} ({widget}): {RESTART_NOTE}')
                 continue
             fits, why = item.in_bounds(value)
             if not fits:
@@ -822,6 +867,12 @@ class GarbageCollectionRunner(QObject):
 
     A thread that is running a benchmark keeps its objects; a pass never touches another
     thread's frames, so the passes stay the app's own pauses and the timings stay honest.
+
+    The timer itself belongs to the thread that built the runner, which is the one that
+    starts and stops it. `summary()` is read by the pane's memory worker, and a worker that
+    asked a `QTimer` belonging to another thread answered with a deleted C++ object - not an
+    exception this app can print, but a fault - so the runner keeps the state its own last
+    command left the timer in and reports that instead of querying Qt across a thread.
     """
 
     def __init__(self, mode: str = 'Automatic', profiler=None,
@@ -832,6 +883,7 @@ class GarbageCollectionRunner(QObject):
         self.history_limit = history_limit
         self.timer = QTimer()
         self.timer.timeout.connect(self.collect_now)
+        self.timer_active = False
         self.mode = ''
         self.running = False
         self.set_mode(mode)
@@ -852,14 +904,16 @@ class GarbageCollectionRunner(QObject):
                     'reason': f'"{mode}" is not a mode this runner has; it knows '
                               f'{", ".join(GC_INTERVALS)}'}
         interval = GC_INTERVALS[mode]
-        self.timer.stop()
-        if interval and self.running:
+        self.timer_active = bool(interval and self.running)
+        if self.timer_active:
             self.timer.start(interval)
+        else:
+            self.timer.stop()
         self.mode = mode
         return {'mode': mode, 'changed': True, 'interval_ms': interval,
-                'running': self.timer.isActive(),
+                'running': self.timer_active,
                 'started': self.running,
-                'reason': ('' if interval and self.running else
+                'reason': ('' if self.timer_active else
                            ('no timer runs in this mode: gc.collect() is called only when '
                             'the Clear Cache or Force Garbage Collection button is pressed'
                             if not interval else
@@ -889,12 +943,13 @@ class GarbageCollectionRunner(QObject):
     def summary(self) -> Dict[str, Any]:
         """What the passes add up to, counted over the passes that answered.
 
-        `running` is what the pane asked for and `timer_active` is what the timer says, and
-        both are reported because in Manual mode they are meant to differ.
+        `running` is whether this runner was started at all and `timer_active` is whether it
+        last told the timer to count; in Manual mode they are meant to differ, and neither
+        read asks Qt anything, so this is safe to call from the pane's memory worker.
         """
         counted = [row for row in self.passes if row['unreachable'] is not None]
         return {'mode': self.mode, 'interval_ms': GC_INTERVALS.get(self.mode),
-                'running': self.running, 'timer_active': self.timer.isActive(),
+                'running': self.running, 'timer_active': self.timer_active,
                 'passes': len(self.passes),
                 'answered': len(counted),
                 'total_unreachable': sum(row['unreachable'] for row in counted),
@@ -904,4 +959,5 @@ class GarbageCollectionRunner(QObject):
 
     def stop(self) -> None:
         self.running = False
+        self.timer_active = False
         self.timer.stop()

@@ -11,6 +11,11 @@ so it gets a test rather than a pass.
 Run:
     python -X utf8 tools/mutation_check.py tests/test_performance_backend_contract.py \
         tools/mutations_performance_backend.py
+
+The last block belongs to 7b and breaks the claims the control table and the pane make rather
+than the measurements: a box bounded by the pane instead of by the row, a value the store was
+never asked to offer, a button wired to nothing, a profile re-applied at start-up over the
+knobs changed after it, and a card seeded with a figure no reader answered.
 """
 
 MUTATIONS = [
@@ -722,5 +727,190 @@ MUTATIONS = [
         'replace': '            if True:',
         'expect': 'test_65c',
         'note': 'a bare filename asks the disk to make a folder called nothing',
+    },
+
+    # ---- 7b: the control table, the door that writes the store, the pane that paints ----
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        widget.setObjectName(name)',
+        'replace': '        pass',
+        'expect': 'test_110',
+        'note': 'a widget is built without the name its table row is read back from',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '            widget.setRange(0, TYPABLE_LIMIT)',
+        'replace': '            widget.setRange(1, 16)',
+        'expect': 'test_130',
+        'note': 'the pane bounds a number box itself, so a typed 999 is corrected before '
+                'the engine can refuse it in its own words',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        for name in list(self._controls):',
+        'replace': '        for name in []:',
+        'which': 1,
+        'expect': 'test_133',
+        'note': 'start-up reads no control, so what the store holds is never shown or refused',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': "        ran = [row['widget'] for row in from_store if row['live'] is not None]",
+        'replace': "        ran = [row['widget'] for row in from_store]",
+        'expect': 'test_139',
+        'note': 'a setting that only landed in a file is counted as a verb that ran on this '
+                'process',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        value = QLabel(MEMORY_NOT_READ_NOTE)',
+        'replace': "        value = QLabel('16.0 GB')",
+        'expect': 'test_118',
+        'note': 'a memory card is seeded with a figure no reader ever answered',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        self.analyze_memory_btn.clicked.connect(self.analyze_memory_usage)',
+        'replace': '        pass',
+        'expect': 'test_121',
+        'note': 'a button the verb table answers for is wired to nothing',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        self._verbs = {name: getattr(self, name) '
+                'for name in performance_controls.VERBS}',
+        'replace': '        self._verbs = {}',
+        'expect': 'test_120',
+        'note': 'the pane keeps no record of the buttons the verb table names',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        history = self.performance_analyzer.benchmark.stored_runs()',
+        'replace': "        history = {'count': 0, 'path': 'nowhere', 'reason': ''}",
+        'expect': 'test_123',
+        'note': 'clearing the table says it left nothing behind, without asking the disk',
+    },
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': "            rows.append([name, verb.label, 'button', '-', verb.produces])",
+        "replace": "            rows.append([name, verb.label, 'button', '-', 'see the button'])",
+        'expect': 'test_117',
+        'note': 'the pane writes its own wording into the column the verb table owns',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        if isinstance(value, str) and value in self.value_refusals:',
+        'replace': '        if False:',
+        'expect': 'test_134',
+        'note': 'a priority this app refuses by name is stored anyway and re-asked at '
+                'start-up',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '    fits, why = item.in_bounds(value)',
+        'replace': "    fits, why = True, ''",
+        'which': 1,
+        'expect': 'test_133',
+        'note': 'a value already in the store outside the range the control offers is shown '
+                'as though it were offered',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '    fits, why = item.in_bounds(value)',
+        'replace': "    fits, why = True, ''",
+        'which': 2,
+        'expect': 'test_131',
+        'note': 'the door that writes the store stops asking the control whether it offers '
+                'the value',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '    app_settings.write(item.group, item.key, value)',
+        'replace': "    app_settings.write('Performance', item.key, value)",
+        'expect': 'test_132',
+        'note': 'every control is written into one group, so the Post-Processing box reads '
+                'a different number than the one typed',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '                if item.wired and item.key and item.key not in RESTART_KEYS]',
+        'replace': '                if item.wired and item.key]',
+        'expect': 'test_140',
+        'note': 'a profile may name the profile box, and so apply itself',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        if cleaned in self.BUILT_IN:',
+        'replace': '        if False:',
+        'expect': 'test_142',
+        'note': 'a saved profile can hide the values this app ships for a built-in name',
+    },
+    {
+        'file': 'src/features/performance_controls.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        if self.timer_active:',
+        'replace': '        if False:',
+        'expect': 'test_144',
+        'note': 'the mode reports the interval it means and leaves the timer where it found it',
+    },
+    {
+        'file': 'src/features/performance_analyzer.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': "                applied.append({'widget': name, 'value': item.default, "
+               "'source': 'default',",
+        "replace": "                applied.append({'widget': name, 'value': item.default, "
+                   "'source': 'store',",
+        'expect': 'test_137',
+        'note': 'a first run with nothing stored claims it read the store',
+    },
+    {
+        'file': 'src/features/performance_analyzer.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '            restart_only = item.key in performance_controls.RESTART_KEYS',
+        'replace': '            restart_only = False',
+        'expect': 'test_138',
+        'note': 'the start-up pass re-applies the profile over the knobs changed after the '
+                'button',
+    },
+    {
+        'file': 'src/features/performance_analyzer.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': "            row['live'] = self._apply_live(row['widget'], row['value'])",
+        'replace': "            row['live'] = None",
+        'expect': 'test_141',
+        'note': 'a profile writes its knobs and never runs the verb each one owns',
+    },
+    {
+        'file': 'src/features/performance_analyzer.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': "        return {'buffer_kb': buffer_kb, 'use_memory_map': bool(mapped)}",
+        'replace': "        return {'buffer_kb': 64, 'use_memory_map': True}",
+        'expect': 'test_125',
+        'note': 'the storage work comes from the engine defaults, so the two boxes the kind '
+                'reads change nothing',
+    },
+    {
+        'file': 'src/features/performance_analyzer.py',
+        'suite': 'tests/test_performance_pane_contract.py',
+        'find': '        work = self.benchmark_work_settings()',
+        'replace': '        work = {}',
+        'which': 2,
+        'expect': 'test_126',
+        'note': 'the four-kind run ignores the stored work the single-kind buttons honour',
     },
 ]

@@ -49,6 +49,13 @@ class MainWindow(QMainWindow):
         saved_theme = getattr(self, 'settings_tab', None)
         theme_name = self.settings_tab.settings.value("theme", "Dark") if hasattr(self, 'settings_tab') else "Dark"
         self.setStyleSheet(get_theme_stylesheet(theme_name))
+
+        # The Performance pane's stored settings are read back here rather than in the pane's
+        # own constructor: a pane built by a test, a screenshot run or a second window should
+        # not become the thing that changes this process's priority class or pins its cores,
+        # while a window the user opened is exactly that. With nothing stored no verb runs,
+        # and the pane prints which controls it examined and which it had to apply.
+        self.performance_tab.apply_stored_settings()
         
     def init_ui(self):
         """Initialize the user interface."""
@@ -86,7 +93,7 @@ class MainWindow(QMainWindow):
         self.automation_tab = AutomationTab()
         self.point_clouds_tab = PointCloudsTab()
         self.mesh_tools_tab = MeshToolsTab()
-        self.performance_tab = PerformanceTab()
+        self.performance_tab = PerformanceTab(job_manager=self.job_manager)
         self.diagnostics_tab = DiagnosticsTab()
         self.scripting_tab = ScriptingTab(main_window=self)
         self.pipeline_tab = PipelineEditorTab()

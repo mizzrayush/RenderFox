@@ -11,13 +11,17 @@ a reader, and **88 had no reader at all** - a failure caught, described, and wri
 stream the package closes.
 
 Those 88 are now records. Measured the same way on this tree: **12 stream writes** left, 0 of them
-unreadable, and **239 log records** written by 33 of the 71 files where 151 were written by 16 -
+unreadable, and **240 log records** written by 33 of the 73 files where 151 were written by 16 -
 the arithmetic the suite pins, because a report that changed channel rather than vanishing is the
-whole claim. The levels are 103 `warning`, 68 `error`, 60 `info`, 6 `debug` and 2 `logger.exception`.
-The count is back to the 239 the channel phase recorded, for the opposite reason: that phase lost a
-warning written by a method no caller reached - the shadowed `update_model_info` in the Model pane -
-and a record that cannot run is not a report, while `main.py:235` writes the one this number gained
-on a quit that leaves a window on screen, which is a branch that runs.
+whole claim. The levels are 104 `warning`, 68 `error`, 60 `info`, 6 `debug` and 2 `logger.exception`.
+The file count is 73 and not 71 because 7b-1 shipped `src/utils/app_settings.py` and
+`src/features/performance_controls.py`, neither of which emits. The count is the channel phase's 239
+plus one, and the one is this phase's: the pane lost the `update_system_info` warning that sat in a
+method it no longer has (HEAD `src/ui/performance_tab.py:1117`) and gained two failure channels for
+work that used to reach only the screen - `on_identity_reader_failed` (`:1134`) and
+`on_memory_task_failed` (`:1636`). A record on a branch that runs is the claim; the earlier
+correction ran the other way, when that phase lost a warning written by a shadowed
+`update_model_info` no caller could reach, and a record that cannot run is not a report.
 Rules 5 and 6 found seventeen defects on the tree the sweep landed on, all of them records the
 channel was already losing: three calls written on the root logger, whose rows are named `root`,
 and fourteen sentences that needed a glyph to be understood.
@@ -437,8 +441,8 @@ class TestInstrument(unittest.TestCase):
                 else:
                     through_a_module_logger += 1
         self.assertEqual(0, on_root, 'a record is written on the root logger after all')
-        self.assertEqual(239, sum(levels.values()),
-                         f'the tree writes {sum(levels.values())} records, not the 239 this file '
+        self.assertEqual(240, sum(levels.values()),
+                         f'the tree writes {sum(levels.values())} records, not the 240 this file '
                          'documents: re-measure, then correct the docstring')
         self.assertGreaterEqual(through_a_module_logger, 230, 'rules 5 and 6 have almost nothing to read')
         self.assertGreaterEqual(len(emitters), 30, f'only {len(emitters)} files emit at all')

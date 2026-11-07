@@ -1142,7 +1142,11 @@ class Test85TheWords(unittest.TestCase):
             for claim in RATINGS:
                 self.assertNotIn(claim, text, f'{os.path.basename(path)} still ranks a machine')
         self.assertIn('benchmark_engine()', source(DIAG_FILE))
-        self.assertIn('engine.run(', source(PANE))
+        self.assertIn('analyzer.run_benchmark(', source(PANE),
+                      'the pane times work around the analyzer, which is where the two '
+                      'boxes the storage kind reads are handed to the engine')
+        self.assertNotIn('BenchmarkRunner()', source(PANE),
+                         'the pane keeps its own engine, so one machine is timed twice')
         self.assertIn('BenchmarkRunner.describe(', source(DIAG_FILE),
                       'the Diagnostics pane is wording a benchmark sentence itself')
 
@@ -1160,7 +1164,9 @@ class Test85TheWords(unittest.TestCase):
                          'a second name for the cpu work is back, and nothing calls it')
         self.assertNotIn('benchmark.run_cpu', source(PANE),
                          'the pane reached around the engine again')
-        for call in ('engine.run(', 'engine.run_all('):
+        self.assertNotIn('.run_gpu_benchmark(', source(PANE),
+                         'the pane timed a GPU it cannot time')
+        for call in ('analyzer.run_benchmark(', 'analyzer.run_all_benchmarks('):
             self.assertIn(call, source(PANE), f'{call} is how the pane times work')
         self.assertIn('def run_gpu_benchmark', code_of(ENGINE_FILE),
                       'the gpu verb answers the label the Geometry button used to carry; '
@@ -1255,7 +1261,6 @@ class Test97PerformancePane(unittest.TestCase):
         from PyQt6.QtCore import QThreadPool
         self.tab.performance_analyzer.stop_monitoring()
         self.tab.update_timer.stop()
-        self.tab.system_monitor.timer.stop()
         QThreadPool.globalInstance().waitForDone(15000)
         self.tab.close()
         self.app.processEvents()
@@ -1274,10 +1279,13 @@ class Test97PerformancePane(unittest.TestCase):
         engine = self.tab.performance_analyzer.benchmark
         engine.run_calls = []
         engine.gave_a_progress_callback = []
+        engine.run_work = []
+        engine.run_all_work = []
 
         def run(kind, duration=2.0, record=False, should_stop=None,
                 progress_callback=None, **work):
             engine.run_calls.append(kind)
+            engine.run_work.append(work)
             engine.gave_a_progress_callback.append(callable(progress_callback))
             if progress_callback:
                 progress_callback(37)
@@ -1285,8 +1293,10 @@ class Test97PerformancePane(unittest.TestCase):
                 raise raises
             return dict(result, kind=kind)
 
-        def run_all(duration=2.0, record=False, should_stop=None, progress_callback=None):
+        def run_all(duration=2.0, record=False, should_stop=None, progress_callback=None,
+                    **work):
             engine.run_calls.append('all')
+            engine.run_all_work.append(work)
             engine.gave_a_progress_callback.append(callable(progress_callback))
             # The real run_all forwards the callback into each kind; silence here would
             # let a bar wired to nothing look like a bar wired to the engine.
@@ -1401,7 +1411,10 @@ class Test97PerformancePane(unittest.TestCase):
         self.assertEqual((0, 100), (self.tab.benchmark_progress.minimum(),
                                     self.tab.benchmark_progress.maximum()),
                          'a bar whose range is 0 to 0 throws every figure away')
-        self.assertEqual(1, len(self.tab._workers), 'the worker could have been collected')
+        self.assertEqual(0, self.tab.shutdown_runs(),
+                         'the pane still owes a run after its answer landed: what it holds '
+                         'is what it has not released, and a held run is a thread that has '
+                         'nowhere to deliver')
         self.assertTrue(all(button.isEnabled() for button in (
             self.tab.benchmark_cpu_btn, self.tab.benchmark_geometry_btn,
             self.tab.benchmark_memory_btn, self.tab.benchmark_storage_btn,
@@ -1553,7 +1566,6 @@ class Test107MetricsShape(unittest.TestCase):
         finding = detector.analyze(metrics(memory_percent=LIMITS['memory_percent'] + 20))[0]
         self.assertIn('this app checks itself against', finding['because'])
         self.assertIn('24% past the', finding['because'])
-
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
