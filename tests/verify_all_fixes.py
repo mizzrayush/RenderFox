@@ -19,11 +19,32 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 
+from src.utils import run_teardown
+
 class TestRenderFoxRectification(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Create single QApplication instance for UI tests
         cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    @classmethod
+    def tearDownClass(cls):
+        # The same drain `main.py` runs on the way out of its event loop, so this suite leaves by
+        # the one path the product does. #50 owns the shape: a window carried into interpreter
+        # finalization is where `0xc0000409` comes from - a fast fail with no traceback, which is
+        # how a run of this file that printed `OK` reached the audit as a FAIL - and the drain is
+        # the version of the exit that cannot lose that race. Measured on this tree it does not
+        # recur: six runs, three on the committed version of this file and three with this
+        # teardown in it, every one of them exit 0. The line stays for the two facts that are not
+        # about a race. `unittest` frees a test's own locals before finalizing, so what reaches
+        # here is held by a name outliving the method - `cls.app`, a pane's singleton, a
+        # registration in a module - and only a walk of `topLevelWidgets()` reaches those. And
+        # teardown is the only point that runs whatever a test did in between, including a test
+        # that failed halfway and never reached its own cleanup.
+        owed = run_teardown.shutdown(cls.app)
+        if owed:
+            raise AssertionError(
+                'this suite finished with window(s) still on screen: %s' % ', '.join(sorted(owed)))
 
     def test_01_imports_and_encodings(self):
         """Test that all core and processing modules import cleanly."""
@@ -256,14 +277,25 @@ class TestRenderFoxRectification(unittest.TestCase):
         from src.ui.main_window import MainWindow
         from src.processing.script_engine import ScriptAPI
         
-        with patch.object(QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Ok), \
-             patch.object(QMessageBox, 'critical', return_value=QMessageBox.StandardButton.Ok), \
-             patch.object(QFileDialog, 'getOpenFileName', return_value=("", "")), \
-             patch.object(QFileDialog, 'getExistingDirectory', return_value=""):
-            mw = MainWindow()
-            api = ScriptAPI(main_window=mw)
-            models = api.get_library_models()
-            self.assertIsInstance(models, list)
+        window = None
+        try:
+            with patch.object(QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Ok), \
+                 patch.object(QMessageBox, 'critical', return_value=QMessageBox.StandardButton.Ok), \
+                 patch.object(QFileDialog, 'getOpenFileName', return_value=("", "")), \
+                 patch.object(QFileDialog, 'getExistingDirectory', return_value=""):
+                mw = MainWindow()
+                window = mw
+                api = ScriptAPI(main_window=mw)
+                models = api.get_library_models()
+                self.assertIsInstance(models, list)
+        finally:
+            # The window carries a database connection and the threads the panes own, and the
+            # name `mw` is a test local, so without this it is `tearDownClass`'s drain that
+            # closes it - several seconds later than the last thing it was needed for.
+            if window is not None:
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
 
 if __name__ == '__main__':
     unittest.main()

@@ -26,7 +26,7 @@ cannot stay is the write to a stream the package closes.
 **Rule 4 is the same defect everywhere else.** Ninety-three stream writes sat outside a module's
 own ``if __name__ == "__main__":`` block at the start of this phase - a failure caught, described,
 and written into the closed stream, or a shader that did not compile, or a milestone in a batch.
-Eighty-eight of them had no reader at all. Each one is a record now: the tree writes 238 of them,
+Eighty-eight of them had no reader at all. Each one is a record now: the tree writes 239 of them,
 from 33 of the 71 app files where it wrote 151 from 16, and what this rule reports is none. A rule
 scoped only to `except` handlers would have let the shader and texture lines stay invisible, and
 would not have stopped the backlog growing in a branch that has no handler.

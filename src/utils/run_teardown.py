@@ -178,3 +178,42 @@ def drain_attributes(owner, names, timeout_ms: int = 5000, pool=None):
         else:
             running.extend(still)
     return running
+
+
+def shutdown(app):
+    """Take every window down while `app` is still alive to run the delete queue.
+
+    Who holds the last reference to a top-level widget decides how a PyQt6 process leaves. Held
+    by a frame that raises `SystemExit` - `sys.exit(app.exec())`, the shape this app's entry point
+    shipped with - it survives to interpreter finalization, after `QApplication` is gone, and the
+    C++ delete that follows is what `#50` recorded as `0xc0000409`: a fast fail, no traceback,
+    nothing on stdout. `#50` recorded precisely that from `tests/verify_all_fixes.py`, a run that
+    printed `Ran 6 tests in 20.1s / OK` and left with a fail code - 3 times in 6 subprocess runs of
+    one tree and 1 in 6 of another.
+
+    This is the shape that cannot lose that race, because the windows go while `app` is still
+    there to run the queue. It is not claimed as a crash this phase cured: measured since, the
+    abort does not reproduce, twenty-two child processes over six shapes - the frame that raises
+    `SystemExit`, the drained quit, a module global, a module global with an `atexit` report of
+    its 73 surviving widgets, and `verify_all_fixes.py` on both the committed file and this one -
+    returned 0 twenty-two times. `tools/check_clean_exit.py` is what keeps it gone; run over the
+    tree as `#50` left it, it named ten findings in the five files that ended a loop that way -
+    `main.py` and the four panes with a hand-run `__main__` block, each one both the exit and no
+    drain - which is the before this change is measured against.
+
+    Only what is on screen is closed. A window that has already answered its own `closeEvent` -
+    the normal quit, and every pane's drain-every-holder walk - is not asked twice, because
+    `MainWindow.closeEvent` is where a running render refuses the exit. Returns the class names of
+    anything still visible afterwards, which is what a `closeEvent` calling `event.ignore()`
+    produces on purpose; `main.py` writes them rather than quitting quiet.
+    """
+    owed = []
+    for widget in list(app.topLevelWidgets()):
+        if widget.isVisible():
+            widget.close()
+        widget.deleteLater()
+    app.processEvents()
+    for widget in app.topLevelWidgets():
+        if widget.isVisible():
+            owed.append(type(widget).__name__)
+    return owed

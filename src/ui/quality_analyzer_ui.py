@@ -21,7 +21,7 @@ from ..features.quality_analyzer import QualityAnalyzer
 from .unified_viewer import UnifiedOpen3DViewer
 from ..processing.mesh_processor import MeshProcessor, MeshUV
 from ..utils.worker import Worker
-from ..utils.run_teardown import drain, drain_attributes
+from ..utils.run_teardown import drain, drain_attributes, shutdown
 from PyQt6.QtCore import QThreadPool
 from PyQt6.QtWidgets import QMessageBox
 
@@ -785,4 +785,6 @@ if __name__ == "__main__":
     # Set a test model
     # window.set_model("path/to/model.obj")
     
-    sys.exit(app.exec())
+    code = app.exec()
+    shutdown(app)
+    sys.exit(code)

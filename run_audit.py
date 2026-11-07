@@ -249,6 +249,13 @@ SUITES = [
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_all_tabs_headless.py")],
         "description": "Runs full Qt offscreen driver across all 15 tabs using procedural edge-case 3D meshes, every file reader's release, and a close driven over a run still in flight",
         "timeout_seconds": 240
+    },
+    {
+        "id": "clean_exit_contract",
+        "name": "Who Ends the Event Loop, and What Still Owns a Window When It Does",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_clean_exit_contract.py")],
+        "description": "#50 was a suite that printed OK and was scored FAIL, because PyQt6 answers a fault at the edge of a C++ frame with `0xc0000409` and this audit reads a run by its return code. The shape that decides it is who holds the last Python reference to a top-level widget when the interpreter starts tearing itself down, so `tools/check_clean_exit.py` is run over the shipped tree - all 71 files in app scope - and five rules are asked: no Qt event loop may be the argument of the exit, every file that owns a `QApplication` must hand it to `src/utils/run_teardown.shutdown` between the loop and the leaving, the drain itself must still close what is on screen, schedule it for deletion, run the queue and report what stayed, `tests/verify_all_fixes.py` must drain in `tearDownClass` rather than in a test that a halfway failure never reaches, and nothing in app scope may register an `atexit` hook. Reach is measured, not assumed: the report has to name the five files that own a loop and count five loops, five drained. Each rule is then shown blind to nothing, by a defect planted in a module written for the run, and the instrument is broken one rule at a time. Two child processes answer what cannot be tested in-process: the shipped `sys.exit(app.exec())` shape with a window in the frame (recorded at exit 0 today, so the abort is not claimed as cured and the tripwire is there if a future Qt turns it back on), and the app's own ending - loop returns 3, the drain names the window that refused the close, the process leaves with 3. The third is the release defect this phase found by hanging on it: the crash reporter shows a modal dialog whenever a QApplication exists, which in an offscreen run is a button nobody can press, so it is guarded on Qt's own `platformName()` and the test requires the handler back in well under a second with its crash record already written",
+        "timeout_seconds": 240
     }
 ]
 

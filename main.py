@@ -20,6 +20,7 @@ from PyQt6.QtCore import Qt
 # from src.ui.main_window import MainWindow  # Moved inside main()
 from src.utils.telemetry import get_telemetry
 from src.utils import early_log
+from src.utils import run_teardown
 
 
 logger = logging.getLogger(__name__)
@@ -52,9 +53,16 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
     except Exception as failed:
         logger.error("Could not record the crash in telemetry: %s", failed)
 
-    # Show error dialog
+    # Show error dialog - unless there is nobody to press its button. `msg.exec()` is modal, and
+    # in an offscreen process (every suite the audit chain runs, and `installer.nsi`'s headless
+    # mode) the raise that reached here is usually the one that ends the run: the crash record
+    # above is written, and the process then waits forever for a click that cannot happen, so a
+    # failure arrives as a timeout with no code and no line. Measured in a child with the platform
+    # name checked: the handler returns in 0.0 s; with the guard taken out the same call is still
+    # waiting at 25 s, which is where `tests/test_clean_exit_contract.py` kills it and names the
+    # defect. `platformName` is Qt's own answer, not a guess from the environment.
     app = QApplication.instance()
-    if app:
+    if app and app.platformName() != 'offscreen':
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Icon.Critical)
         msg.setWindowTitle("RenderFox Crash Reporter")
@@ -213,8 +221,20 @@ def main():
     if 'splash' in locals() and splash:
         splash.finish(main_window)
     
-    # Start the application event loop
-    sys.exit(app.exec())
+    # Start the application event loop, and take the windows down on the way out of it.
+    code = app.exec()
+
+    # Not `sys.exit(app.exec())`: raising SystemExit from this frame keeps the frame - and
+    # `main_window` in it - alive until interpreter finalization, when `QApplication` is already
+    # gone and the delete that follows is a C++ call into an app that is not there. That is the
+    # shape `#50` recorded a suite dying from at `0xc0000409`, with nothing for `sys.excepthook`
+    # to see; it does not reproduce on this tree, which `run_teardown.shutdown`'s own docstring
+    # says with numbers, and a release does not get to depend on which side of that race wins.
+    owed = run_teardown.shutdown(app)
+    if owed:
+        logger.warning("Quit left %d window(s) still on screen: %s", len(owed), ', '.join(owed[:6]))
+    del main_window
+    return code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

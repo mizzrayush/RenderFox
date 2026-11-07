@@ -153,7 +153,14 @@ class FeedbackDialog(QDialog):
 
 if __name__ == "__main__":
     from PyQt6.QtWidgets import QApplication
+    # This file reaches nothing in `src` on its own, and `python src/ui/feedback_dialog.py` puts
+    # `src/ui` - not the package root - on the path, so the drain has to be named from a file
+    # that can find it. `python -m` needs neither line and ignores the duplicate.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from src.utils.run_teardown import shutdown
     app = QApplication(sys.argv)
     dialog = FeedbackDialog()
     dialog.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    shutdown(app)
+    sys.exit(code)

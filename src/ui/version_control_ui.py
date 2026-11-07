@@ -25,6 +25,7 @@ from ..features.version_control import (AssetVersionControl, NOT_COMPARABLE, des
                                         describe_polygon_count, describe_volume,
                                         describe_watertight)
 from .icon_provider import get_icon
+from ..utils.run_teardown import shutdown
 
 logger = logging.getLogger(__name__)
 
@@ -928,4 +929,6 @@ if __name__ == "__main__":
     window.resize(1400, 900)
     window.show()
     
-    sys.exit(app.exec())
+    code = app.exec()
+    shutdown(app)
+    sys.exit(code)

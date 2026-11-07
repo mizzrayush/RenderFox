@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QFileDialog, QMessageBox)
 
 from ..features.ai_asset_tagger import AIAssetTagger
-from ..utils.run_teardown import drain_attributes
+from ..utils.run_teardown import drain_attributes, shutdown
 from .icon_provider import get_icon
 
 logger = logging.getLogger(__name__)
@@ -883,4 +883,9 @@ if __name__ == "__main__":
     window.resize(1200, 800)
     window.show()
     
-    sys.exit(app.exec())
+    # The loop's result is taken before the exit and the windows go through the drain `main.py`
+    # runs: `sys.exit(app.exec())` carries this frame, and the window in it, into interpreter
+    # finalization, where `QApplication` is already gone.
+    code = app.exec()
+    shutdown(app)
+    sys.exit(code)
