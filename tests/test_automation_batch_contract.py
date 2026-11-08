@@ -48,7 +48,8 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
 
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QFileDialog,
+                             QLabel, QLineEdit, QMessageBox, QSpinBox)
 
 from src.features import automation_engine as engine_module
 from src.features.automation_engine import (
@@ -577,6 +578,19 @@ class PaneCase(DirCase):
                 return
         raise AssertionError(f'{data} is not offered')
 
+    def set_params(self, values):
+        """Put values into the fields the registry generated, by the name each one uses."""
+        for name, value in values.items():
+            widget = self.tab._batch_param_fields[name]
+            if isinstance(widget, QSpinBox):
+                widget.setValue(int(value))
+            elif isinstance(widget, QDoubleSpinBox):
+                widget.setValue(float(value))
+            elif isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            else:
+                widget.setText(str(value))
+
     def configure(self, operation='file.copy', folder=None,
                   output=None, params=None, kinds=None, recursive=None,
                   overwrite=None, backup=None, library=False):
@@ -588,7 +602,7 @@ class PaneCase(DirCase):
         if output is not None:
             self.tab.output_path_edit.setText(output)
         if params is not None:
-            self.tab.batch_params_edit.setText(params)
+            self.set_params(params)
         if kinds is not None:
             self.tab.file_types_edit.setText(kinds)
         if recursive is not None:
@@ -846,21 +860,21 @@ class PaneCase(DirCase):
         self.assertEqual(len(self.warnings()), 1, self.warnings())
         self.assertIn('ghost', self.warnings()[0])
 
-    def test_55_parameters_are_read_as_data_by_the_same_parser_the_tasks_use(self):
+    def test_55_parameters_are_read_as_the_types_the_registry_checks(self):
         self.ready_folder('hero.obj', operation='processing.generate_lod',
-                          params='"levels": 2')
+                          params={'levels': 2})
         plan = self.tab._batch_plan()
         self.assertEqual(plan['params'], {'levels': 2})
         self.assertEqual(plan['ready'][0][1], {'input_file': plan['ready'][0][0],
                                                'output_dir': self.out, 'levels': 2})
-        self.configure(params='levels = two')
+        self.set_params({'levels': 0})
         plan = self.tab._batch_plan()
-        self.assertEqual(plan['ready'], [])
-        self.assertIn('name/value pairs', plan['blocked'][0])
+        self.assertEqual(plan['params'], {}, 'a field left at not set was still sent')
+        self.assertNotIn('levels', plan['ready'][0][1])
 
     def test_56_a_command_batch_is_previewed_once_per_file(self):
         self.ready_folder('a.obj', 'b.obj', operation='system.run_command',
-                          params='"command": "build.py {file}"')
+                          params={'command': 'build.py {file}'})
         self.tab.preview_batch_btn.click()
         log = self.tab.batch_log.toPlainText()
         self.assertIn('build.py ' + os.path.join(self.src, 'a.obj'), log)
@@ -1132,21 +1146,22 @@ class PaneCase(DirCase):
                         'the backup the plan promised was not made')
 
     def test_78_preview_lists_a_file_the_registry_refuses(self):
-        """A parameter the action never mentions is a blocked line, not a crash.
+        """A command the registry will not run is a blocked line, not a crash.
 
         Without this the plan reaches for `kwargs.get` on the None the registry answered
         with. That raises inside a Qt slot, and PyQt6 aborts the process on an unhandled
         exception there (0xC0000409) rather than failing a test, so the handler is called
         directly - `test_33` already proves the button is connected to it.
         """
-        self.ready_folder('a.obj', 'b.obj', params='"levels": 2')
+        self.ready_folder('a.obj', 'b.obj', operation='system.run_command',
+                          params={'command': 'build.py'})
         plan = self.tab._batch_plan()
         self.assertEqual(plan['ready'], [], plan)
         self.assertEqual(len(plan['blocked']), 2, plan['blocked'])
         self.tab.preview_batch()
         log = self.tab.batch_log.toPlainText()
-        self.assertIn('0 file(s) would run as file.copy', log)
-        self.assertIn('levels', log)
+        self.assertIn('0 file(s) would run as system.run_command', log)
+        self.assertIn('{file}', log)
         self.assertEqual(len(self.warnings()), 1, self.warnings())
         self.assertEqual(self.tab.batch_status_label.text(), 'Preview: nothing can run yet.')
 
@@ -1170,7 +1185,7 @@ class PaneCase(DirCase):
         """
         self.cube(self.src, 'hero.obj')
         self.configure(operation='processing.convert_format', folder=self.src,
-                       output=self.out, params='"output_format": "stl"', backup=False)
+                       output=self.out, params={'output_format': 'stl'}, backup=False)
         plan = self.tab._batch_plan()
         self.assertEqual(len(plan['ready']), 1, plan)
         self.assertEqual(plan['ready'][0][1]['destination'],
@@ -1197,7 +1212,7 @@ class PaneCase(DirCase):
         for name in ('a.obj', 'b.obj'):
             self.cube(self.src, name)
         self.configure(operation='processing.convert_format', folder=self.src,
-                       output=self.out, params='"output_format": "stl"', backup=False)
+                       output=self.out, params={'output_format': 'stl'}, backup=False)
         self.tab.start_batch_operation()
         self.settle()
         self.assertEqual(sorted(os.listdir(self.out)), ['a.stl', 'b.stl'])
@@ -1215,7 +1230,7 @@ class PaneCase(DirCase):
         with open(already, 'w', encoding='utf-8') as handle:
             handle.write('mine')
         self.configure(operation='processing.convert_format', folder=self.src,
-                       output=self.out, params='"output_format": "stl"',
+                       output=self.out, params={'output_format': 'stl'},
                        overwrite=False, backup=False)
         plan = self.tab._batch_plan()
         self.assertEqual(plan['ready'], [], plan)
@@ -1230,7 +1245,7 @@ class PaneCase(DirCase):
         for name in ('a.obj', 'b.obj'):
             self.cube(self.src, name)
         self.configure(operation='file.thumbnail', folder=self.src, output=self.out,
-                       params='"size": 4', backup=False)
+                       params={'size': 4}, backup=False)
         self.tab.start_batch_operation()
         self.settle()
         self.assertEqual(self.tab.batch_status_label.text(),
@@ -1324,6 +1339,150 @@ class PaneCase(DirCase):
         self.assertNotIn('_open_in_batch_processor', library)
         # Nothing is queued by this app, so nothing may promise a queue.
         self.assertNotIn('Add to Batch Queue', library)
+
+    # --- the parameter fields the registry generates ---------------------------
+    def form_rows(self):
+        """The captions the pane writes above its fields, as they read on screen."""
+        return [one.text() for one in
+                self.tab.batch_params_form.findChildren(QLabel)]
+
+    def test_110_the_form_offers_one_field_per_parameter_the_batch_cannot_fill(self):
+        """Every action's fields are its own declared parameters, less what the loop fills."""
+        for action_id in BATCH_IDS:
+            self.pick(self.tab.operation_combo, action_id)
+            offered = sorted(self.tab._batch_param_fields)
+            item_param, folder_param = ActionRegistry.batch_binding(action_id)
+            wanted = sorted(one for one in ActionRegistry.parameter_names(action_id)
+                            if one != folder_param
+                            and (one != item_param or item_param == 'command'))
+            self.assertEqual(offered, wanted, action_id)
+
+    def test_111_each_field_holds_the_type_the_registry_checks(self):
+        """A spin box cannot hold text and a check box cannot hold a number, so what
+        reaches `validate` is the kind the action named - nothing has to be parsed."""
+        kinds = {'int': QSpinBox, 'float': QDoubleSpinBox, 'bool': QCheckBox,
+                 'str': QLineEdit}
+        for action_id in BATCH_IDS:
+            self.pick(self.tab.operation_combo, action_id)
+            for field in ActionRegistry.param_form(action_id):
+                widget = self.tab._batch_param_fields[field['name']]
+                self.assertIsInstance(widget, kinds[field['type']],
+                                      f"{action_id}.{field['name']} is a "
+                                      f"{type(widget).__name__}, not a {field['type']}")
+
+    def test_112_a_field_names_the_default_the_action_itself_carries(self):
+        self.pick(self.tab.operation_combo, 'file.thumbnail')
+        self.assertIn('default 256', ' '.join(self.form_rows()))
+        signature = inspect.signature(ActionRegistry.get_action('file.thumbnail'))
+        self.assertEqual(signature.parameters['size'].default,
+                         ActionRegistry.parameter_defaults('file.thumbnail')['size'],
+                         'the pane promised a default the function does not use')
+
+    def test_113_an_action_that_takes_no_parameter_shows_the_reason(self):
+        """Coming from an action that does have parameters leaves none of them behind."""
+        self.pick(self.tab.operation_combo, 'processing.simplify_to_faces')
+        self.assertEqual(self.tab.batch_params_form_layout.count(), 10,
+                         'five parameters should be five rows and five captions')
+        for action_id in ('file.copy', 'file.delete', 'processing.repair_mesh'):
+            self.pick(self.tab.operation_combo, action_id)
+            self.assertEqual(self.tab._batch_param_fields, {}, action_id)
+            self.assertEqual(self.tab.batch_params_form_layout.count(), 1,
+                             f'{action_id} left the previous operation still on screen')
+            self.assertIn('nothing to set', ' '.join(self.form_rows()))
+            self.assertEqual(self.tab._form_parameters(), {})
+
+    def test_114_the_command_field_is_what_becomes_each_files_command(self):
+        self.ready_folder('a.obj', operation='system.run_command',
+                          params={'command': 'build.py {file}'})
+        self.assertIn('command (no default - the action will not run without it)',
+                      self.form_rows())
+        plan = self.tab._batch_plan()
+        self.assertEqual(plan['params'], {'command': 'build.py {file}'})
+        self.assertIn('"command": "build.py {file}"', '\n'.join(plan['lines']))
+        self.assertEqual(plan['ready'][0][1]['command'],
+                         f'build.py {os.path.join(self.src, "a.obj")}')
+        self.set_params({'command': ''})
+        plan = self.tab._batch_plan()
+        self.assertEqual(plan['ready'], [], plan)
+        self.assertIn('{file}', plan['blocked'][0])
+
+    def test_115_a_number_the_engine_will_not_draw_reaches_its_own_refusal(self):
+        """The field accepts what the engine refuses, so the limit is named, not hidden."""
+        self.ready_folder('a.obj', operation='file.thumbnail')
+        box = self.tab._batch_param_fields['size']
+        box.setValue(8000)
+        self.assertEqual(box.value(), 8000, 'the field clamped the number away')
+        plan = self.tab._batch_plan()
+        self.assertEqual(len(plan['ready']), 1, plan)
+        run_one = self.tab._batch_operation(plan['action'], self.out, plan['params'],
+                                            {'overwrite': False, 'backup': False})
+        outcome = run_one(plan['ready'][0][0])
+        self.assertFalse(outcome['success'], outcome)
+        self.assertIn('16 and 4096', outcome['error'])
+
+    def test_116_a_ratio_that_is_not_a_fraction_is_refused_before_it_is_written(self):
+        """`kept 3 of 1200 faces` would be a sentence about a reduction that never happened."""
+        self.cube(self.src, 'hero.obj')
+        self.configure(operation='processing.simplify_by_ratio', folder=self.src,
+                       output=self.out, params={'ratio': 3.0}, backup=False)
+        destination = os.path.join(self.out, 'hero.obj')
+        self.tab.start_batch_btn.click()
+        self.settle()
+        self.assertIn('not a fraction', self.tab.batch_log.toPlainText())
+        self.assertFalse(os.path.exists(destination),
+                        'the refused simplify left a file behind')
+        self.assertEqual(self.tab.batch_status_label.text(),
+                         'Finished 1 file(s): 0 ok, 1 failed')
+
+    def test_117_a_leftover_value_does_not_leak_into_the_next_operations_plan(self):
+        self.pick(self.tab.operation_combo, 'processing.convert_format')
+        self.set_params({'output_format': 'stl'})
+        self.assertEqual(self.tab._form_parameters(), {'output_format': 'stl'})
+        self.pick(self.tab.operation_combo, 'processing.generate_lod')
+        self.assertEqual(self.tab._form_parameters(), {},
+                         'the format the previous operation was given is still being sent')
+
+    def test_118_a_bool_field_sends_true_only_when_it_is_switched_on(self):
+        action = 'processing.simplify_to_faces'
+        self.pick(self.tab.operation_combo, action)
+        flags = sorted(one['name'] for one in ActionRegistry.param_form(action)
+                       if one['type'] == 'bool')
+        self.assertEqual(flags, ['preserve_boundary', 'preserve_normal',
+                                 'preserve_topology'])
+        defaults = ActionRegistry.parameter_defaults(action)
+        for name in flags:
+            self.assertIs(defaults[name], False,
+                          f'{name} starts unchecked, which sends nothing, so a default of '
+                          'True would not be what runs')
+        self.assertEqual([one for one in self.tab._form_parameters() if one in flags], [],
+                         'an untouched box sent a value')
+        self.assertIn('preserve_boundary (default off)', self.form_rows())
+        self.set_params({'preserve_boundary': True})
+        self.assertEqual(self.tab._form_parameters()['preserve_boundary'], True)
+
+    def test_119_a_tab_the_app_builds_already_shows_its_first_operations_form(self):
+        """The fields are there before anyone touches the operation combo."""
+        fresh = AutomationTab()
+        self.addCleanup(fresh.deleteLater)
+        self.assertEqual(fresh._batch_action(), BATCH_IDS[0])
+        self.assertIn('nothing to set', ' '.join(
+            one.text() for one in fresh.batch_params_form.findChildren(QLabel)))
+        APP.processEvents()
+
+    def test_120_a_field_left_alone_sends_nothing_for_every_action(self):
+        """An untouched form is not a parameter set; it is the absence of one.
+
+        The empty state each widget starts in - zero, unchecked, blank - is what it shows
+        before anyone touches it, so sending it would put a value in the call that nobody
+        chose. That is the same mistake the deleted batch pane made in reverse: reporting
+        the settings it was handed as if they were the results it produced.
+        """
+        for action_id in BATCH_IDS:
+            self.pick(self.tab.operation_combo, action_id)
+            fields = ActionRegistry.param_form(action_id)
+            self.assertEqual(sorted(self.tab._batch_param_fields),
+                             sorted(one['name'] for one in fields), action_id)
+            self.assertEqual(self.tab._form_parameters(), {}, action_id)
 
 
 class MeshOperationCase(DirCase):

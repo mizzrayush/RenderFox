@@ -8,6 +8,7 @@ import time
 import json
 import logging
 import fnmatch
+import inspect
 import calendar
 import subprocess
 from datetime import datetime, timedelta
@@ -75,6 +76,10 @@ class ActionRegistry:
     _actions: Dict[str, Callable] = {}
     _descriptions: Dict[str, str] = {}
     _param_specs: Dict[str, Dict] = {}
+    # What each parameter holds when nothing is sent for it, read off the action's own
+    # signature when it is registered. The pane that builds a field per parameter shows
+    # these, so the default a person reads is the default the call would use.
+    _param_defaults: Dict[str, Dict[str, Any]] = {}
     # An action that says how a batch feeds it one file - (the parameter the file goes
     # into, the parameter the output folder goes into, or None when it leaves no file of
     # its own) - can be repeated over a list. The rest cannot be, so they are not offered.
@@ -90,6 +95,7 @@ class ActionRegistry:
         cls._actions[action_id] = func
         cls._descriptions[action_id] = description
         cls._param_specs[action_id] = params or {}
+        cls._param_defaults[action_id] = cls._signature_defaults(func, params or {})
         cls._batch_specs[action_id] = tuple(batch) if batch else None
         cls._batch_extensions[action_id] = str(batch_extension or '').strip().lstrip('.').lower()
         logger.debug("Registered action: %s", action_id)
@@ -98,6 +104,21 @@ class ActionRegistry:
     def get_action(cls, action_id: str) -> Optional[Callable]:
         """Get action callable by ID."""
         return cls._actions.get(action_id)
+
+    @staticmethod
+    def _signature_defaults(func: Callable, spec: Dict) -> Dict[str, Any]:
+        """What each registered parameter holds when nothing is sent for it.
+
+        The action's own python signature is the only thing that knows, so the default a
+        pane promises and the default the call uses cannot drift apart. Handing the
+        numbers to the registration line is how those two disagree.
+        """
+        try:
+            parameters = inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return {}
+        return {name: item.default for name, item in parameters.items()
+                if name in spec and item.default is not inspect.Parameter.empty}
         
     @classmethod
     def get_all_actions(cls) -> Dict[str, Dict]:
@@ -373,6 +394,14 @@ class ActionRegistry:
             from ..processing.mesh_processor import MeshSimplifier
             if not os.path.isfile(input_file):
                 raise FileNotFoundError(f"there is no model at {input_file}")
+            # The backend keeps a fraction it is handed by clamping it into 0..1, and a
+            # sentence that prints the number asked for after that would report a
+            # reduction that never happened. So a number that is not a fraction is
+            # answered here, before the file is written.
+            if not 0 < float(ratio) <= 1:
+                return {'success': False,
+                        'error': f"ratio {ratio} is not a fraction of the faces a mesh has; "
+                                 "give a number above 0 and up to 1"}
             outcome = MeshSimplifier.simplify_ratio(
                 input_file, destination, ratio=float(ratio)) or {}
             if not outcome.get('success'):
@@ -636,6 +665,35 @@ class ActionRegistry:
     def parameter_names(cls, action_id: str) -> list:
         """The parameters this action was registered with, by name."""
         return sorted(cls._param_specs.get(action_id) or {})
+
+    @classmethod
+    def parameter_defaults(cls, action_id: str) -> Dict[str, Any]:
+        """The value each parameter holds when the call sends nothing for it."""
+        return dict(cls._param_defaults.get(action_id) or {})
+
+    @classmethod
+    def param_form(cls, action_id: str) -> list:
+        """One field per parameter a batch cannot fill for itself, as the action declares it.
+
+        The file the loop is holding goes into the binding's first parameter and the output
+        folder into its second, so a field for either would only let a person overrule the
+        value the batch already knows. `command` is the exception: the batch only puts the
+        path into the text, and the text has to be written by someone first.
+        """
+        spec = cls._param_specs.get(action_id) or {}
+        binding = cls._batch_specs.get(action_id)
+        defaults = cls.parameter_defaults(action_id)
+        fields = []
+        for name in sorted(spec):
+            if binding and len(binding) == 2:
+                item_param, folder_param = binding
+                if name == folder_param or (name == item_param and item_param != 'command'):
+                    continue
+            fields.append({'name': name,
+                           'type': str(spec[name].get('type') or 'str'),
+                           'required': bool(spec[name].get('required')),
+                           'default': defaults.get(name)})
+        return fields
 
     @classmethod
     def bind_batch_params(cls, action_id: str, item: str, output_dir: str = '',

@@ -295,12 +295,13 @@ class AutomationTab(QWidget):
         """Batch pane: one registry action repeated over a list of real files.
 
         Every control here changes a call the app can make: the operations are the
-        registry's own, `Files` picks which files a folder gives up, `Parameters` is read
-        by the same parser the task editor uses, and Preview prints the exact arguments
-        each file would get. What this tab used to hold - five source types, nine
-        operation names, a target-format list and a LOD group - matched no action
-        anywhere in the app, and Start Batch fell over on a progress value the file
-        only ever mentioned and never assigned.
+        registry's own, `Files` picks which files a folder gives up, `Parameters` is a
+        field per parameter the registry says the action takes - each one holding the type
+        it checks and naming the default the action's own signature carries - and Preview
+        prints the exact arguments each file would get. What this tab used to hold - five
+        source types, nine operation names, a target-format list and a LOD group - matched
+        no action anywhere in the app, and Start Batch fell over on a progress value the
+        file only ever mentioned and never assigned.
         """
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -342,10 +343,11 @@ class AutomationTab(QWidget):
         controls_layout.addWidget(self.browse_output_btn, 3, 3)
 
         controls_layout.addWidget(QLabel("Parameters:"), 4, 0)
-        self.batch_params_edit = QLineEdit()
-        self.batch_params_edit.setPlaceholderText(
-            '"levels": 2   or   "command": "py export.py {file}"')
-        controls_layout.addWidget(self.batch_params_edit, 4, 1, 1, 3)
+        self.batch_params_form = QWidget()
+        self.batch_params_form_layout = QGridLayout(self.batch_params_form)
+        self.batch_params_form_layout.setContentsMargins(0, 0, 0, 0)
+        self._batch_param_fields = {}
+        controls_layout.addWidget(self.batch_params_form, 4, 1, 1, 3)
 
         self.recursive_cb = QCheckBox("Include subfolders")
         self.recursive_cb.setChecked(True)
@@ -406,6 +408,7 @@ class AutomationTab(QWidget):
         execution_group.setLayout(execution_layout)
         layout.addWidget(execution_group)
 
+        self._fill_batch_param_form()
         self._update_batch_controls()
 
         return widget
@@ -1128,6 +1131,7 @@ class AutomationTab(QWidget):
         # Batch operations
         self.source_type_combo.currentTextChanged.connect(self._update_batch_controls)
         self.operation_combo.currentIndexChanged.connect(self._update_batch_controls)
+        self.operation_combo.currentIndexChanged.connect(self._fill_batch_param_form)
         self.start_batch_btn.clicked.connect(self.start_batch_operation)
         self.pause_batch_btn.clicked.connect(self.toggle_batch_pause)
         self.stop_batch_btn.clicked.connect(self.stop_batch_operation)
@@ -1785,6 +1789,104 @@ class AutomationTab(QWidget):
                     f"output folder given as {folder_param}.")
         return f"Runs on each file as {item_param}, and leaves no file of its own."
 
+    @staticmethod
+    def _default_words(field):
+        """What runs when this field is left alone, said from the default the action carries."""
+        value = field['default']
+        if field['required'] and value is None:
+            return 'no default - the action will not run without it'
+        if value is None:
+            return "leaving it not set uses the action's own choice"
+        if value == '':
+            return "leaving it blank uses the action's own choice"
+        if isinstance(value, bool):
+            return 'default on' if value else 'default off'
+        return f'default {value}'
+
+    def _param_widget(self, field):
+        """A widget that holds a value of the type the registry checks for this parameter.
+
+        The ranges reach past what the engines will accept on purpose. A number too big
+        for the engine is typed, sent, and answered with the engine's own refusal, which
+        is a result a person can read; clamping it in the widget would hide the limit
+        instead of naming it.
+        """
+        kind = field['type']
+        if kind == 'int':
+            box = QSpinBox()
+            box.setRange(0, 2_000_000_000)
+            box.setSpecialValueText('not set')
+            return box
+        if kind == 'float':
+            box = QDoubleSpinBox()
+            box.setDecimals(6)
+            box.setRange(0.0, 1_000_000.0)
+            box.setSingleStep(0.01)
+            box.setSpecialValueText('not set')
+            return box
+        if kind == 'bool':
+            return QCheckBox('on')
+        box = QLineEdit()
+        box.setPlaceholderText('not set')
+        return box
+
+    def _fill_batch_param_form(self, *_ignored):
+        """Rebuild the parameter rows for the operation now chosen, from the registry.
+
+        The rows are `ActionRegistry.param_form` for the chosen action, so an action that
+        takes nothing but the file and the folder shows that plainly, and one that gains a
+        parameter gains a field without this file being touched.
+        """
+        layout = self.batch_params_form_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        layout.setColumnStretch(1, 1)
+        self._batch_param_fields = {}
+        action = self._batch_action()
+        fields = ActionRegistry.param_form(action) if action else []
+        if not fields:
+            layout.addWidget(QLabel(
+                'choose an operation first' if not action else
+                'nothing to set - this action takes no parameter beyond what the batch '
+                'already gives it'), 0, 0, 1, 2)
+            return
+        for row, field in enumerate(fields):
+            widget = self._param_widget(field)
+            widget.setToolTip(f"{field['name']} is sent as a {field['type']}; "
+                              f"{self._default_words(field)}.")
+            layout.addWidget(QLabel('%s (%s)' % (field['name'], self._default_words(field))),
+                             row, 0)
+            layout.addWidget(widget, row, 1)
+            self._batch_param_fields[field['name']] = widget
+
+    @staticmethod
+    def _field_value(widget):
+        """What this field sends, or None when it is still showing its empty state.
+
+        None is left out of the call, which is what makes the action's own default the
+        thing that runs. The empty state of a widget is not a value a person chose: a
+        spin box at zero, a box unchecked and a line left blank all say "not set", and
+        sending them would put a parameter in the call that nobody set.
+        """
+        if isinstance(widget, QSpinBox):
+            return int(widget.value()) or None
+        if isinstance(widget, QDoubleSpinBox):
+            return float(widget.value()) or None
+        if isinstance(widget, QCheckBox):
+            return True if widget.isChecked() else None
+        return widget.text().strip() or None
+
+    def _form_parameters(self):
+        """The values the fields hold, in the types the registry checks."""
+        params = {}
+        for name, widget in self._batch_param_fields.items():
+            value = self._field_value(widget)
+            if value is not None:
+                params[name] = value
+        return params
+
     def _update_batch_controls(self, *_ignored):
         """Enable only the fields the chosen source and operation can actually use."""
         action = self._batch_action()
@@ -1879,11 +1981,7 @@ class AutomationTab(QWidget):
                    "cannot be repeated over a list")
             return {'lines': [why], 'ready': [], 'blocked': [why], 'action': action,
                     'output_dir': output_dir, 'params': {}, 'switches': switches}
-        params, complaint = self._parse_parameters(self.batch_params_edit.text())
-        if complaint:
-            return {'lines': [complaint], 'ready': [], 'blocked': [complaint],
-                    'action': action, 'output_dir': output_dir, 'params': {},
-                    'switches': switches}
+        params = self._form_parameters()
         items, why = self.collect_batch_items()
         if why:
             return {'lines': [why], 'ready': [], 'blocked': [why], 'action': action,
