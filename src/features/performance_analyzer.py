@@ -34,6 +34,7 @@ import psutil
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
+from ..utils.app_paths import data_dir as _app_data_dir
 from ..utils.frame_clock import FrameClock, shared_clock
 from . import performance_controls
 from .diagnostic_engine import SystemInfo
@@ -68,10 +69,10 @@ def data_dir() -> str:
     """The app's own data folder, where a benchmark history has to outlive a run.
 
     `RENDERFOX_DATA_DIR` points it elsewhere, which is how the suites keep their test
-    runs out of the history of the machine they run on.
+    runs out of the history of the machine they run on. `src/utils/app_paths.py` answers
+    that for the whole app now, so this says the same thing rather than a second time.
     """
-    override = os.environ.get('RENDERFOX_DATA_DIR')
-    return override if override else os.path.join(os.path.expanduser('~'), '.renderfox')
+    return _app_data_dir()
 
 
 def _stamp() -> str:

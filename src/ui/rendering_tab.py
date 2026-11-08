@@ -26,6 +26,7 @@ from PyQt6.QtGui import QAction, QIcon, QColor
 from .model_viewer import ModelViewer3D
 from .rendering.node_graph import NodeGraphWidget
 from ..core.material_data import Material
+from ..utils.app_paths import output_dir
 from .texture_generator import TextureGeneratorDialog
 from .icon_provider import get_icon
 
@@ -825,7 +826,8 @@ class RenderingTab(QWidget):
 
     def _output_seed(self):
         """Where a picture from this tab should land: beside the model, if there is one."""
-        return os.path.dirname(os.path.abspath(self.model_path)) if self.model_path else os.getcwd()
+        return (os.path.dirname(os.path.abspath(self.model_path)) if self.model_path
+                else output_dir())
 
     def _frame_name(self, extension):
         stem = os.path.splitext(os.path.basename(self.model_path))[0] if self.model_path else 'render'

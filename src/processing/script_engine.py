@@ -16,6 +16,8 @@ import sqlite3
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+from ..utils.app_paths import output_dir
+
 
 class ModelWrapper:
     """Wrapper for 3D model manipulation in scripts."""
@@ -370,7 +372,7 @@ class ScriptLibrary:
     
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            db_path = os.path.join(os.path.dirname(__file__), '..', '..', 'output', 'scripts.db')
+            db_path = os.path.join(output_dir(), 'scripts.db')
         
         self.db_path = db_path
         self._init_database()

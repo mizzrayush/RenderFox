@@ -4,7 +4,6 @@ Inspired by the robust Blendr Kraft cross format converter.
 """
 
 import os
-import sys
 import tempfile
 import logging
 import numpy as np
@@ -14,23 +13,20 @@ from enum import Enum
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from ..utils.app_paths import app_root, bundled
+
 logger = logging.getLogger(__name__)
 
 # pyassimp looks for the assimp build in its own package folder and in every directory
 # already on PATH (measured: pyassimp 5.2.5, helper.search_library). Nothing is in the
 # package folder here, so the DLL in this app's lib/ has to be put on PATH before
-# pyassimp is imported - and the candidate list has to include where a PyInstaller
-# build actually unpacks it, because that is not three directories above __file__.
+# pyassimp is imported - and the candidate list has to include where a PyInstaller build
+# unpacks it, which is why both roots come from `src/utils/app_paths.py`: `bundled()` is
+# `_MEIPASS/lib` in a package and `lib/` beside the checkout in a source tree, and
+# `app_root()` adds the folder the executable itself stands in.
 def _assimp_lib_dirs():
-    roots = [os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))]
-    meipass = getattr(sys, '_MEIPASS', None)
-    if meipass:
-        roots.append(meipass)
-    if getattr(sys, 'frozen', False):
-        roots.append(os.path.dirname(sys.executable))
     dirs = []
-    for root in roots:
-        candidate = os.path.join(root, 'lib')
+    for candidate in (os.path.join(app_root(), 'lib'), bundled('lib')):
         if os.path.isdir(candidate) and candidate not in dirs:
             dirs.append(candidate)
     # A folder that actually holds an assimp build first, so a stale lib/ alongside

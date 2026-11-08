@@ -84,8 +84,8 @@ MUTATIONS = [
     # ---- where the record goes, and what it is written over ----------------------------------
     {
         'file': FB,
-        'find': '            feedback_dir = os.path.join(home_dir, ".renderfox", "feedback")',
-        'replace': '            feedback_dir = os.path.join(home_dir, ".renderfox")',
+        'find': '            feedback_dir = os.path.join(data_dir(), "feedback")',
+        'replace': '            feedback_dir = data_dir()',
         'expect': 'test_11',
         'note': 'reports land loose in the app folder instead of the folder the pane names to the '
                 'user, so nobody finds the file they were told the path of',

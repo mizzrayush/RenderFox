@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple, Callable
 
 from ..core.models import RenderJob, SoftwareType, JobStatus
+from ..utils.app_paths import config_path
 
 # The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
 # only reader of a DCC process-control failure - the row a user gets when `stop` raises after the
@@ -761,9 +762,9 @@ def create_render_engine(software_type: SoftwareType, executable_path: str) -> O
 def _get_user_configured_path(software_key: str) -> Optional[str]:
     """Retrieve software path from config.json if configured."""
     try:
-        config_path = os.path.join(os.getcwd(), 'config.json')
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
+        location = config_path()
+        if os.path.exists(location):
+            with open(location, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 software_data = data.get('software', {})
                 val = software_data.get(software_key, '').strip()

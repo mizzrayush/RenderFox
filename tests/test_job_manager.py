@@ -9,8 +9,9 @@ run Blender, because `detect_available_software()` asked config.json for a
 Blender path and nobody asked for the other three.
 
 Nothing is monkeypatched: the manager runs in its own thread, the renderers are
-real child processes, and `config.json` in the working directory is the app's own
-configuration mechanism.
+real child processes, and `config.json` beside the app - the mechanism
+`src/utils/app_paths.py` answers, here pointed at the sandbox by
+`RENDERFOX_APP_ROOT` - is the app's own configuration mechanism.
 
 Run: python -X utf8 tests/test_job_manager.py
 """
@@ -43,21 +44,29 @@ ALL_PACKAGES = ['blender', 'maya', 'cinema4d', 'unreal']
 
 
 class JobManagerCase(unittest.TestCase):
-    """A sandbox with the shims installed, config.json in cwd, and one JobManager."""
+    """A sandbox with the shims installed, config.json as the app's own file, and one JobManager."""
 
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(sys.argv)
         cls.work = tempfile.mkdtemp(prefix='renderfox_queue_')
         cls.previous_cwd = os.getcwd()
+        cls.previous_root = os.environ.get('RENDERFOX_APP_ROOT')
         cls.executables = harness.install(cls.work)
         cls.out = os.path.join(cls.work, 'out')
         os.makedirs(cls.out, exist_ok=True)
-        os.chdir(cls.work)  # config.json is read from the working directory
+        os.chdir(cls.work)
+        # config.json is read from the app's own folder, and `src/utils/app_paths.py`
+        # takes that folder from this variable - so the sandbox is the app here.
+        os.environ['RENDERFOX_APP_ROOT'] = cls.work
 
     @classmethod
     def tearDownClass(cls):
         os.chdir(cls.previous_cwd)
+        if cls.previous_root is None:
+            del os.environ['RENDERFOX_APP_ROOT']
+        else:
+            os.environ['RENDERFOX_APP_ROOT'] = cls.previous_root
         shutil.rmtree(cls.work, ignore_errors=True)
 
     def setUp(self):

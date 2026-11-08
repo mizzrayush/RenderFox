@@ -11,11 +11,12 @@ a reader, and **88 had no reader at all** - a failure caught, described, and wri
 stream the package closes.
 
 Those 88 are now records. Measured the same way on this tree: **12 stream writes** left, 0 of them
-unreadable, and **240 log records** written by 33 of the 73 files where 151 were written by 16 -
+unreadable, and **240 log records** written by 33 of the 74 files where 151 were written by 16 -
 the arithmetic the suite pins, because a report that changed channel rather than vanishing is the
 whole claim. The levels are 104 `warning`, 68 `error`, 60 `info`, 6 `debug` and 2 `logger.exception`.
-The file count is 73 and not 71 because 7b-1 shipped `src/utils/app_settings.py` and
-`src/features/performance_controls.py`, neither of which emits. The count is the channel phase's 239
+The file count is 74 and not 71 because 7b-1 shipped `src/utils/app_settings.py` and
+`src/features/performance_controls.py`, neither of which emits, and Phase 38 shipped
+`src/utils/app_paths.py`, which is the reader and emits nothing either. The count is the channel phase's 239
 plus one, and the one is this phase's: the pane lost the `update_system_info` warning that sat in a
 method it no longer has (HEAD `src/ui/performance_tab.py:1117`) and gained two failure channels for
 work that used to reach only the screen - `on_identity_reader_failed` (`:1134`) and

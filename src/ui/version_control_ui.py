@@ -26,6 +26,7 @@ from ..features.version_control import (AssetVersionControl, NOT_COMPARABLE, des
                                         describe_watertight)
 from .icon_provider import get_icon
 from ..utils.run_teardown import shutdown
+from ..utils.app_paths import output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -921,10 +922,9 @@ if __name__ == "__main__":
     
     app = QApplication(sys.argv)
     
-    # Use a test library path
-    library_path = Path(__file__).parent.parent.parent / "output"
-    
-    window = VersionControlUI(str(library_path))
+    library_path = output_dir()
+
+    window = VersionControlUI(library_path)
     window.setWindowTitle("Version Control System")
     window.resize(1400, 900)
     window.show()

@@ -28,6 +28,7 @@ import trimesh
 import numpy as np
 import logging
 
+from ..utils.app_paths import output_dir
 from ..utils.thumbnail_renderer import generate_3d_thumbnail
 
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
@@ -896,7 +897,7 @@ class AssetVersionControl:
 
 if __name__ == "__main__":
     # Demo usage
-    vcs = AssetVersionControl("d:/MyApps/RenderFox/library")
+    vcs = AssetVersionControl(output_dir())
     
     # Save version
     version_id = vcs.save_version("model.obj", commit_message="Initial version", author="Artist")

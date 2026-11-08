@@ -73,7 +73,7 @@ Section "RenderFox Core (Required)" SecCore
   
   SetOutPath "$INSTDIR"
   
-  ; Copy main application files from PyInstaller dist
+  ; Copy the PyInstaller onedir build: RenderFox.exe into $INSTDIR, its shipped files into _internal
   File /r "dist\RenderFox\*.*"
 
   ; Store installation folder in registry
@@ -87,18 +87,18 @@ Section "RenderFox Core (Required)" SecCore
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayName" "${PRODUCT_NAME} 3D Batch Studio"
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
-  WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\resources\icon.ico"
+  WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\_internal\resources\icon.ico"
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "InstallLocation" "$INSTDIR"
   
   ; Create Start Menu Shortcuts
   CreateDirectory "$SMPROGRAMS\RenderFox"
-  CreateShortcut "$SMPROGRAMS\RenderFox\RenderFox.lnk" "$INSTDIR\RenderFox.exe" "" "$INSTDIR\resources\icon.ico" 0
+  CreateShortcut "$SMPROGRAMS\RenderFox\RenderFox.lnk" "$INSTDIR\RenderFox.exe" "" "$INSTDIR\_internal\resources\icon.ico" 0
   CreateShortcut "$SMPROGRAMS\RenderFox\Uninstall RenderFox.lnk" "$INSTDIR\Uninstall.exe" "" "$INSTDIR\Uninstall.exe" 0
   
   ; Create Desktop Shortcut
-  CreateShortcut "$DESKTOP\RenderFox.lnk" "$INSTDIR\RenderFox.exe" "" "$INSTDIR\resources\icon.ico" 0
+  CreateShortcut "$DESKTOP\RenderFox.lnk" "$INSTDIR\RenderFox.exe" "" "$INSTDIR\_internal\resources\icon.ico" 0
 
 SectionEnd
 

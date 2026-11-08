@@ -2,7 +2,7 @@
 
 The shipped build is packaged with ``console=False`` (`RenderFox.spec:29`), so the process
 has no console: a write to stdout or stderr goes where nobody can read it. Six questions follow
-from that sentence, and this checker asks one of each, over the 73 files the app ships.
+from that sentence, and this checker asks one of each, over the 74 files the app ships.
 
 **A debug trace has no destination.** Twenty ``print("DEBUG: ...")`` calls sat in the load,
 pick and paint paths, and the ones in ``paintGL`` ran at the frame rate. They are gone; rule
@@ -27,7 +27,7 @@ cannot stay is the write to a stream the package closes.
 own ``if __name__ == "__main__":`` block at the start of this phase - a failure caught, described,
 and written into the closed stream, or a shader that did not compile, or a milestone in a batch.
 Eighty-eight of them had no reader at all. Each one is a record now: the tree writes 240 of them,
-from 33 of the 73 app files where it wrote 151 from 16, and what this rule reports is none. A rule
+from 33 of the 74 app files where it wrote 151 from 16, and what this rule reports is none. A rule
 scoped only to `except` handlers would have let the shader and texture lines stay invisible, and
 would not have stopped the backlog growing in a branch that has no handler.
 

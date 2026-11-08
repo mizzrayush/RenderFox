@@ -16,6 +16,7 @@ from typing import Dict, List, Any, Optional
 import traceback
 
 from ..utils.frame_clock import shared_clock
+from ..utils.app_paths import output_dir
 
 try:
     import GPUtil
@@ -859,7 +860,7 @@ class ErrorLogger:
     
     def __init__(self, log_dir: Optional[str] = None):
         if log_dir is None:
-            log_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'output', 'logs')
+            log_dir = os.path.join(output_dir(), 'logs')
         
         self.log_dir = Path(os.path.normpath(log_dir))
         self.log_dir.mkdir(parents=True, exist_ok=True)

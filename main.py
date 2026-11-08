@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt
 from src.utils.telemetry import get_telemetry
 from src.utils import early_log
 from src.utils import run_teardown
+from src.utils.app_paths import bundled
 
 
 logger = logging.getLogger(__name__)
@@ -115,12 +116,12 @@ def main():
     # AppUserModelID moved to start of main
 
     # Set application icon
-    # Check root and resources folder
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    icon_path = os.path.join(base_dir, "icon.ico")
-    
+    # Check root and resources folder, both from the reader: `bundled()` is the folder this
+    # start keeps shipped files in - `_internal` for the package, the checkout for a source run.
+    icon_path = bundled("icon.ico")
+
     if not os.path.exists(icon_path):
-        icon_path = os.path.join(base_dir, "resources", "icon.ico")
+        icon_path = bundled(os.path.join("resources", "icon.ico"))
         
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
@@ -128,7 +129,7 @@ def main():
         logger.warning("Window icon not found at %s", icon_path)
 
     # Splash Screen
-    splash_path = os.path.join(base_dir, "resources", "splash.png")
+    splash_path = bundled(os.path.join("resources", "splash.png"))
     if os.path.exists(splash_path):
         splash_pix = QPixmap(splash_path)
         # Scale if too large (optional, but good for 4k images)

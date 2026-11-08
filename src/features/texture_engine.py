@@ -8,6 +8,8 @@ import logging
 import torch
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
+from src.utils.app_paths import data_dir, output_dir
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -97,12 +99,12 @@ class TextureGenerationThread(QThread):
                 
                 # Save Output
                 self.progress_update.emit(90, "Saving Image...")
-                output_dir = os.path.join(os.getcwd(), "output", "generated_textures")
-                os.makedirs(output_dir, exist_ok=True)
+                out_dir = os.path.join(output_dir(), "generated_textures")
+                os.makedirs(out_dir, exist_ok=True)
                 
                 import uuid
                 filename = f"tex_online_{uuid.uuid4().hex[:8]}.png"
-                filepath = os.path.join(output_dir, filename)
+                filepath = os.path.join(out_dir, filename)
                 
                 image.save(filepath)
                 
@@ -158,7 +160,7 @@ class TextureGenerationThread(QThread):
                 else:
                     # Default Download
                     model_id = "runwayml/stable-diffusion-v1-5"
-                    cache_dir = os.path.join(os.getcwd(), "ai_models", "sd-v1-5")
+                    cache_dir = os.path.join(data_dir(), "ai_models", "sd-v1-5")
                     os.makedirs(cache_dir, exist_ok=True)
                     
                     # Check for pre-downloaded safetensors file (from installer)
@@ -223,12 +225,12 @@ class TextureGenerationThread(QThread):
             # 5. Save Output
             self.progress_update.emit(95, "Saving Image...")
             
-            output_dir = os.path.join(os.getcwd(), "output", "generated_textures")
-            os.makedirs(output_dir, exist_ok=True)
+            out_dir = os.path.join(output_dir(), "generated_textures")
+            os.makedirs(out_dir, exist_ok=True)
             
             import uuid
             filename = f"tex_{uuid.uuid4().hex[:8]}.png"
-            filepath = os.path.join(output_dir, filename)
+            filepath = os.path.join(out_dir, filename)
             
             image.save(filepath)
             

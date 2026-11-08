@@ -22,6 +22,7 @@ from .mesh_tools_tab import MeshToolsTab
 from .performance_tab import PerformanceTab
 from .diagnostics_tab import DiagnosticsTab
 from .scripting_tab import ScriptingTab
+from ..utils.app_paths import bundled
 from ..core.job_manager import JobManager
 from .pipeline_editor_tab import PipelineEditorTab
 from .rendering_tab import RenderingTab
@@ -64,10 +65,9 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1280, 820)
         
         # Explicitly set window icon to prevent it from reverting
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        icon_path = os.path.join(base_dir, "icon.ico")
+        icon_path = bundled("icon.ico")
         if not os.path.exists(icon_path):
-            icon_path = os.path.join(base_dir, "resources", "icon.ico")
+            icon_path = bundled(os.path.join("resources", "icon.ico"))
             
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
@@ -362,13 +362,14 @@ class MainWindow(QMainWindow):
         browser = QTextBrowser()
         browser.setOpenExternalLinks(True)
         
-        guide_path = os.path.join(os.getcwd(), "USER_GUIDE.md")
+        guide_path = bundled("USER_GUIDE.md")
         if os.path.exists(guide_path):
             with open(guide_path, "r", encoding="utf-8") as f:
                 content = f.read()
             browser.setMarkdown(content)
         else:
-            browser.setPlainText("RenderFox User Guide file (USER_GUIDE.md) not found.")
+            browser.setPlainText(f"RenderFox User Guide file (USER_GUIDE.md) not found "
+                                 f"at {guide_path}.")
             
         layout.addWidget(browser)
         close_btn = QPushButton("Close")

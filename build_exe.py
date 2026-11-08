@@ -1,4 +1,3 @@
-
 import os
 import sys
 import subprocess
@@ -13,12 +12,18 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
+
 def build_executable():
     """
     Build the RenderFox executable using PyInstaller.
+
+    One command, one source of truth: `RenderFox.spec`. This script used to re-type the whole
+    flag list here as well, and the two lists had already drifted - the spec shipped the assimp
+    build and `pyassimp`, this one shipped neither, and neither shipped `USER_GUIDE.md`, which
+    `src/ui/main_window.py:365` asks the package for by name.
     """
     print("[*] Starting RenderFox Build Process...")
-    
+
     # Check if PyInstaller is installed
     try:
         import PyInstaller
@@ -28,98 +33,47 @@ def build_executable():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
         print("[OK] PyInstaller installed successfully.")
 
-    # Define paths
     base_dir = Path(__file__).parent.absolute()
-    main_script = base_dir / "main.py"
-    icon_path = base_dir / "resources" / "icon.ico"  # Assuming an icon exists, or we'll skip
+    spec = base_dir / "RenderFox.spec"
     dist_dir = base_dir / "dist"
     build_dir = base_dir / "build"
-    
+
+    if not spec.exists():
+        print(f"[ERROR] {spec} is not there, and it is the only place the package's contents "
+              "are written down. Refusing to build from an invented list.")
+        sys.exit(1)
+
     # Clean previous builds
     if dist_dir.exists():
         shutil.rmtree(dist_dir)
     if build_dir.exists():
         shutil.rmtree(build_dir)
-        
+
     print("[*] Cleaned previous build directories.")
 
-    # PyInstaller arguments
-    args = [
-        "pyinstaller",
-        "--noconfirm",
-        "--clean",
-        "--name=RenderFox",
-        "--windowed",  # No console window
-        "--onedir",    # Folder output (easier for debugging than --onefile)
-        # "--onefile", # Uncomment for single file exe (slower startup)
-        
-        # Add data directories
-        f"--add-data={base_dir / 'src'}{os.pathsep}src",
-        f"--add-data={base_dir / 'resources'}{os.pathsep}resources",
-        
-        # Hidden imports (often needed for these libs)
-        "--hidden-import=pymeshlab",
-        "--hidden-import=trimesh",
-        "--hidden-import=open3d",
-        "--hidden-import=torch",
-        "--hidden-import=transformers",
-        "--hidden-import=transformers.models.clip",
-        "--hidden-import=transformers.models.clip.modeling_clip",
-        "--hidden-import=transformers.models.clip.processing_clip",
-        "--hidden-import=transformers.models.clip.tokenization_clip",
-        "--hidden-import=huggingface_hub",
-        "--hidden-import=PIL",
-        "--hidden-import=PIL.Image",
-        "--hidden-import=PyQt6.QtSvg",
-        "--hidden-import=PyQt6.QtSvgWidgets",
-        "--hidden-import=PyQt6.QtOpenGL",
-        "--hidden-import=PyQt6.QtOpenGLWidgets",
-        "--hidden-import=scipy.spatial.transform._rotation_groups",
-        "--hidden-import=sklearn.utils._typedefs",
-        "--hidden-import=sklearn.neighbors._partition_nodes",
-        "--hidden-import=sklearn.externals.array_api_compat.numpy.fft",
-        "--hidden-import=sklearn.externals.array_api_compat.numpy",
-        "--hidden-import=sklearn._cyutility",
-        "--hidden-import=sklearn.utils._cython_blas",
-        "--hidden-import=sklearn.neighbors.quad_tree",
-        "--hidden-import=sklearn.tree._utils",
-        "--hidden-import=sklearn.utils._heap",
-        "--hidden-import=sklearn.utils._sorting",
-        "--hidden-import=sklearn.utils._vector_sentinel",
-        "--hidden-import=sklearn.metrics._pairwise_distances_reduction",
-        "--hidden-import=sklearn.metrics._dist_metrics",
-        "--hidden-import=sklearn.tree._partitioner",
-        "--hidden-import=sklearn.tree._criterion",
-        "--hidden-import=sklearn.tree._splitter",
-        "--hidden-import=sklearn.tree._tree",
-        
-        # Exclude unnecessary modules to save space
-        "--exclude-module=tkinter",
-        "--exclude-module=matplotlib",
-        "--exclude-module=notebook",
-        "--exclude-module=PyQt5",
-        "--exclude-module=PySide6",
-        
-        str(main_script)
-    ]
-    
-    # Add icon if it exists
-    if icon_path.exists():
-        args.insert(4, f"--icon={icon_path}")
-    else:
-        print("[!] Icon file not found at resources/icon.ico. Using default icon.")
+    command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", str(spec)]
 
-    print(f"[*] Running PyInstaller with command:\n{' '.join(args)}")
-    
+    print(f"[*] Running PyInstaller with command:\n{' '.join(command)}")
+
     try:
-        subprocess.check_call(args)
-        print("\n[OK] Build Complete!")
-        print(f"[*] Executable is located at: {dist_dir / 'RenderFox' / 'RenderFox.exe'}")
-        print("[*] Ready for NSIS packaging.")
-        
+        subprocess.check_call(command)
     except subprocess.CalledProcessError as e:
         print(f"\n[ERROR] Build Failed with error code {e.returncode}")
         sys.exit(1)
+
+    package = dist_dir / "RenderFox"
+    print(f"\n[OK] Build Complete! Executable: {package / 'RenderFox.exe'}")
+
+    # The package is only shippable if the reader's frozen answers are files on this disk, so
+    # ask them of the folder just written rather than of the spec that was meant to write it.
+    check = base_dir / "tools" / "check_package_layout.py"
+    print(f"[*] Checking the shipped files against the paths {check.name} reads...")
+    if subprocess.call([sys.executable, "-X", "utf8", str(check), str(package)]) != 0:
+        print("[ERROR] The build is missing files the app asks for by name. See the list above.")
+        sys.exit(1)
+
+    print("[OK] Every file the app names is in the package. Ready for NSIS packaging.")
+
 
 if __name__ == "__main__":
     build_executable()

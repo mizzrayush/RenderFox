@@ -38,6 +38,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from src.processing.lod_generator import LODGenerator, LODSettings
+from src.utils.app_paths import output_dir
 
 # PyQt6 for signals and threads
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
@@ -115,9 +116,7 @@ class LibraryManager(QObject):
 
     def __init__(self, db_path: Optional[str] = None, thumbnails_dir: Optional[str] = None):
         super().__init__()
-        base_dir = os.getcwd()
-        out_dir = os.path.join(base_dir, "output")
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir = output_dir()
         self.db_path = db_path or os.path.join(out_dir, "library.db")
         self.thumbs_dir = thumbnails_dir or os.path.join(out_dir, "thumbnails")
         os.makedirs(self.thumbs_dir, exist_ok=True)
@@ -892,7 +891,7 @@ class LibraryManager(QObject):
 
     def backup_database(self, dest_dir: Optional[str] = None) -> Optional[str]:
         try:
-            dest_dir = dest_dir or os.path.join(os.getcwd(), "output")
+            dest_dir = dest_dir or output_dir()
             os.makedirs(dest_dir, exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
             target = os.path.join(dest_dir, f"library_backup_{ts}.db")

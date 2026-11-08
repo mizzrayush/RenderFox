@@ -4,7 +4,6 @@ Handles capturing frames and stitching them into a video file using ffmpeg.
 """
 
 import os
-import sys
 import shutil
 import logging
 import subprocess
@@ -14,6 +13,12 @@ from PyQt6.QtCore import QObject, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPainter
 from PyQt6.QtWidgets import QWidget, QApplication
 
+from ..utils.app_paths import app_root, bundled
+
+# The FFmpeg build the installer copies into `$INSTDIR\ffmpeg` and the spec ships inside
+# `resources`; both spellings of the search are the same folder name, so it is written once.
+FFMPEG_BUILD = "ffmpeg-2025-12-22-git-c50e5c7778-essentials_build"
+
 # The packaged build has no console (`RenderFox.spec`: console=False), so a render that failed
 # has one place to say so: the root logger, which the Diagnostics pane turns into rows.
 logger = logging.getLogger(__name__)
@@ -21,20 +26,20 @@ logger = logging.getLogger(__name__)
 
 def find_ffmpeg_executable() -> str:
     """Locate the ffmpeg executable across bundled paths, resources, and system PATH."""
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(os.path.abspath(sys.executable))
-        meipass_dir = getattr(sys, '_MEIPASS', app_dir)
-    else:
-        app_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        meipass_dir = app_dir
+    # Two roots, both from the reader: the folder the executable lives in, which is where
+    # `installer.nsi:107` unpacks the FFmpeg component, and the folder this start keeps the
+    # shipped `resources` in - `_internal` for a package, the checkout for a source tree.
+    app_dir = app_root()
+    installed = os.path.join("ffmpeg", "bin", "ffmpeg.exe")
+    shipped = os.path.join("resources", FFMPEG_BUILD, "bin", "ffmpeg.exe")
 
     candidates = [
-        os.path.join(app_dir, "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(app_dir, installed),
         os.path.join(app_dir, "ffmpeg.exe"),
         os.path.join(app_dir, "bin", "ffmpeg.exe"),
-        os.path.join(app_dir, "resources", "ffmpeg-2025-12-22-git-c50e5c7778-essentials_build", "bin", "ffmpeg.exe"),
-        os.path.join(meipass_dir, "ffmpeg", "bin", "ffmpeg.exe"),
-        os.path.join(meipass_dir, "resources", "ffmpeg-2025-12-22-git-c50e5c7778-essentials_build", "bin", "ffmpeg.exe"),
+        os.path.join(app_dir, shipped),
+        bundled(installed),
+        bundled(shipped),
     ]
     for p in candidates:
         if os.path.isfile(p):

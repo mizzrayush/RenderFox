@@ -8,8 +8,8 @@ main thread of this machine, in 0.58 s, and answers a worker thread in 0.06 s wi
 - and `analyze_model` runs on a worker, so the Open3D `Visualizer` behind the `except` was
 the branch always taken. That window answers the first time a process opens one and never
 answers again once another GL window has existed: the headless tab suite's tagging row was
-still owed after 180 seconds, with the thread's own stack sitting in `poll_events` at
-`ai_asset_tagger.py:232`, while the same call in a fresh process took 1.5 seconds. The pane's
+still owed after 180 seconds, with the thread's own stack sitting in `poll_events` inside the
+Open3D branch this phase deleted, while the same call in a fresh process took 1.5 seconds. The pane's
 progress bar had nothing to report and no verb could stop it, because a worker blocked inside
 a native call answers no cancellation. The rendering half is worth recording too: when
 `save_image` did answer, it answered with 2 colours over the whole 224x224 frame - a flat

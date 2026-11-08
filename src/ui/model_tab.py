@@ -27,6 +27,7 @@ from .version_control_ui import VersionControlUI
 from ..features.quality_analyzer import QualityAnalyzer
 from ..features.version_control import AssetVersionControl
 from ..utils.run_teardown import drain, drain_attributes
+from ..utils.app_paths import output_dir
 from .icon_provider import get_icon
 
 # New imports for conversion wiring
@@ -303,11 +304,11 @@ class ModelFormatConverter(QDialog):
 class ModelTab(QWidget):
     """Comprehensive model management tab using OpenGL viewer."""
     
-    def __init__(self, parent=None, library_path='output'):
+    def __init__(self, parent=None, library_path=None):
         super().__init__(parent)
         self.current_model_path = None
         self.model_library = []
-        self.library_path = library_path
+        self.library_path = library_path or output_dir()
         self.quality_analyzer_engine = QualityAnalyzer()
         self.version_control_engine = AssetVersionControl(self.library_path)  # Use your library path
         self.analysis_worker = None
@@ -514,7 +515,7 @@ class ModelTab(QWidget):
         self.detail_tabs.addTab(self.quality_analyzer_tab, "Quality")
 
         # Version Control tab
-        self.version_control_tab = VersionControlUI(library_path='output')
+        self.version_control_tab = VersionControlUI(library_path=self.library_path)
         self.version_control_tab.version_control = self.version_control_engine
         self.detail_tabs.addTab(self.version_control_tab, "Versions")
         

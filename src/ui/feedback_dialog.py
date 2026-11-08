@@ -14,6 +14,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QMessageBox, QFormLayout)
 from PyQt6.QtCore import Qt
 
+from ..utils.app_paths import data_dir
+
 logger = logging.getLogger(__name__)
 
 class FeedbackDialog(QDialog):
@@ -122,8 +124,7 @@ class FeedbackDialog(QDialog):
         exist.
         """
         try:
-            home_dir = os.path.expanduser("~")
-            feedback_dir = os.path.join(home_dir, ".renderfox", "feedback")
+            feedback_dir = os.path.join(data_dir(), "feedback")
             os.makedirs(feedback_dir, exist_ok=True)
             
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S')

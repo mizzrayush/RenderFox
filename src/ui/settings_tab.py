@@ -15,6 +15,7 @@ import os
 import json
 import logging
 from ..core.models import SoftwareConfiguration, SoftwareType, AppSettings
+from ..utils.app_paths import app_root, config_path, output_dir
 from .icon_provider import get_icon
 from .styles import AVAILABLE_THEMES, get_theme_stylesheet, MODERN_DARK_THEME, MODERN_LIGHT_THEME, MODERN_MIDNIGHT_THEME
 
@@ -27,7 +28,6 @@ class SettingsTab(QWidget):
     
     settings_changed = pyqtSignal()
     theme_changed = pyqtSignal(str)  # New signal for theme changes
-    CONFIG_FILE = 'config.json'
     
     def __init__(self):
         super().__init__()
@@ -906,12 +906,13 @@ class SettingsTab(QWidget):
     def load_settings(self):
         """Load settings from JSON config file."""
         settings_data = {}
-        if os.path.exists(self.CONFIG_FILE):
+        location = config_path()
+        if os.path.exists(location):
             try:
-                with open(self.CONFIG_FILE, 'r') as f:
+                with open(location, 'r', encoding='utf-8') as f:
                     settings_data = json.load(f)
             except Exception as e:
-                logger.error("Error loading config.json: %s", e)
+                logger.error("Error loading %s: %s", location, e)
         
         # Load Software Settings
         software_settings = settings_data.get("software", {})
@@ -928,10 +929,10 @@ class SettingsTab(QWidget):
         
         # Load Directories
         dir_settings = settings_data.get("directories", {})
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        project_root = app_root()
         
         self.project_dir.setText(dir_settings.get("project_dir", project_root))
-        self.default_output.setText(dir_settings.get("output_dir", os.path.join(project_root, "output")))
+        self.default_output.setText(dir_settings.get("output_dir", output_dir()))
         
         import tempfile
         self.temp_dir.setText(dir_settings.get("temp_dir", tempfile.gettempdir()))
@@ -1078,9 +1079,10 @@ class SettingsTab(QWidget):
     def save_settings(self, show_confirmation=True):
         """Save current settings to JSON config file."""
         settings_data = self._collect_all_settings()
-        
+        location = config_path()
+
         try:
-            with open(self.CONFIG_FILE, 'w') as f:
+            with open(location, 'w', encoding='utf-8') as f:
                 json.dump(settings_data, f, indent=2)
             
             # Also save to QSettings for legacy support/backup
@@ -1094,7 +1096,7 @@ class SettingsTab(QWidget):
                                        "Settings have been saved successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Save Failed",
-                               f"Failed to save settings: {str(e)}")
+                               f"Failed to save settings to {location}: {str(e)}")
 
     def _save_to_qsettings(self):
         """Save current settings to QSettings (backup)."""

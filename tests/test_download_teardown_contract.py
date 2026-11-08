@@ -41,7 +41,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from PyQt6.QtCore import QThreadPool
 from PyQt6.QtWidgets import QApplication, QWidget
 
-from src.features import model_downloader as downloader_module
 from src.features.model_downloader import (
     ModelDownloaderDialog, ModelDownloaderThread)
 from src.ui.settings_tab import SettingsTab
@@ -91,9 +90,9 @@ class TestDownloadTeardownContract(unittest.TestCase):
     def download_fixture(self, hold_seconds):
         """A downloader whose two network calls are here, writing into a tree that goes away.
 
-        `run` builds its paths from the module's own `__file__`, so that is the one thing to
-        move to put `ai_models` somewhere the test can delete; the fake module is what keeps
-        the test off a network it has no business using.
+        `run` asks `src/utils/app_paths.py` where its models go, so `RENDERFOX_DATA_DIR` is
+        the one thing to move to put `ai_models` somewhere the test can delete; the fake module
+        is what keeps the test off a network it has no business using.
 
         The recorded `start` is what keeps the test alive. Every thread that comes through
         here is waited on when the fixture closes, whatever the body did in between - a body
@@ -103,7 +102,7 @@ class TestDownloadTeardownContract(unittest.TestCase):
         """
         home = tempfile.mkdtemp(prefix='renderfox_dl_')
         previous_module = sys.modules.get('huggingface_hub')
-        previous_file = downloader_module.__file__
+        previous_data = os.environ.get('RENDERFOX_DATA_DIR')
         previous_start = ModelDownloaderThread.start
         hub = _FakeHub(hold_seconds)
         started = []
@@ -114,7 +113,7 @@ class TestDownloadTeardownContract(unittest.TestCase):
 
         ModelDownloaderThread.start = record_then_start
         sys.modules['huggingface_hub'] = hub
-        downloader_module.__file__ = os.path.join(home, 'src', 'features', 'model_downloader.py')
+        os.environ['RENDERFOX_DATA_DIR'] = home
         try:
             yield hub
         finally:
@@ -123,7 +122,10 @@ class TestDownloadTeardownContract(unittest.TestCase):
                 self.assertTrue(thread.wait(15000),
                                 'the download this fixture launched never reached its end')
             ModelDownloaderThread.start = previous_start
-            downloader_module.__file__ = previous_file
+            if previous_data is None:
+                del os.environ['RENDERFOX_DATA_DIR']
+            else:
+                os.environ['RENDERFOX_DATA_DIR'] = previous_data
             if previous_module is None:
                 del sys.modules['huggingface_hub']
             else:

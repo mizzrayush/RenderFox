@@ -1,8 +1,9 @@
 """
 Installer for the mock DCC harness.
 
-`JobManager` and `detect_available_software` resolve an engine from
-`config.json` in the current working directory (`software.blender` and friends).
+`JobManager` and `detect_available_software` resolve an engine from the
+`config.json` beside the app - `src/utils/app_paths.py`, whose `RENDERFOX_APP_ROOT`
+the two suites point at their sandbox (`software.blender` and friends).
 That is the app's own configuration path, so the harness writes a real
 `config.json` next to real executables and lets the app find them the way it
 would find Blender - no patching, no fake detector, no test-only branch in

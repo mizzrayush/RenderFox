@@ -15,6 +15,7 @@ from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from .models import Priority, RenderJob, JobStatus, SoftwareType
 from ..processing.render_engines import (create_render_engine, detect_available_software,
                                          _get_user_configured_path)
+from ..utils.app_paths import config_path
 
 # The one report channel the packaged build has: `diagnostics_tab.setup_logging` puts a
 # PaneLogHandler on the root logger, and every record that reaches it becomes a row. A write
@@ -323,7 +324,7 @@ class JobManager(QObject):
         until the next queue start.
         """
         try:
-            with open(os.path.join(os.getcwd(), 'config.json'), encoding='utf-8') as handle:
+            with open(config_path(), encoding='utf-8') as handle:
                 perf = json.load(handle).get('performance') or {}
         except (OSError, ValueError, AttributeError):
             perf = {}
@@ -555,7 +556,7 @@ class JobManager(QObject):
         exactly the resolution at which "Save" then "Start Queue" happens.
         """
         try:
-            with open(os.path.join(os.getcwd(), 'config.json'), 'rb') as handle:
+            with open(config_path(), 'rb') as handle:
                 return hashlib.sha256(handle.read()).hexdigest()
         except OSError:
             return None

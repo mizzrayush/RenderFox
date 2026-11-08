@@ -18,7 +18,6 @@ Date: October 2025
 """
 
 import os
-import sys
 
 # Isolate PyTorch backend for Transformers to prevent TensorFlow/Keras interference
 os.environ['USE_TF'] = '0'
@@ -32,6 +31,8 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Callable
 import logging
 from PIL import Image
+
+from src.utils.app_paths import app_root, bundled, data_dir, state_file
 
 # The named logger, so a record this module writes carries `src.features.ai_asset_tagger` in the
 # Diagnostics component column instead of `root`. It is bound before the CLIP probe below only so
@@ -90,26 +91,21 @@ class AIAssetTagger:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
             logger.info(f"Using device: {self.device}")
             
-            # Determine base application directory
-            if getattr(sys, 'frozen', False):
-                app_dir = os.path.dirname(os.path.abspath(sys.executable))
-                meipass_dir = getattr(sys, '_MEIPASS', app_dir)
-            else:
-                app_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                meipass_dir = app_dir
-
             # Check for local model path in settings
             settings = QSettings("RenderFox", "RenderFox")
             custom_path = settings.value("Advanced/local_ai_model_path", "")
-            
-            # Search candidate paths for offline OpenAI CLIP model
+
+            # Search candidate paths for offline OpenAI CLIP model, with every root from the
+            # reader: the folder `installer.nsi:123` copies the weights into is beside the
+            # executable, the folder the downloader writes is under the profile, and a copy the
+            # build itself shipped sits in the folder `bundled()` names.
             candidate_paths = [
                 custom_path,
-                os.path.join(app_dir, "OPENai Clip"),
-                os.path.join(meipass_dir, "OPENai Clip"),
-                os.path.join(os.getcwd(), "OPENai Clip"),
-                os.path.join(app_dir, "ai_models", "clip"),
-                os.path.join(app_dir, "resources", "OPENai Clip"),
+                os.path.join(app_root(), "OPENai Clip"),
+                bundled("OPENai Clip"),
+                os.path.join(data_dir(), "OPENai Clip"),
+                os.path.join(app_root(), "ai_models", "clip"),
+                os.path.join(app_root(), "resources", "OPENai Clip"),
             ]
             
             local_path = None
@@ -962,10 +958,8 @@ class AIAssetTagger:
     # =========================================================================
 
     def _get_tags_db_path(self) -> str:
-        """Get path to tags database file."""
-        # Use a local JSON file for tag storage
-        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        return os.path.join(root, "config", "asset_tags.json")
+        """Where the tags a person assigned live: the copy that is already there, else the profile."""
+        return state_file(os.path.join("config", "asset_tags.json"))
 
     def _load_tags_db(self) -> Dict:
         """Load tags database."""
@@ -973,7 +967,7 @@ class AIAssetTagger:
         if os.path.exists(path):
             try:
                 import json
-                with open(path, 'r') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
                 logger.error(f"Failed to load tags DB: {e}")
@@ -985,7 +979,7 @@ class AIAssetTagger:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             import json
-            with open(path, 'w') as f:
+            with open(path, 'w', encoding='utf-8') as f:
                 json.dump(db, f, indent=4)
         except Exception as e:
             logger.error(f"Failed to save tags DB: {e}")

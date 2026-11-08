@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime
 from PyQt6.QtCore import QObject, QSettings
 
+from .app_paths import data_dir
+
 # The packaged build has no console (`RenderFox.spec`: console=False): the line this module
 # used to print on a failed write was written where nobody could read it.
 logger = logging.getLogger(__name__)
@@ -26,7 +28,7 @@ class TelemetryManager(QObject):
         self.settings = QSettings("RenderFox", "RenderFox")
         
         # Setup logging
-        self.log_dir = os.path.join(os.path.expanduser("~"), ".renderfox", "logs")
+        self.log_dir = os.path.join(data_dir(), "logs")
         os.makedirs(self.log_dir, exist_ok=True)
         
         self.log_file = os.path.join(self.log_dir, f"telemetry_{datetime.now().strftime('%Y%m%d')}.jsonl")

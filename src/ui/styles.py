@@ -4,14 +4,13 @@ Inspired by Blender 4.x, Unreal Engine 5, and Marmoset Toolbag.
 """
 
 import os
-import sys
 
-if getattr(sys, 'frozen', False):
-    _BASE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
-else:
-    _BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ..utils.app_paths import bundled
 
-_ICONS_DIR = os.path.join(_BASE_DIR, "resources", "icons").replace("\\", "/")
+# The folder the build unpacks its `resources` into: `sys._MEIPASS` when frozen, the checkout
+# otherwise - which is what `src/utils/app_paths.py` answers, so the packaged sheet cannot be
+# pointed at a folder this start does not keep.
+_ICONS_DIR = bundled(os.path.join("resources", "icons")).replace("\\", "/")
 
 MODERN_DARK_THEME = """
 /* Global Window & Fonts */

@@ -20,6 +20,8 @@ import uuid
 
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 
+from ..utils.app_paths import data_dir
+
 # The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
 # only reader these threads have: the scheduler loop, the directory watcher and the task/workflow
 # files all run where no pane is attached, and a failure here would otherwise be unrecoverable
@@ -60,10 +62,10 @@ def app_data_dir() -> str:
     Tasks and workflows used to be written relative to the working directory, so the app
     only found its saved work when it happened to be started from the right folder, and a
     packaged build pointed at ``sys._MEIPASS`` wrote into a temporary directory.
+    ``src/utils/app_paths.py`` gives that answer once for the app now, so this is the same
+    folder under the name this module's callers already use.
     """
-    path = os.path.join(os.path.expanduser('~'), '.renderfox')
-    os.makedirs(path, exist_ok=True)
-    return path
+    return data_dir()
 
 
 

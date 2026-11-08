@@ -55,20 +55,28 @@ CLASSES = {'blender': BlenderEngine, 'maya': MayaEngine,
 
 
 class MockDCCCase(unittest.TestCase):
-    """Sandbox with the shims installed, a config.json in cwd, and an out/ directory."""
+    """Sandbox with the shims installed, a config.json as the app's own file, and an out/ directory."""
 
     @classmethod
     def setUpClass(cls):
         cls.work = tempfile.mkdtemp(prefix='renderfox_mock_dcc_')
         cls.previous_cwd = os.getcwd()
+        cls.previous_root = os.environ.get('RENDERFOX_APP_ROOT')
         cls.executables = harness.install(cls.work)
         cls.out = os.path.join(cls.work, 'out')
         os.makedirs(cls.out, exist_ok=True)
-        os.chdir(cls.work)  # config.json is read from the working directory
+        os.chdir(cls.work)
+        # The sandbox is the app's own folder for the length of this suite: that is where
+        # `src/utils/app_paths.py` says config.json and the output folder are.
+        os.environ['RENDERFOX_APP_ROOT'] = cls.work
 
     @classmethod
     def tearDownClass(cls):
         os.chdir(cls.previous_cwd)
+        if cls.previous_root is None:
+            del os.environ['RENDERFOX_APP_ROOT']
+        else:
+            os.environ['RENDERFOX_APP_ROOT'] = cls.previous_root
         shutil.rmtree(cls.work, ignore_errors=True)
 
     def setUp(self):
@@ -312,7 +320,7 @@ class TestEngineLaunchPath(MockDCCCase):
         self.assertEqual(6, len(self.frames_written()))
 
     def test_09_configured_path_is_discovered_by_the_detector(self):
-        """`config.json` in the working directory is how a user points RenderFox at their install.
+        """The app's own `config.json` is how a user points RenderFox at their install.
 
         Every engine has to be looked up through it, not just Blender: the queue
         refuses a job whose software is missing from this dict, so a configured

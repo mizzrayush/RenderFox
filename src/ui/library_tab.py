@@ -23,6 +23,7 @@ from src.ui.icon_provider import get_icon
 # Import our library manager
 from src.core.library_manager import LibraryManager, LibraryScannerWorker, SearchQuery
 from ..utils.run_teardown import drain_attributes
+from ..utils.app_paths import data_dir, output_dir
 
 # The packaged build has no console (`RenderFox.spec`: console=False), so the only report
 # channel a failure has is the root logger the Diagnostics pane reads.
@@ -115,7 +116,7 @@ class ModelCard(QFrame):
             if model_path and os.path.exists(model_path):
                 try:
                     from src.utils.thumbnail_renderer import generate_3d_thumbnail
-                    thumbs_dir = os.path.expanduser("~/.renderfox/thumbnails")
+                    thumbs_dir = os.path.join(output_dir(), 'thumbnails')
                     os.makedirs(thumbs_dir, exist_ok=True)
                     base = os.path.splitext(os.path.basename(model_path))[0]
                     thumb_path = os.path.join(thumbs_dir, f"{base}.png")
@@ -1711,8 +1712,7 @@ class LibraryTab(QWidget):
     def _get_saved_searches_file(self):
         """Get path to saved searches file."""
         import json
-        config_dir = os.path.join(os.path.expanduser("~"), ".renderfox")
-        os.makedirs(config_dir, exist_ok=True)
+        config_dir = data_dir()
         return os.path.join(config_dir, "saved_searches.json")
 
     def _save_search_to_file(self, name, data):
@@ -2243,7 +2243,7 @@ class LibraryTab(QWidget):
             progress.show()
             
             # Clear existing thumbnails directory
-            thumbnails_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'output', 'thumbnails')
+            thumbnails_dir = os.path.join(output_dir(), 'thumbnails')
             if os.path.exists(thumbnails_dir):
                 import shutil
                 shutil.rmtree(thumbnails_dir)

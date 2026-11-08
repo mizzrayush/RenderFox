@@ -4,12 +4,12 @@ Handles downloading of AI models (Stable Diffusion, CLIP) for offline use.
 """
 
 import os
-import sys
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton, QMessageBox, QCheckBox, QHBoxLayout
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
+from ..utils.app_paths import data_dir
 from ..utils.run_teardown import drain_attributes
 
 class ModelDownloaderThread(QThread):
@@ -44,10 +44,10 @@ class ModelDownloaderThread(QThread):
                 self.finished.emit()
                 return
 
-            if getattr(sys, 'frozen', False):
-                base_dir = os.path.dirname(os.path.abspath(sys.executable))
-            else:
-                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            # A checkpoint the app downloaded has to be found again however the app was
+            # started, and the folder `installer.nsi:20` copies the exe into is one this
+            # account cannot write - so the models live in the profile, next to the task list.
+            base_dir = data_dir()
             
             current_step = 0
             
