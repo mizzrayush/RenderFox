@@ -2,7 +2,7 @@
 
 Four modules in `src/` ask for the same folder - the tagger's scratch write
 (`ai_asset_tagger.py:168`), the diagnostics pane's free-space answer
-(`diagnostic_engine.py:219`), the performance report's disk question
+(`diagnostic_engine.py:220`), the performance report's disk question
 (`performance_analyzer.py:871`) and the pipeline's staging root
 (`pipeline_editor_tab.py:31`, called again at `:842`) - so the answer is written once, here, and
 five test files import it instead of each keeping a copy.

@@ -5,7 +5,7 @@ reports itself: a raise nobody caught prints a traceback and a failing test name
 the edge of a C++ frame is answered with `0xc0000409` - `STATUS_FAIL_FAST_EXCEPTION`, a fast fail
 with no output, because `unittest` prints its summary at the end and there is no end. A suite that
 printed `Ran 6 tests in 20.1s / OK` arrived at the audit as
-`Core Backend & Regression Suite [FAIL]`, because `run_audit.py:312` reads
+`Core Backend & Regression Suite [FAIL]`, because `run_audit.py:340` reads
 `proc.returncode == 0`. That was measured 3 times in 6 subprocess runs of one tree and 1 in 6 of
 another.
 
@@ -333,7 +333,7 @@ class TestInstrument(unittest.TestCase):
     def test_17_the_exit_code_rule_is_applied_where_a_code_is_read(self):
         """Rule 2b is keyed to one file, so the keying is what is tested here, not the rule.
 
-        `run_audit.py:312` reads the exit code of the process it starts - `main.py`, and nothing
+        `run_audit.py:340` reads the exit code of the process it starts - `main.py`, and nothing
         else - so the rule that keeps that code alive runs on that file only. A file that is not
         the entry point is not asked, and the entry point is asked whatever its name in the tree
         happens to be; both halves have to hold, or the rule is either blind or noisy.
@@ -535,7 +535,7 @@ class TestQuitPath(unittest.TestCase):
                       f'the window that refused the close was not named by the drain: {output}')
         self.assertEqual(3, code,
                          'a quit that ended on a failure code did not leave on it, which is what '
-                         '`run_audit.py:312` reads')
+                         '`run_audit.py:340` reads')
 
     def test_32_the_crash_reporter_does_not_wait_on_a_button_nobody_can_press(self):
         """A modal dialog in an offscreen process is not a report; it is a hang.

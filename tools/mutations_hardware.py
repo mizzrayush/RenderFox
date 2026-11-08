@@ -274,15 +274,15 @@ MUTATIONS = [
     # ---- the diagnostics pane --------------------------------------------------------
     {
         'file': 'src/ui/diagnostics_tab.py',
-        'find': "                return words.get(health.get(name, {}).get('status'), '[Not checked]')",
-        'replace': "                return words.get(health.get(name, {}).get('status'), '[OK]')",
+        'find': "            return words.get(health.get(name, {}).get('status'), '[Not checked]')",
+        'replace': "            return words.get(health.get(name, {}).get('status'), '[OK]')",
         'expect': 'test_136',
         'note': 'a check that never ran is printed as a pass',
     },
     {
         'file': 'src/ui/diagnostics_tab.py',
-        'find': "            words = {'healthy': '[OK]', 'warning': '[Warning]', 'critical': '[Critical]'}",
-        'replace': "            words = {'healthy': '[OK]', 'warning': '[Warning]', 'critical': '[Warning]'}",
+        'find': "        words = {'healthy': '[OK]', 'warning': '[Warning]', 'critical': '[Critical]'}",
+        'replace': "        words = {'healthy': '[OK]', 'warning': '[Warning]', 'critical': '[Warning]'}",
         'expect': 'test_132',
         'note': 'a critical volume is filed with the same word as a warning',
     },
@@ -295,15 +295,15 @@ MUTATIONS = [
     },
     {
         'file': 'src/ui/diagnostics_tab.py',
-        'find': '            results += "=== STORAGE ===\\n"',
-        'replace': '            results += ""',
+        'find': '        results += "=== STORAGE ===\\n"',
+        'replace': '        results += ""',
         'expect': 'test_133',
         'note': 'the full report stops printing the volumes it was handed',
     },
     {
         'file': 'src/ui/diagnostics_tab.py',
-        'find': "            checked = ('cpu', 'memory', 'disk', 'gpu', 'dependencies')",
-        'replace': '            checked = tuple(health)',
+        'find': "        checked = ('cpu', 'memory', 'disk', 'gpu', 'dependencies')",
+        'replace': '        checked = tuple(health)',
         'expect': 'test_136',
         'note': 'the overall line counts only the checks that happened to answer',
     },
@@ -313,6 +313,102 @@ MUTATIONS = [
         'replace': "                indicator, verdicts.get(status, 'Good'))",
         'expect': 'test_131',
         'note': 'a badge with no reading behind it is painted as a pass',
+    },
+
+    # ---- which thread does the measuring ---------------------------------------------
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '        QThreadPool.globalInstance().start(worker)',
+        'replace': '        worker.run()',
+        'expect': 'test_137',
+        'note': 'the measurement runs on the thread that clicked, so the window waits',
+        'which': 2,
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '        self.run_step(\'quick check\', measure, self.show_quick_check)',
+        'replace': '        self.show_quick_check(measure())',
+        'suite': 'tests/test_check_threading_contract.py',
+        'expect': 'test_01',
+        'note': 'the quick check measures the machine inside the click again',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '        self.run_step(\'full diagnostic\', measure, self.show_full_diagnostic)',
+        'replace': '        self.show_full_diagnostic(measure())',
+        'suite': 'tests/test_check_threading_contract.py',
+        'expect': 'test_01',
+        'note': 'the comprehensive check measures the machine inside the click again',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '        opengl = OpenGLInfo.get_opengl_info()',
+        'replace': '        opengl = None',
+        'expect': 'test_138',
+        'note': 'the pane stops taking the one reading only it may take',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '            return self.diagnostic_engine.get_full_system_report(opengl)',
+        'replace': '            return self.diagnostic_engine.get_full_system_report()',
+        'expect': 'test_138',
+        'note': 'the worker is sent to ask the widget question itself',
+    },
+    {
+        'file': 'src/features/diagnostic_engine.py',
+        'find': "            'opengl': OpenGLInfo.get_opengl_info() if opengl is None else opengl,",
+        'replace': "            'opengl': OpenGLInfo.get_opengl_info(),",
+        'expect': 'test_138',
+        'note': 'the reading the caller took on the paint thread is dropped on the way in',
+    },
+    {
+        'file': 'src/features/diagnostic_engine.py',
+        'find': '            if QThread.currentThread() is not app.thread():',
+        'replace': '            if False:',
+        'expect': 'test_139',
+        'note': 'a widget is built on a pool thread to answer one question',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '        worker.signals.error.connect(failure or self.on_measurement_failed)',
+        'replace': '        worker.signals.error.connect(self.on_measurement_failed)',
+        'expect': 'test_139',
+        'note': 'the failure channel the check was given is ignored for the pane-wide one',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '                            failure=self.check_failure(lead, status))',
+        'replace': '                            failure=None)',
+        'expect': 'test_139',
+        'note': 'every machine check is pointed at the box no one was watching',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': '            self.diagnostic_results.setPlainText(f"{lead}: {kind.__name__}: {value}")',
+        'replace': '            pass',
+        'expect': 'test_139',
+        'note': 'a check that raised leaves its busy words on screen forever',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': "        'quick check': ('Analyzing system...', 'Error running diagnostics',",
+        'replace': "        'quick check': ('Analyzing system...', 'Error running full diagnostic',",
+        'expect': 'test_139',
+        'note': 'one failure sentence stands for two different buttons',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': "        'full diagnostic': ('Running comprehensive analysis...',",
+        'replace': "        'full diagnostic': ('Analyzing system...',",
+        'expect': 'test_137',
+        'note': 'the comprehensive check says it is doing the quick one',
+    },
+    {
+        'file': 'src/ui/diagnostics_tab.py',
+        'find': "                            'Error running full diagnostic', 'Status: Diagnostic failed'),",
+        'replace': "                            'Error running full diagnostic', 'Status: Check failed'),",
+        'expect': 'test_139',
+        'note': 'the word beside a failed comprehensive check is the quick one',
     },
 
     # ---- the log arithmetic the Diagnostics pane prints ------------------------------
@@ -449,13 +545,20 @@ MUTATIONS = [
         'file': 'src/ui/diagnostics_tab.py',
         'find': '        def worker_func(progress_callback=None):',
         'replace': '        def worker_func():',
-        'expect': 'test_177_a_measurement',
-        'note': 'the measurement is handed an argument the house worker always passes',
+        'expect': 'test_03',
+        'suite': 'tests/test_check_threading_contract.py',
+        'note': 'the shared off-thread path is handed an argument the house worker always '
+                'passes, so `Worker.run` raises `TypeError` before the measurement starts and '
+                'only `error` ever fires; live, every test that presses a machine button then '
+                'waits its whole `pump` budget for a `result` that cannot arrive - measured on '
+                'this tree at past the sweep budget of 900 s and inside 1800 s, naming '
+                'test_177 when it finished. The shape is a fact about the text, so the same '
+                'question is asked of the file, where it costs 0.2 s',
         'which': 2,
     },
     {
         'file': 'src/ui/diagnostics_tab.py',
-        'find': '        worker.signals.error.connect(self.on_measurement_failed)',
+        'find': '        worker.signals.error.connect(failure or self.on_measurement_failed)',
         'replace': '        pass',
         'expect': 'test_177_a_measurement',
         'note': 'a measurement that dies takes its reason with it',

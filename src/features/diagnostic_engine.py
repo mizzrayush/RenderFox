@@ -640,11 +640,29 @@ class OpenGLInfo:
     
     @staticmethod
     def get_opengl_info() -> Dict[str, Any]:
-        """Get OpenGL capabilities."""
+        """Get OpenGL capabilities - on the thread that paints, and nowhere else.
+
+        The reading needs a current context, and the only way this app can ask for one is to
+        build a `QOpenGLWidget`, which is a widget: constructing one on a pool thread is the
+        shape this app has already taken out of two worker threads, the AI tagger's and the
+        library grid's Open3D windows. So the thread question is answered here in words rather
+        than by reaching for a widget this thread may not own.
+
+        Whether the question can then be *answered* is a second thing, and it is measured: five
+        calls each under the offscreen platform and the real `windows` one, and a widget that was
+        never shown has no current context on either thread, so `glGetString` returns error 1282
+        every time. That is why the panes print the `error` this dict carries instead of a vendor,
+        and why the hand-off below is about which thread may ask, not about a figure that was
+        being lost. A caller that runs the rest of the report on a worker takes the reading on its
+        own thread first and hands it to `get_full_system_report(opengl=...)`: 0.0 ms once the
+        process has built one widget and 20-25 ms on the first call, which is the widget, against
+        the 1.4 s drive scan and 0.4 s adapter query the rest of the report is made of.
+        """
         if not OPENGL_AVAILABLE:
             return {'error': 'PyOpenGL not installed'}
         
         try:
+            from PyQt6.QtCore import QThread
             from PyQt6.QtWidgets import QApplication
             from PyQt6.QtOpenGLWidgets import QOpenGLWidget
             
@@ -652,6 +670,10 @@ class OpenGLInfo:
             app = QApplication.instance()
             if app is None:
                 return {'error': 'QApplication not initialized'}
+            
+            if QThread.currentThread() is not app.thread():
+                return {'error': 'OpenGL can only be asked from the thread that paints; '
+                                 'this reading was taken on a worker'}
             
             widget = QOpenGLWidget()
             widget.makeCurrent()
@@ -908,12 +930,17 @@ class DiagnosticEngine:
     def __init__(self):
         self.error_logger = ErrorLogger()
     
-    def get_full_system_report(self) -> Dict[str, Any]:
+    def get_full_system_report(self, opengl: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Everything the Diagnostics pane shows, measured in one pass.
 
         The adapter and volume readings are taken once here and handed to the health checks,
         so a row's figures and the verdict beside it come from the same look at the machine
         rather than two looks a second apart.
+
+        `opengl` is for the caller that runs this method on a worker and has already taken
+        the OpenGL reading where it may be taken - on the thread that paints. Given, it is
+        used as it came; not given, this method asks for it itself, which is what the
+        source-run and export callers have always done.
         """
         storage = SystemInfo.get_storage_info()
         gpu = SystemInfo.get_gpu_report()
@@ -928,7 +955,7 @@ class DiagnosticEngine:
             'gpu_text': gpu['text'],
             'gpu_reasons': gpu['reasons'],
             'gpu_load_reason': gpu['load_reason'],
-            'opengl': OpenGLInfo.get_opengl_info(),
+            'opengl': OpenGLInfo.get_opengl_info() if opengl is None else opengl,
             'dependencies': DependencyChecker.check_all_dependencies(),
             'health_checks': HealthChecker.run_all_checks(storage, gpu, cpu),
             'recent_errors': self.error_logger.get_recent_errors(limit=10)

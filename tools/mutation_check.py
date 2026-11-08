@@ -27,6 +27,13 @@ before any test runs, which is indistinguishable from a suite killed by a mutati
 entry in the list comes back CRASHED and the advice printed under it points at tests that
 already reach the defect. The suite paths are therefore checked before anything is planted, and
 a run that cannot start says so and plants nothing (exit 2).
+
+The fourth disguise is a run that does not end. A planted defect can leave a test waiting for a
+delivery that will never arrive, and a sweep with no deadline waits with it: measured here, one
+entry whose error channel is off costs 119 s against the 34-38 s that same suite costs clean, and
+a hung entry held a whole sweep for fourteen minutes on a process whose CPU time had stopped
+moving. That is answered as its own verdict, HUNG, with the child killed and the file restored,
+because "the sweep is still running" is not a measurement of anything.
 """
 
 import argparse
@@ -37,6 +44,14 @@ import subprocess
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# The budget one planted suite run gets, in seconds, before the entry is answered HUNG and the
+# child is killed. It is a constant rather than a guess made per sweep because the cost it has to
+# cover is measured: the slowest entry in `tools/mutations_hardware.py` answers in 119 s and the
+# suite it runs costs 34-38 s clean, so the budget is roughly seven times the slowest real answer -
+# enough room for a machine under load, short enough that a run that has stopped doing work is
+# ended inside one sweep rather than deciding the length of the next one.
+SUITE_TIMEOUT = 900
 
 
 def load_mutations(path):
@@ -84,6 +99,10 @@ def main():
     parser.add_argument('--list', action='store_true', help='only check every anchor is unique')
     parser.add_argument('--only', help='run just these numbers, e.g. --only 22 or --only 22,26')
     parser.add_argument('--verbose', action='store_true', help='print the failure text')
+    parser.add_argument('--timeout', type=int, default=SUITE_TIMEOUT,
+                        help=f'seconds one planted suite run may take before the entry is '
+                             f'answered HUNG and the child is killed (default {SUITE_TIMEOUT}; '
+                             f'an entry may carry its own "timeout")')
     args = parser.parse_args()
 
     mutations = load_mutations(os.path.join(ROOT, args.spec) if not os.path.isabs(args.spec) else args.spec)
@@ -126,6 +145,7 @@ def main():
     cache = {}
     survived = []
     crashed = []
+    hung = []
     broken_restore = []
     for position, item in enumerate(mutations, 1):
         index = item.get('number', position)
@@ -149,24 +169,37 @@ def main():
         open(path, 'wb').write(mutated.encode('utf-8'))
 
         suite = item.get('suite') or args.suite
-        proc = subprocess.run([sys.executable, '-X', 'utf8', os.path.join(ROOT, suite)],
-                              capture_output=True, text=True, encoding='utf-8', errors='replace',
-                              cwd=ROOT)
-        names = failing_tests(proc.stderr)
-        caught = [name for name in names if item['expect'] in name]
+        budget = item.get('timeout', args.timeout)
+        try:
+            proc = subprocess.run([sys.executable, '-X', 'utf8', os.path.join(ROOT, suite)],
+                                  capture_output=True, text=True, encoding='utf-8',
+                                  errors='replace', cwd=ROOT, timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc, names, caught = None, [], []
+        else:
+            names = failing_tests(proc.stderr)
+            caught = [name for name in names if item['expect'] in name]
 
         open(path, 'wb').write(raw)
         if hashlib.sha256(open(path, 'rb').read()).hexdigest() != digest:
             broken_restore.append(f'{number} {item["file"]} did not restore byte-exactly')
 
-        if args.verbose:
+        if args.verbose and proc is not None:
             report = proc.stderr.splitlines()
             keep = [i for i, one in enumerate(report) if one.startswith(('FAIL:', 'ERROR:'))]
             for i in keep:
                 print(chr(10).join(report[i:i + 14]))
                 print('-' * 70)
         label = f'{number} {item["note"]}'
-        if caught:
+        if proc is None:
+            # Nothing is known about this entry except that its run did not answer inside the
+            # budget. The defect may well be caught and may equally be invisible, and a reader
+            # who has to work that out from a silent terminal is the reason this is a verdict.
+            print(f'{label}\n      HUNG - the suite waited past {budget}s without reporting; '
+                  f'the child was killed and the file restored, so ask for this entry alone '
+                  f'with --only {index} and a longer --timeout')
+            hung.append(label)
+        elif caught:
             print(f'{label}\n      caught by {len(caught)} test(s): ' + ', '.join(sorted(set(caught))[:4]))
         elif proc.returncode != 0 or 'OK' not in proc.stderr:
             # a suite that never reaches its report line detected the defect too, but not in
@@ -193,7 +226,11 @@ def main():
         print(f'{len(survived)} of {len(mutations)} defects went unnoticed:')
         for line in survived:
             print('  ' + line)
-    if survived or crashed:
+    if hung:
+        print(f'{len(hung)} defect(s) were answered by waiting past the budget:')
+        for line in hung:
+            print('  ' + line)
+    if survived or crashed or hung:
         return 1
     print(f'all {len(mutations)} defects were caught by a named test')
     return 0

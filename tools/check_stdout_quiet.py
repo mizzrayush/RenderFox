@@ -12,7 +12,7 @@ one that was deleted here read "useful if needed", which is an invitation to put
 write back into the function that must never have one.
 
 **A failure needs a channel the user can open.** The only one the app has is the root
-logger: `src/ui/diagnostics_tab.py:733` puts a `PaneLogHandler` on it, and the Diagnostics
+logger: `src/ui/diagnostics_tab.py:756` puts a `PaneLogHandler` on it, and the Diagnostics
 pane turns each record into a row. Rule 3 checks the other half of that path - that every
 bare ``logger.`` call resolves to a name the module or the enclosing function actually
 bound. A ``logger.warning`` with no ``logger`` is a ``NameError`` raised inside an

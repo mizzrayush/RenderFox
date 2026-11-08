@@ -23,7 +23,7 @@ in it - into finalization.
 **Rule 2 asks the same question of every file that owns a `QApplication`.** Five do, in app scope:
 `main.py` and four panes with a hand-run `__main__` block. A loop that ends is only half an exit;
 the other half is a `shutdown` call on the same object, in the same file, between the loop and the
-leaving. An exit code is part of the contract too - `run_audit.py:312` reads one - so the entry
+leaving. An exit code is part of the contract too - `run_audit.py:340` reads one - so the entry
 point that returns the loop's code must still hand it to `sys.exit`.
 
 **Rule 3 checks the drain itself, not just that its name was called.** A `shutdown` that stops
@@ -229,7 +229,7 @@ def undrained_loops(path: Path):
 def entry_keeps_the_loop_code(path: Path):
     """Rule 2b: the file that *is* the entry point must still leave with the loop's code.
 
-    `run_audit.py:312` scores a suite by `proc.returncode == 0`, and a `main()` that returns
+    `run_audit.py:340` scores a suite by `proc.returncode == 0`, and a `main()` that returns
     `None` after a fix this careful would report a clean exit for a loop that ended in failure.
     """
     tree = ast.parse(_source(path), filename=str(path))
@@ -324,7 +324,7 @@ def atexit_hooks(path: Path):
 def scan(paths, entry=None):
     """Every rule, over the given files: ``[(file, rule, lineno, detail), ...]``.
 
-    `entry` is the file whose exit code somebody outside the process reads - `run_audit.py:312`
+    `entry` is the file whose exit code somebody outside the process reads - `run_audit.py:340`
     for the app, and a planted file for `tests/test_clean_exit_contract.py`, which has to be able
     to ask whether rule 2b is applied at all without rewriting the shipped entry point to find out.
     """

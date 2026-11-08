@@ -25,6 +25,10 @@ What is pinned here, in order:
   status words `healthy` / `warning` / `critical`;
 * a question to Windows that fails is reported as that failure with the message Windows
   sent, and a pane never treats "unknown" as "all right";
+* the machine is never measured on the thread that paints: a button click hands the reading
+  to the pool and says what it is doing, the one reading that cannot be taken anywhere else
+  is taken on the paint thread and passed down as an argument, and a check that raises lands
+  in the box it was writing into instead of a console the packaged build does not have;
 * the figures beside a verdict and the verdict itself come from one measurement, so a row
   cannot show last second's number with this second's word;
 * the panes paint what they are handed and compute nothing of their own.
@@ -40,6 +44,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -54,7 +59,7 @@ sys.path.insert(0, ROOT)
 import psutil
 
 from src.features.diagnostic_engine import (DependencyChecker, DiagnosticEngine,
-                                            HealthChecker, SystemInfo)
+                                            HealthChecker, OpenGLInfo, SystemInfo)
 
 VOLUME_KEYS = {'mountpoint', 'device', 'filesystem', 'total_bytes', 'used_bytes',
                'free_bytes', 'used_percent', 'media_type', 'disk'}
@@ -95,6 +100,40 @@ def gpu_report(adapters=(), reasons=(), load_reason=None):
             'load_reason': load_reason,
             'text': SystemInfo._gpu_text(list(adapters), list(reasons)),
             'identity_source': adapters[0]['source'] if adapters else None}
+
+
+def full_report(health, volumes, opengl=None):
+    """A report shaped like the engine's, with a marker in every field the panes print.
+
+    `opengl` echoes whatever the caller handed down, which is what lets a test tell the
+    difference between a reading taken on the paint thread and passed over and one the
+    worker went and made up.
+    """
+    return {'cpu': {'physical_cores': 4, 'logical_cores': 8,
+                    'current_frequency': '100 MHz', 'usage_percent': 7.5,
+                    'max_frequency': '200 MHz'},
+            'memory': {'used': '1 GB', 'total': '2 GB', 'percent': 50.0,
+                       'available': '1 GB', 'swap_used': '0 GB', 'swap_total': '2 GB'},
+            'os': {'os': 'Windows', 'os_release': '11', 'os_version': '10',
+                   'architecture': 'x64', 'processor': 'Intel64',
+                   'python_version': '3.11'},
+            'storage': {'volumes': volumes, 'reasons': []},
+            'gpu': [adapter('MARKER-GPU')],
+            'gpu_text': 'MARKER-GPU TEXT',
+            'gpu_reasons': ['current load: MARKER'],
+            'opengl': opengl or {'vendor': 'V', 'renderer': 'R', 'version': '1'},
+            'dependencies': {'required': {}, 'optional': {}},
+            'health_checks': health,
+            'recent_errors': [], 'timestamp': 'now'}
+
+
+def healthy(**verdicts):
+    """The five checks, all quiet, except the ones this test wants to say otherwise."""
+    health = {name: {'status': 'healthy', 'message': 'all quiet on ' + name}
+              for name in ('cpu', 'memory', 'disk', 'gpu', 'dependencies')}
+    for name, verdict in verdicts.items():
+        health[name] = verdict
+    return health
 
 
 
@@ -908,7 +947,65 @@ class Test13DiagnosticsPane(unittest.TestCase):
         cls.real_engine = cls.tab.diagnostic_engine
 
     def setUp(self):
+        # Registered first so it runs last, after the releases this test adds below: the pool
+        # cannot be asked to empty while a stub is still holding a worker open, and a worker
+        # still in flight when the next test begins is what turns a defect about *which thread*
+        # measures into a process that aborts before it can name anything.
+        self.addCleanup(self.wait_for_pool)
         self.tab.diagnostic_engine = self.real_engine
+        # The pane answers the one question that may only be answered on the thread that
+        # paints, then hands the value to the worker. This class records the thread it was
+        # asked from and stays clear of a real GL context; `test_139` uses the untouched
+        # reader, because the guard under test is inside it.
+        self.real_opengl_reader = OpenGLInfo.get_opengl_info
+        self.opengl_threads = []
+
+        def read():
+            from PyQt6.QtCore import QThread
+            self.opengl_threads.append(QThread.currentThread() is self.tab.thread())
+            return {'vendor': 'MARKER-VENDOR', 'renderer': 'MARKER-RENDERER', 'version': '1'}
+
+        patcher = mock.patch.object(OpenGLInfo, 'get_opengl_info', side_effect=read)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        """End this test's readings the way the pane ends its own, before anything is released.
+
+        `shutdown_runs` takes the receivers off every worker this pane started and only then
+        waits, so a reading that answers after the assertions have been made has nowhere to be
+        delivered. Doing it here rather than in a cleanup is the point: `tearDown` runs before
+        the `release.set` cleanups a test registers, so a worker still blocked on an event is
+        silenced while it is still blocked, and the answer it wakes on finds no receiver. No
+        `processEvents` follows it - the deliveries this test needed came from its own `pump`,
+        and delivering at teardown is how one test's stub reached the next one's pane.
+        """
+        self.tab.shutdown_runs(timeout_ms=250)
+
+    def wait_for_pool(self):
+        """Let the readings this test silenced run out, so the next test starts with no worker."""
+        from PyQt6.QtCore import QThreadPool
+        QThreadPool.globalInstance().waitForDone(20000)
+
+    def pump(self, seconds=25.0, until=None):
+        """Spin this thread until the worker's answer has been delivered.
+
+        A `result` emitted on a pool thread is queued to the one that owns the pane, so
+        waiting for the pool alone leaves the box holding the busy words: the handler only
+        runs when this thread takes its events.
+        """
+        end = time.time() + seconds
+        while time.time() < end:
+            self.app.processEvents()
+            time.sleep(0.02)
+            if until and until():
+                return True
+        return until() if until else False
+
+    def answered(self, *begins):
+        """Has the report box moved past the busy words to the lines it was given?"""
+        text = self.tab.diagnostic_results.toPlainText()
+        return any(text.startswith(begin) for begin in begins)
 
     def badge(self, name):
         frame = getattr(self.tab, name)
@@ -933,39 +1030,40 @@ class Test13DiagnosticsPane(unittest.TestCase):
             self.assertEqual('Not checked', self.badge(name).text(), name)
         self.assertIn('#7f8c8d', self.badge('cpu_health').styleSheet())
 
-    def fake_engine(self, health, volumes):
+    def fake_engine(self, health, volumes, hang=None):
+        """A stand-in engine that hands back a fixed report and records what it was passed.
+
+        `received` is the argument the pane handed down with the call - the paint-thread
+        reading - and `hang` holds the report open until the test lets go, which is how a
+        click that waits for the machine shows up as a failure instead of a slow pass.
+        """
         class Stub:
-            def get_full_system_report(self_inner):
-                return {'cpu': {'physical_cores': 4, 'logical_cores': 8,
-                                'current_frequency': '100 MHz', 'usage_percent': 7.5,
-                                'max_frequency': '200 MHz'},
-                        'memory': {'used': '1 GB', 'total': '2 GB', 'percent': 50.0,
-                                   'available': '1 GB', 'swap_used': '0 GB',
-                                   'swap_total': '2 GB'},
-                        'os': {'os': 'Windows', 'os_release': '11', 'os_version': '10',
-                               'architecture': 'x64', 'processor': 'Intel64',
-                               'python_version': '3.11'},
-                        'storage': {'volumes': volumes, 'reasons': []},
-                        'gpu': [adapter('MARKER-GPU')],
-                        'gpu_text': 'MARKER-GPU TEXT',
-                        'gpu_reasons': ['current load: MARKER'],
-                        'opengl': {'vendor': 'V', 'renderer': 'R', 'version': '1'},
-                        'dependencies': {'required': {}, 'optional': {}},
-                        'health_checks': health,
-                        'recent_errors': [], 'timestamp': 'now'}
+            def __init__(self_inner):
+                self_inner.received = []
+                self_inner.started = threading.Event()
+
+            def get_full_system_report(self_inner, opengl=None):
+                self_inner.received.append(opengl)
+                self_inner.started.set()
+                if hang is not None:
+                    hang.wait(12)
+                return full_report(health, volumes, opengl)
 
             def get_recommendations(self_inner, health_arg=None):
                 return ['Warning: MARKER-ADVICE']
-        self.tab.diagnostic_engine = Stub()
+
+        stub = Stub()
+        self.tab.diagnostic_engine = stub
+        return stub
 
     def test_132_quick_check_prints_the_backends_sentence(self):
-        health = {'cpu': {'status': 'healthy', 'message': 'm'},
-                  'memory': {'status': 'healthy', 'message': 'm'},
-                  'disk': {'status': 'critical', 'message': '9.9 GB free on Q:\\ (MARKERDISK)'},
-                  'gpu': {'status': 'healthy', 'message': 'm'},
-                  'dependencies': {'status': 'healthy', 'message': 'm'}}
+        health = healthy(disk={'status': 'critical',
+                               'message': '9.9 GB free on Q:\\ (MARKERDISK)'})
         self.fake_engine(health, [volume('C:\\')])
         self.tab.run_quick_check()
+        self.assertTrue(self.pump(
+            until=lambda: self.answered('Quick System Check Results')),
+            'the quick check never answered')
         text = self.tab.diagnostic_results.toPlainText()
         self.assertIn('[Critical] Storage: 9.9 GB free on Q:\\ (MARKERDISK)', text, text)
         self.assertIn('MARKER-GPU', text)
@@ -974,11 +1072,12 @@ class Test13DiagnosticsPane(unittest.TestCase):
                          'the badge and the line were given the same check and disagreed')
 
     def test_133_full_diagnostic_prints_the_volumes_it_was_given(self):
-        health = {name: {'status': 'healthy', 'message': 'all quiet on ' + name}
-                  for name in ('cpu', 'memory', 'disk', 'gpu', 'dependencies')}
-        self.fake_engine(health, [volume('C:\\', 90.0),
-                                 volume('D:\\', 10.0, media=None, disk=None)])
+        self.fake_engine(healthy(), [volume('C:\\', 90.0),
+                                     volume('D:\\', 10.0, media=None, disk=None)])
         self.tab.run_full_diagnostic()
+        self.assertTrue(self.pump(
+            until=lambda: self.answered('=== FULL SYSTEM DIAGNOSTIC ===')),
+            'the full diagnostic never answered')
         text = self.tab.diagnostic_results.toPlainText()
         self.assertIn('=== STORAGE ===', text)
         self.assertIn('C:\\ [NTFS]: 180.0 GB used of 200.0 GB (90.0%) - SSD, TestDisk', text)
@@ -993,6 +1092,9 @@ class Test13DiagnosticsPane(unittest.TestCase):
         with mock.patch.object(DependencyChecker, 'check_all_dependencies',
                                return_value=deps):
             self.tab.run_dependency_check()
+            self.assertTrue(self.pump(
+                until=lambda: self.answered('Dependency Check Results')),
+                'the package reading never answered')
         text = self.tab.diagnostic_results.toPlainText()
         self.assertIn('[Installed] trimesh: 4.7.4', text)
         self.assertIn('[Not Installed] gone', text)
@@ -1029,10 +1131,159 @@ class Test13DiagnosticsPane(unittest.TestCase):
                   'dependencies': {'status': 'healthy', 'message': 'm'}}
         self.fake_engine(health, [volume('C:\\')])
         self.tab.run_quick_check()
+        self.assertTrue(self.pump(
+            until=lambda: self.answered('Quick System Check Results')),
+            'the quick check never answered')
         text = self.tab.diagnostic_results.toPlainText()
         self.assertIn('[Not checked] CPU:', text, text)
         self.assertIn('[Not checked] Storage: no storage check ran', text, text)
         self.assertIn('Issues detected', text, 'the overall line counted only what answered')
+
+    def test_137_no_button_waits_on_a_machine_reading(self):
+        """The click returns while the reading is still running, and says what it is doing.
+
+        All three checks used to measure the machine inside the click - 2.3 s for the two
+        that walk the drives and ask Windows about adapters, a quarter of a second for the
+        package lookups - which is the same interval the window could not paint, and the reason
+        a "quick check"
+        looked like the app had hung. Each reading is held open here on purpose: a click that
+        still runs it itself never reaches the assertion after `started`, and the busy words
+        it leaves in the box are the ones this test reads.
+        """
+        for name, click, busy, status in (
+                ('quick check', self.tab.run_quick_check, 'Analyzing system...',
+                 'Status: Running quick check...'),
+                ('full diagnostic', self.tab.run_full_diagnostic,
+                 'Running comprehensive analysis...',
+                 'Status: Running full diagnostic...')):
+            release = threading.Event()
+            # Released even when an assert below fails. A stub left inside `hang.wait(12)`
+            # outlives this test by that whole window, answers into this pane after the next
+            # test has already replaced its engine, and is the reason one sweep's verdict on
+            # a moved reading was a process abort instead of the named failure below.
+            self.addCleanup(release.set)
+            stub = self.fake_engine(healthy(), [volume('C:\\')], hang=release)
+            click()
+            self.assertTrue(stub.started.wait(20), f'the {name} never started a reading')
+            self.assertEqual(busy, self.tab.diagnostic_results.toPlainText(),
+                             f'the {name} click ran the reading before it returned')
+            self.assertEqual(status, self.tab.health_status.text(), name)
+            release.set()
+            self.assertTrue(self.pump(
+                until=lambda: self.answered('Quick System Check Results',
+                                            '=== FULL SYSTEM DIAGNOSTIC ===')),
+                f'the {name} never answered')
+
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def hanging_packages(progress_callback=None):
+            started.set()
+            release.wait(20)
+            return {'required': {}, 'optional': {}}
+
+        with mock.patch.object(DependencyChecker, 'check_all_dependencies',
+                               side_effect=hanging_packages):
+            self.tab.run_dependency_check()
+            self.assertTrue(started.wait(20), 'the package reading never started')
+            self.assertEqual('Reading the installed packages...',
+                             self.tab.diagnostic_results.toPlainText(),
+                             'the dependency click ran the reading before it returned')
+            self.assertEqual('Status: Checking dependencies...', self.tab.health_status.text())
+            release.set()
+            self.assertTrue(self.pump(
+                until=lambda: self.answered('Dependency Check Results')),
+                'the dependency check never answered')
+
+    def test_138_the_open_gl_reading_is_taken_where_it_may_be_taken(self):
+        """The widget-shaped half stays on the paint thread and travels down as an argument.
+
+        `QOpenGLWidget` is a widget, and building one on a pool thread is the fault this app
+        has already removed twice - from the AI tagger's and the library grid's Open3D
+        windows. The reading costs 0.0 ms once the process has built one widget, against the
+        1.4 s drive scan around it, so the pane takes it
+        itself and hands it over. Both halves are pinned: that it was asked from the thread
+        that owns the pane, and that the value the worker returned is the one printed, rather
+        than a second question asked wherever the worker happened to be. What that value is
+        on a real machine is the engine's own question, and its docstring records the answer
+        measured here: a widget that was never shown has no current context on either thread.
+        """
+        stub = self.fake_engine(healthy(), [volume('C:\\')])
+        self.tab.run_full_diagnostic()
+        self.assertTrue(self.pump(
+            until=lambda: self.answered('=== FULL SYSTEM DIAGNOSTIC ===')),
+            'the full diagnostic never answered')
+        self.assertEqual([True], self.opengl_threads,
+                         'the OpenGL question was not asked once, on the thread that paints')
+        self.assertEqual([{'vendor': 'MARKER-VENDOR', 'renderer': 'MARKER-RENDERER',
+                           'version': '1'}], stub.received,
+                         'the engine was called without the reading the pane had taken')
+        self.assertIn('Renderer: MARKER-RENDERER', self.tab.diagnostic_results.toPlainText(),
+                      'the report printed something other than what it was handed')
+
+        engine_body = body_of(os.path.join('src', 'features', 'diagnostic_engine.py'),
+                              'DiagnosticEngine', 'get_full_system_report')
+        self.assertIn('opengl is None', engine_body,
+                      'the engine stopped using what it is handed')
+        self.assertIn('OpenGLInfo.get_opengl_info()', engine_body,
+                      'a caller with no reading to hand left with none to ask for')
+        pane_body = body_of(os.path.join('src', 'ui', 'diagnostics_tab.py'),
+                            'DiagnosticsTab', 'system_report_measure')
+        self.assertIn('get_full_system_report(opengl)', pane_body,
+                      'the pane went back to letting the worker ask')
+
+    def test_139_a_check_that_cannot_answer_says_so(self):
+        """Two ways a check comes up short, and neither of them is a silent box.
+
+        The OpenGL question cannot be answered from a worker at all, so it is refused with
+        the words the report already knows how to print instead of crashing the process over
+        a widget. A reading that raises has to land in the box it was writing into: the
+        handler used to swallow it, and the packaged build has no console to swallow it in.
+        Each of the three buttons owns a sentence and a status word of its own, so this reads
+        all three and requires each to say which check failed - one shared "Error running
+        diagnostics" for a drive scan and a package read would tell a person the wrong thing
+        about which button to press again.
+        """
+        answers = []
+        worker = threading.Thread(target=lambda: answers.append(self.real_opengl_reader()))
+        worker.start()
+        worker.join(30)
+        self.assertEqual(1, len(answers), 'the reading never came back')
+        self.assertIn('error', answers[0], str(answers[0]))
+        self.assertIn('thread', answers[0]['error'],
+                      'the refusal does not say what it refused for')
+
+        class Failing:
+            def get_full_system_report(self_inner, opengl=None):
+                raise RuntimeError('the drive scan died')
+
+        for name, lead, status in (
+                ('run_quick_check', 'Error running diagnostics', 'Status: Check failed'),
+                ('run_full_diagnostic', 'Error running full diagnostic',
+                 'Status: Diagnostic failed')):
+            self.tab.diagnostic_engine = Failing()
+            getattr(self.tab, name)()
+            self.assertTrue(
+                self.pump(until=lambda: lead in self.tab.diagnostic_results.toPlainText()),
+                f'the {name} printed some other check\'s failure: '
+                f'{self.tab.diagnostic_results.toPlainText()}')
+            self.assertIn('RuntimeError: the drive scan died',
+                          self.tab.diagnostic_results.toPlainText())
+            self.assertEqual(status, self.tab.health_status.text(), name)
+
+        def unreadable_packages():
+            raise ValueError('the package records are unreadable')
+
+        with mock.patch.object(DependencyChecker, 'check_all_dependencies',
+                               side_effect=unreadable_packages):
+            self.tab.run_dependency_check()
+            self.assertTrue(
+                self.pump(until=lambda: 'Error checking dependencies'
+                          in self.tab.diagnostic_results.toPlainText()),
+                'the dependency check swallowed what it could not read')
+        self.assertIn('ValueError: the package records are unreadable',
+                      self.tab.diagnostic_results.toPlainText())
+        self.assertEqual('Status: Check failed', self.tab.health_status.text())
 
 
 class Test14VolumeDiskJoin(unittest.TestCase):
