@@ -316,7 +316,8 @@ class ActionRegistry:
                 return None
             return size if size else None
 
-        def convert_format(input_file: str, destination: str, output_format: str = ''):
+        def convert_format(input_file: str, destination: str, output_format: str = '',
+                           preserve_materials: bool = True):
             from ..processing.format_converter import FormatConverter
             if not os.path.isfile(input_file):
                 raise FileNotFoundError(f"there is no model at {input_file}")
@@ -330,7 +331,9 @@ class ActionRegistry:
                         'error': f"{os.path.basename(destination)} would be written as "
                                  f"{target_ext}, the format it already is - set output_format "
                                  f"(for example \"glb\") to name the format to convert to"}
-            outcome = FormatConverter().convert_file(input_file, destination) or {}
+            outcome = FormatConverter().convert_file(
+                input_file, destination,
+                {'preserve_materials': bool(preserve_materials)}) or {}
             if not outcome.get('success'):
                 return {'success': False,
                         'error': outcome.get('message') or 'the converter gave no reason'}
@@ -344,13 +347,20 @@ class ActionRegistry:
                     f"({size} bytes) with {outcome.get('method') or 'the first library that worked'}")
             if skipped:
                 line += f"; {', '.join(skipped)} not applied"
+            if outcome.get('content'):
+                line += f"; {outcome['content']}"
             return {'success': True, 'result': line, 'output_path': destination}
 
         cls.register("processing.convert_format", convert_format,
                      "Convert a model to the format the destination extension names", {
             "input_file": {"type": "str", "required": True},
             "destination": {"type": "str", "required": True},
-            "output_format": {"type": "str", "required": False}
+            "output_format": {"type": "str", "required": False},
+            # The words the batch pane has carried since the baseline: a checkbox here is
+            # the same control, and the row it draws says "Preserve Materials", not the
+            # parameter name.
+            "preserve_materials": {"type": "bool", "required": False,
+                                   "label": "Preserve Materials"}
         }, batch=('input_file', 'destination'))
 
         def simplify_to_faces(input_file: str, destination: str, target_faces: int = 10000,
@@ -691,6 +701,7 @@ class ActionRegistry:
                     continue
             fields.append({'name': name,
                            'type': str(spec[name].get('type') or 'str'),
+                           'label': spec[name].get('label'),
                            'required': bool(spec[name].get('required')),
                            'default': defaults.get(name)})
         return fields

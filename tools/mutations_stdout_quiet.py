@@ -450,7 +450,7 @@ MUTATIONS = [
         'replace': "LEVEL_CALLS = frozenset({'debug', 'info', 'error', 'critical', 'exception', 'log'})",
         'expect': 'test_39_a_record_written_on_the_root_logger_is_reported',
         'note': 'the busiest level in the app is not a log call, so rules 5 and 6 read 104 of '
-                'the 240 records as ordinary code',
+                'the 241 records as ordinary code',
     },
     {
         'file': CK,

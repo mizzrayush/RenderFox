@@ -4,10 +4,13 @@ Inspired by the robust Blendr Kraft cross format converter.
 """
 
 import os
+import json
+import re
 import tempfile
+import zipfile
 import logging
 import numpy as np
-from typing import List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -90,7 +93,173 @@ def _meaningful_options(options: Optional[Dict]) -> List[str]:
         live.append('scale')
     live += [key for key in ('center', 'normalize', 'repair', 'remove_duplicates')
              if options.get(key)]
+    # Both answers change the file, so the question counts as asked either way: carrying
+    # the parts apart is a different call from merging them, and either of them differs
+    # from the route that runs when nobody mentions materials at all.
+    if 'preserve_materials' in options:
+        live.append('preserve_materials')
     return live
+
+
+# The places a written file is asked about, read back out of its own bytes. This is not
+# trimesh's visual read-back: measured on a .glb this app had just written with two
+# images inside it, `visual.material.image` answers None, so a sentence built on the
+# reader would deny a texture the file holds. A container that has a field for something
+# is counted; one that is triangles and nothing else says so, and the rest are simply
+# not claimed.
+_CONTENT_PLACES = {
+    'obj': ('materials', 'textures', 'uvs'),
+    'glb': ('materials', 'textures', 'uvs'),
+    'gltf': ('materials', 'textures', 'uvs'),
+    'dae': ('materials', 'textures', 'uvs'),
+    'fbx': ('materials', 'textures'),
+    'ply': ('uvs',),
+    '3mf': ('materials',),
+    'stl': (),
+    'off': (),
+}
+# The counts come out of the file, so the noun has to follow them: a model with one part
+# answers `1 material`, and `1 materials` is the kind of wording that makes a person
+# doubt the number next to it.
+_PLACE_WORDS = {'materials': ('materials', 'material'),
+                'textures': ('textures', 'texture'),
+                'uvs': ('texture coordinates',),
+                'colours': ('vertex colours',)}
+
+
+def _place_word(place: str, value) -> str:
+    words = _PLACE_WORDS[place]
+    # A count of one is the only thing that makes the noun singular. A yes/no field
+    # answers `True`, which python reads as the number one, and a sentence that says
+    # `keeps texture` - with no number in front of it at all - reads as a word that went
+    # missing rather than as a field the file has.
+    if len(words) > 1 and not isinstance(value, bool) and value == 1:
+        return words[1]
+    return words[0]
+
+
+def _joined(words: List[str], last: str) -> str:
+    """`a`, `a and b`, `a, b and c` - the sentence has to read as one."""
+    if len(words) == 1:
+        return words[0]
+    return ', '.join(words[:-1]) + f' {last} ' + words[-1]
+
+
+def _gltf_document(raw: bytes, ext: str) -> Optional[Dict]:
+    """The JSON part of a glTF: the whole file for .gltf, the first chunk for .glb."""
+    try:
+        if ext == 'gltf':
+            return json.loads(raw.decode('utf-8', 'replace'))
+        length = int.from_bytes(raw[12:16], 'little')
+        return json.loads(raw[20:20 + length].decode('utf-8', 'replace'))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _content_findings(path: str) -> Optional[Dict[str, Any]]:
+    """What the file's own container names, or None when it cannot be read at all."""
+    ext = _extension(Path(path).suffix)
+    places = _CONTENT_PLACES.get(ext)
+    if places is None:
+        return None
+    if not places:
+        # .stl and .off are a triangle list and nothing else, so there is no field to
+        # open for a material - the answer does not depend on the bytes.
+        return {}
+    try:
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    text = raw.decode('latin-1', 'replace')
+    found: Dict[str, Any] = {}
+    if ext in ('glb', 'gltf'):
+        document = _gltf_document(raw, ext)
+        if document is None:
+            return None
+        attributes = [prim.get('attributes') or {} for mesh in document.get('meshes') or []
+                      for prim in mesh.get('primitives') or []]
+        found['materials'] = len(document.get('materials') or [])
+        found['textures'] = len(document.get('images') or [])
+        found['uvs'] = any(str(key).upper().startswith('TEXCOORD')
+                           for one in attributes for key in one)
+        found['colours'] = any(str(key).upper().startswith('COLOR_')
+                               for one in attributes for key in one)
+    elif ext == 'obj':
+        # The .mtllib names are taken as file names beside the model, which is what
+        # `write_scene` writes; the basename keeps a path typed into a model file from
+        # pointing the reader somewhere else.
+        folder = os.path.dirname(path) or '.'
+        textures = 0
+        for name in re.findall(r'(?m)^\s*mtllib\s+(\S+)', text):
+            try:
+                with open(os.path.join(folder, os.path.basename(name)),
+                          'r', errors='replace') as handle:
+                    sidecar = handle.read()
+            except OSError:
+                continue
+            textures += len(re.findall(r'(?m)^\s*map_\w+', sidecar))
+        found['materials'] = len({one.lower() for one in
+                                  re.findall(r'(?m)^\s*usemtl\s+(\S+)', text)})
+        found['textures'] = textures
+        found['uvs'] = bool(re.findall(r'(?m)^\s*vt\s', text))
+    elif ext == 'ply':
+        header = text.split('end_header')[0].lower()
+        # The name is the last word of the line: `property float x` and
+        # `property list uchar int vertex_indices` alike.
+        names = {line.split()[-1] for line in header.splitlines()
+                 if line.strip().startswith('property ')}
+        found['uvs'] = bool(names & {'s', 't', 'u', 'v', 'texcoord'})
+        found['colours'] = {'red', 'green', 'blue'} <= names
+    elif ext == 'dae':
+        found['materials'] = len(re.findall(r'<(?:b:)?material[\s>]', text, re.IGNORECASE))
+        found['textures'] = bool(re.search(r'<(?:b:)?(?:surface|sampler2d)', text,
+                                           re.IGNORECASE))
+        found['uvs'] = 'texcoord' in text.lower()
+    elif ext == 'fbx':
+        found['materials'] = raw.count(b'Material::')
+        found['textures'] = raw.count(b'Texture::')
+    elif ext == '3mf':
+        try:
+            with zipfile.ZipFile(path) as archive:
+                xml = ' '.join(archive.read(one).decode('utf-8', 'replace')
+                               for one in archive.namelist() if one.endswith('.model'))
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return None
+        found['materials'] = len(re.findall(r'<(?:m:)?(?:base)?materials[\s>]', xml,
+                                            re.IGNORECASE))
+    else:
+        return None
+    return found
+
+
+def _content_sentence(path: str) -> Optional[str]:
+    """One line naming what the file that was just written still holds.
+
+    The switch is a question about the file, so the answer is read off the file: what it
+    counts is the container's own material, texture and coordinate fields, and a format
+    that is triangles and nothing else says that instead of being counted empty.
+    """
+    ext = _extension(Path(path).suffix)
+    found = _content_findings(path)
+    if found is None:
+        return None
+    if not _CONTENT_PLACES[ext]:
+        return (f'the .{ext} has no place for materials, textures or texture coordinates, '
+                'so that choice cannot change the file')
+    kept = []
+    for place in _CONTENT_PLACES[ext]:
+        value = found.get(place)
+        word = _place_word(place, value)
+        if isinstance(value, bool):
+            kept.append(word if value else f'no {word}')
+        elif value:
+            kept.append(f'{value} {word}')
+        else:
+            kept.append(f'no {word}')
+    if found.get('colours'):
+        kept.append(_place_word('colours', True))
+    return f'the .{ext} that was written keeps {_joined(kept, "and")}'
 
 
 # Helper: ensure we return a trimesh.Trimesh from a trimesh.Scene or Trimesh. A PointCloud and
@@ -210,6 +379,13 @@ class FormatConverter(QObject):
         'obj': 'obj', 'ply': 'ply', 'stl': 'stl', 'gltf': 'gltf2', 'glb': 'glb2',
         'dae': 'collada', 'fbx': 'fbx', '3mf': '3mf',
     }
+
+    # The targets trimesh will take a *Scene* - the parts kept apart, each with its own
+    # material - and write out. This is narrower than the `write` set above: measured on
+    # this build, `Scene.export('x.off')` raises "unsupported export format: off" while
+    # the same call on a single Trimesh writes the file. So the route a conversion takes
+    # is chosen from this list rather than tried and caught.
+    _SCENE_EXPORT_FORMATS = {'obj', 'ply', 'stl', 'gltf', 'glb', '3mf'}
 
     # Tried in this order: the first library that can do the whole job wins, and trimesh
     # is first because it is the only one that can apply the conversion options the UI
@@ -427,6 +603,20 @@ class FormatConverter(QObject):
                     message = f"Converted using {method_name}"
                     if skipped:
                         message += f" ({', '.join(skipped)} not applied)"
+                    if 'preserve_materials' in (options or {}):
+                        # The file is already written and verified by this point, so a
+                        # reader that cannot make sense of its bytes must not turn the
+                        # answer into a failure. Measured on the first version of this
+                        # sentence: a .stl handed to the .3mf branch raised BadZipFile
+                        # inside the call below, and a conversion that had produced a real
+                        # file came back as "assimp failed: File is not a zip file".
+                        try:
+                            result['content'] = _content_sentence(output_file)
+                        except Exception as error:
+                            logger.debug(f"Could not read back what {output_file} keeps: {error}")
+                            result['content'] = None
+                        if result['content']:
+                            message += f'; {result["content"]}'
                     self.conversion_completed.emit(input_file, True, message)
                     return result
 
@@ -446,12 +636,32 @@ class FormatConverter(QObject):
         }
     
     def _convert_with_trimesh(self, input_file: str, output_file: str, options: Dict) -> Dict[str, any]:
-        """Convert using trimesh library"""
+        """Convert using trimesh library.
+
+        `preserve_materials` is the one option that changes *which call is made* rather
+        than what happens to one mesh: with it the file goes out as the scene it was read
+        as, because `as_trimesh()` merges the parts - and with them the materials, since a
+        concatenated mesh holds one visual. Measured on a .obj carrying two named
+        materials, the merged route writes a .glb naming one material and the scene route
+        writes one naming both; the faces are the same either way.
+        """
         if not TRIMESH_AVAILABLE:
             return {'success': False, 'message': 'Trimesh not available'}
         
         try:
-            # Load the mesh/scene
+            keep = options.get('preserve_materials')
+            if keep is not None and (_extension(Path(output_file).suffix)
+                                     in self._SCENE_EXPORT_FORMATS):
+                scene, _reason = self.read_scene(input_file)
+                if scene is not None:
+                    ok, reason = self.write_scene(scene if keep else self.without_materials(scene),
+                                                  output_file)
+                    if not ok:
+                        return {'success': False, 'message': reason}
+                    return {'success': True, 'message': 'Conversion successful'}
+
+            # Load the mesh/scene - the route every caller that says nothing about
+            # materials takes, and the only one a .off target can take.
             mesh_or_scene = trimesh.load(input_file)
             
             # Normalize to a single mesh
@@ -902,6 +1112,25 @@ class FormatConverter(QObject):
                            f'route failed: {result.get("message", "no reason given")}')
         return True, f'{os.path.basename(output_file)} written via a .glb staging file by ' \
                      f'{result.get("method", "a library here")}'
+
+    def without_materials(self, scene):
+        """The parts, with the material each one names taken off and nothing else.
+
+        Vertex colours stay: the switch answers about the texture, not about the colours
+        painted on the vertices, and trimesh's own visual reset drops those too - so they
+        are read off first and handed back. Measured on a two-material .obj, this leaves a
+        .glb that names no material, no image and no texture coordinates, where the same
+        scene written as it stands names both materials.
+        """
+        for geometry in scene.geometry.values():
+            visual = geometry.visual
+            kept = None
+            if visual.kind in ('vertex', 'face'):
+                kept = np.array(visual.vertex_colors)
+            geometry.visual = trimesh.visual.ColorVisuals(mesh=geometry)
+            if kept is not None:
+                geometry.visual.vertex_colors = kept
+        return scene
 
     def write_mesh(self, mesh, output_file: str) -> Tuple[bool, str]:
         """One mesh in memory as a model file, through the same writer a scene uses."""

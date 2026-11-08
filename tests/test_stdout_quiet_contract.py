@@ -11,18 +11,23 @@ a reader, and **88 had no reader at all** - a failure caught, described, and wri
 stream the package closes.
 
 Those 88 are now records. Measured the same way on this tree: **12 stream writes** left, 0 of them
-unreadable, and **240 log records** written by 33 of the 74 files where 151 were written by 16 -
+unreadable, and **241 log records** written by 33 of the 74 files where 151 were written by 16 -
 the arithmetic the suite pins, because a report that changed channel rather than vanishing is the
-whole claim. The levels are 104 `warning`, 68 `error`, 60 `info`, 6 `debug` and 2 `logger.exception`.
+whole claim. The levels are 104 `warning`, 68 `error`, 60 `info`, 7 `debug` and 2 `logger.exception`.
 The file count is 74 and not 71 because 7b-1 shipped `src/utils/app_settings.py` and
 `src/features/performance_controls.py`, neither of which emits, and Phase 38 shipped
 `src/utils/app_paths.py`, which is the reader and emits nothing either. The count is the channel phase's 239
-plus one, and the one is this phase's: the pane lost the `update_system_info` warning that sat in a
+plus two. One is 7b's: the pane lost the `update_system_info` warning that sat in a
 method it no longer has (HEAD `src/ui/performance_tab.py:1117`) and gained two failure channels for
 work that used to reach only the screen - `on_identity_reader_failed` (`:1134`) and
 `on_memory_task_failed` (`:1636`). A record on a branch that runs is the claim; the earlier
 correction ran the other way, when that phase lost a warning written by a shadowed
 `update_model_info` no caller could reach, and a record that cannot run is not a report.
+The other is 15b-1's, and it is the record a written file needs when the sentence about it cannot
+be made: `src/processing/format_converter.py:616` logs at debug that the read-back of what the
+output file keeps failed, on the branch where the conversion still succeeds - the answer about the
+model is already on its way, and the one thing the user should never see is that file reported as
+a failure because a reporter could not parse it.
 Rules 5 and 6 found seventeen defects on the tree the sweep landed on, all of them records the
 channel was already losing: three calls written on the root logger, whose rows are named `root`,
 and fourteen sentences that needed a glyph to be understood.
@@ -442,8 +447,8 @@ class TestInstrument(unittest.TestCase):
                 else:
                     through_a_module_logger += 1
         self.assertEqual(0, on_root, 'a record is written on the root logger after all')
-        self.assertEqual(240, sum(levels.values()),
-                         f'the tree writes {sum(levels.values())} records, not the 240 this file '
+        self.assertEqual(241, sum(levels.values()),
+                         f'the tree writes {sum(levels.values())} records, not the 241 this file '
                          'documents: re-measure, then correct the docstring')
         self.assertGreaterEqual(through_a_module_logger, 230, 'rules 5 and 6 have almost nothing to read')
         self.assertGreaterEqual(len(emitters), 30, f'only {len(emitters)} files emit at all')

@@ -1484,6 +1484,138 @@ class PaneCase(DirCase):
                              sorted(one['name'] for one in fields), action_id)
             self.assertEqual(self.tab._form_parameters(), {}, action_id)
 
+    # --- the switch the registry draws, and the file it changes ----------------
+    def textured_source(self, folder, name='model.obj'):
+        """An .obj with two named images, so one switch has two of something to keep.
+
+        The two parts have to wear different pictures: measured in the converter suite,
+        trimesh writes two materials whose image bytes are identical as a single `newmtl`,
+        and a fixture that holds one material cannot show a switch that keeps two working.
+        """
+        import numpy as np
+        from PIL import Image
+        parts = []
+        for label, shift, top, bottom in (('brick', (0.0, 0.0, 0.0), 220, 40),
+                                          ('marble', (4.0, 0.0, 0.0), 40, 220)):
+            raw = trimesh.creation.box(extents=(1, 2, 3))
+            mesh = trimesh.Trimesh(vertices=raw.vertices, faces=raw.faces, process=False)
+            picture = os.path.join(folder, f'{label}.png')
+            grid = (np.indices((8, 8)).sum(axis=0) % 2).astype(np.uint8)
+            Image.fromarray(np.dstack([grid * top, grid * bottom,
+                                       255 - grid * 120])).save(picture)
+            material = trimesh.visual.material.SimpleMaterial(
+                image=Image.open(picture).convert('RGB'))
+            material.name = label
+            mesh.visual = trimesh.visual.TextureVisuals(
+                uv=np.round(np.random.RandomState(1).rand(len(mesh.vertices), 2), 5),
+                material=material)
+            mesh.apply_transform(trimesh.transformations.translation_matrix(shift))
+            parts.append(mesh)
+        trimesh.Scene(parts).export(os.path.join(folder, name))
+        return os.path.join(folder, name)
+
+    def glb_records(self, path):
+        """What the .glb on disk says it holds, read here rather than by the app."""
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+        document = json.loads(
+            raw[20:20 + int.from_bytes(raw[12:16], 'little')].decode('utf-8'))
+        attributes = {one for mesh in document.get('meshes') or []
+                      for prim in mesh.get('primitives') or []
+                      for one in (prim.get('attributes') or {})}
+        return (len(document.get('materials') or []), len(document.get('images') or []),
+                attributes)
+
+    def test_121_the_row_says_the_switch_a_person_reads_and_the_tip_the_parameter(self):
+        """The batch pane has always drawn "Preserve Materials"; the registry now carries
+        those words, and the name the action is called with stays in the tool tip.
+        """
+        self.pick(self.tab.operation_combo, 'processing.convert_format')
+        rows = self.form_rows()
+        self.assertIn('Preserve Materials (default on)', rows, rows)
+        for caption in rows:
+            self.assertNotIn('preserve_materials', caption,
+                             'the parameter name took the place of the words on screen')
+        box = self.tab._batch_param_fields['preserve_materials']
+        self.assertIn('preserve_materials is sent as a bool', box.toolTip())
+
+    def test_122_a_switch_that_ships_on_starts_on_so_off_becomes_sayable(self):
+        self.pick(self.tab.operation_combo, 'processing.convert_format')
+        box = self.tab._batch_param_fields['preserve_materials']
+        self.assertTrue(box.isChecked(),
+                        'a setting whose default is on has to show on, or there is no way '
+                        'to say off for it')
+        self.assertEqual(self.tab._form_parameters(), {},
+                         'the box starting on is not a value anybody chose')
+        box.setChecked(False)
+        self.assertEqual(self.tab._form_parameters(), {'preserve_materials': False})
+        box.setChecked(True)
+        self.assertEqual(self.tab._form_parameters(), {},
+                         'putting the box back on is putting the default back')
+
+    def test_123_every_bool_field_starts_on_its_own_default_and_sends_the_move(self):
+        """One reading rule for every switch the registry can draw, not one per action."""
+        for action_id in BATCH_IDS:
+            self.pick(self.tab.operation_combo, action_id)
+            for field in ActionRegistry.param_form(action_id):
+                if field['type'] != 'bool':
+                    continue
+                box = self.tab._batch_param_fields[field['name']]
+                started = bool(field['default'])
+                self.assertEqual(box.isChecked(), started,
+                                 f'{action_id}.{field["name"]} shows the wrong default')
+                self.assertNotIn(field['name'], self.tab._form_parameters(), action_id)
+                box.setChecked(not started)
+                self.assertEqual(self.tab._form_parameters().get(field['name']),
+                                 not started, action_id)
+                box.setChecked(started)
+                self.assertNotIn(field['name'], self.tab._form_parameters(), action_id)
+
+    def test_124_the_box_changes_the_file_the_batch_writes_and_the_log_says_so(self):
+        """Untouched keeps both pictures; off writes a file that has none of them."""
+        self.textured_source(self.src)
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out, kinds='.obj', backup=False,
+                       params={'output_format': 'glb'})
+        kept = os.path.join(self.out, 'model.glb')
+        self.tab.start_batch_operation()
+        self.settle()
+        self.assertEqual(self.tab.batch_status_label.text(),
+                         'Finished 1 file(s): 1 ok, 0 failed')
+        materials, images, attributes = self.glb_records(kept)
+        self.assertEqual((materials, images), (2, 2),
+                         'the run the untouched box describes kept something else')
+        self.assertIn('TEXCOORD_0', attributes)
+        self.assertIn('keeps 2 materials, 2 textures and texture coordinates',
+                      self.tab.batch_log.toPlainText())
+        self.set_params({'preserve_materials': False})
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out, kinds='.obj', backup=False, overwrite=True,
+                       params={'output_format': 'glb'})
+        self.tab.start_batch_operation()
+        self.settle()
+        materials, images, attributes = self.glb_records(kept)
+        self.assertEqual((materials, images), (0, 0),
+                         'the answer that says off left the pictures in the file')
+        self.assertNotIn('TEXCOORD_0', attributes)
+        self.assertIn('keeps no materials, no textures and no texture coordinates',
+                      self.tab.batch_log.toPlainText())
+
+    def test_125_the_preview_names_the_switch_only_when_it_has_been_moved(self):
+        self.textured_source(self.src)
+        self.configure(operation='processing.convert_format', folder=self.src,
+                       output=self.out, kinds='.obj', backup=False,
+                       params={'output_format': 'glb'})
+        plan = self.tab._batch_plan()
+        self.assertEqual(plan['params'], {'output_format': 'glb'}, plan)
+        self.assertNotIn('preserve_materials', json.dumps(plan['ready'][0][1]))
+        self.set_params({'preserve_materials': False})
+        plan = self.tab._batch_plan()
+        self.assertEqual(plan['params'],
+                         {'output_format': 'glb', 'preserve_materials': False}, plan)
+        self.assertIn('"preserve_materials": false', '\n'.join(plan['lines']))
+        self.assertEqual(plan['ready'][0][1]['preserve_materials'], False)
+
 
 class MeshOperationCase(DirCase):
     """Each 6f action over one real file, with every number read back from the result.

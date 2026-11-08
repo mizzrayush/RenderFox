@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -554,6 +555,309 @@ class TestThePickerTellsTheTruth(FormatCase):
                          [os.path.basename(self.seeds['off'])],
                          'the dialog accepted a format the converter refuses')
         dialog.deleteLater()
+
+
+def gltf_document(path):
+    """The JSON inside a .glb or .gltf, counted here rather than by the app under test."""
+    with open(path, 'rb') as handle:
+        raw = handle.read()
+    if path.endswith('.gltf'):
+        return json.loads(raw.decode('utf-8', 'replace'))
+    return json.loads(raw[20:20 + int.from_bytes(raw[12:16], 'little')].decode('utf-8'))
+
+
+def textured_box(folder, name, shift, top, bottom):
+    """A box wearing one named image, built with trimesh rather than with the converter.
+
+    `top` and `bottom` have to differ between the parts: measured here, two materials
+    whose image bytes are identical are written as one `newmtl`, so a fixture that shades
+    both the same way holds one material and cannot test preservation of two.
+    """
+    from PIL import Image
+    raw = trimesh.creation.box(extents=(1, 2, 3))
+    mesh = trimesh.Trimesh(vertices=raw.vertices, faces=raw.faces, process=False)
+    picture = os.path.join(folder, f'{name}.png')
+    grid = (np.indices((8, 8)).sum(axis=0) % 2).astype(np.uint8)
+    Image.fromarray(np.dstack([grid * top, grid * bottom, 255 - grid * 120])).save(picture)
+    material = trimesh.visual.material.SimpleMaterial(image=Image.open(picture).convert('RGB'))
+    material.name = name
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=np.round(np.random.RandomState(1).rand(len(mesh.vertices), 2), 5), material=material)
+    mesh.apply_transform(trimesh.transformations.translation_matrix(shift))
+    return mesh
+
+
+def painted_box(shift):
+    """A box with colour carried on its vertices, which no material is asked about."""
+    raw = trimesh.creation.box(extents=(1, 2, 3))
+    mesh = trimesh.Trimesh(vertices=raw.vertices, faces=raw.faces, process=False)
+    mesh.visual = trimesh.visual.ColorVisuals(
+        mesh=mesh, vertex_colors=np.tile(np.array([[10, 200, 30, 255]], dtype=np.uint8),
+                                         (len(mesh.vertices), 1)))
+    mesh.apply_transform(trimesh.transformations.translation_matrix(shift))
+    return mesh
+
+
+def obj_material_names(path):
+    """The `usemtl` names an .obj actually reaches for, read off its own lines."""
+    with open(path, 'r', errors='replace') as handle:
+        return sorted({line.split()[1] for line in handle if line.startswith('usemtl')})
+
+
+class TestTheMaterialSwitch(FormatCase):
+    """`preserve_materials` has to change the call, and the answer has to come off the file.
+
+    The control sat in the batch pane answering nothing for months. Measured here before
+    any of it was wired: a .obj carrying two named materials converted to .glb left ONE
+    material in the file however the box was set, because `as_trimesh()` merges the parts
+    and a merged mesh can hold only one visual. So every test below counts the material,
+    image and attribute records inside the bytes that were written, with `gltf_document`
+    above rather than with the app's own reader - and the geometry is compared too, because
+    a switch that changes the file by breaking it is not a switch.
+
+    `FormatCase`'s seeds are plain boxes with nothing to keep, so these fixtures are built
+    with trimesh directly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # One folder each: trimesh names an .obj's sidecar 'material.mtl' unless told
+        # otherwise, so three .obj fixtures written into one folder share - and the last
+        # one overwrites - the materials the first two are read back through. This is the
+        # same hazard `write_scene` hands a model named after itself to dodge.
+        def folder(name):
+            path = os.path.join(cls.work, name)
+            os.makedirs(path, exist_ok=True)
+            return path
+
+        two = folder('two_materials')
+        cls.two_material = os.path.join(two, 'model.obj')
+        trimesh.Scene([textured_box(two, 'MatRed', [0, 0, 0], 220, 40),
+                       textured_box(two, 'MatBlue', [4, 0, 0], 40, 220)]).export(cls.two_material)
+
+        one = folder('one_material')
+        cls.single_material = os.path.join(one, 'model.obj')
+        trimesh.Scene([textured_box(one, 'Solo', [0, 0, 0], 220, 40)]).export(cls.single_material)
+
+        mixed = folder('mixed')
+        cls.mixed = os.path.join(mixed, 'model.glb')
+        trimesh.Scene([textured_box(mixed, 'MatRed', [0, 0, 0], 220, 40),
+                       painted_box([4, 0, 0])]).export(cls.mixed)
+
+        pair = folder('pair')
+        cls.two_as_glb = os.path.join(pair, 'model.glb')
+        trimesh.Scene([textured_box(pair, 'MatRed', [0, 0, 0], 220, 40),
+                       textured_box(pair, 'MatBlue', [4, 0, 0], 40, 220)]).export(cls.two_as_glb)
+
+    def named(self, path):
+        """(materials, images, attribute names) as the written container itself says them."""
+        document = gltf_document(path)
+        attributes = {str(key) for mesh in document.get('meshes') or []
+                      for prim in mesh.get('primitives') or []
+                      for key in (prim.get('attributes') or {})}
+        return (len(document.get('materials') or []),
+                len(document.get('images') or []), attributes)
+
+    def convert(self, source, name, keep):
+        """Write `name` from `source` with the switch at `keep`, and refuse a failure."""
+        path = os.path.join(self.out, name)
+        options = None if keep is None else {'preserve_materials': keep}
+        result = self.converter.convert_file(source, path, options)
+        self.assertTrue(result['success'], f'{name}: {result["message"]}')
+        return path, result
+
+    def signals(self):
+        """The pane's own channel, captured as the conversion emits it."""
+        case = self
+
+        class Capture:
+            def __init__(self):
+                self.messages = []
+
+            def record(self, path, ok, text):
+                self.messages.append((path, ok, text))
+
+            def __enter__(self):
+                case.converter.conversion_completed.connect(self.record)
+                return self
+
+            def __exit__(self, *exc):
+                case.converter.conversion_completed.disconnect(self.record)
+                return False
+
+        return Capture()
+
+    def test_24_the_switch_changes_which_call_runs(self):
+        on, on_result = self.convert(self.two_material, 'kept.glb', True)
+        off, off_result = self.convert(self.two_material, 'stripped.glb', False)
+
+        on_materials, on_images, on_attributes = self.named(on)
+        off_materials, off_images, off_attributes = self.named(off)
+        self.assertEqual((on_materials, on_images), (2, 2),
+                         f'the .glb written with the switch on names {on_materials} materials '
+                         f'and {on_images} images, read off its own JSON')
+        self.assertEqual((off_materials, off_images), (0, 0),
+                         f'the .glb written with the switch off still carries '
+                         f'{off_materials} materials and {off_images} images, so the two '
+                         f'answers made the same call')
+        self.assertTrue(any(key.startswith('TEXCOORD') for key in on_attributes),
+                        f'no texture coordinates were written with the switch on: {on_attributes}')
+        self.assertFalse(any(key.startswith('TEXCOORD') for key in off_attributes),
+                         f'texture coordinates survived the switch off: {off_attributes}')
+
+        for path, result in ((on, on_result), (off, off_result)):
+            self.assertEqual(result['options_skipped'], [], path)
+        on_mesh, on_note = self.converter.read_mesh(on)
+        off_mesh, off_note = self.converter.read_mesh(off)
+        self.assertIsNotNone(on_mesh, on_note)
+        self.assertIsNotNone(off_mesh, off_note)
+        self.assertEqual(len(on_mesh.faces), len(off_mesh.faces),
+                         'the switch changed the triangle count, which is not what it claims')
+        self.assertTrue(np.allclose(on_mesh.bounds, off_mesh.bounds),
+                        'the switch moved the model')
+
+    def test_25_a_source_with_one_material_is_left_alone_either_way(self):
+        """The route a caller that says nothing takes, and the route on takes, agree here."""
+        asked, asked_result = self.convert(self.single_material, 'asked.glb', True)
+        silent, _ = self.convert(self.single_material, 'silent.glb', None)
+        for path in (asked, silent):
+            materials, images, attributes = self.named(path)
+            self.assertEqual((materials, images), (1, 1),
+                             f'{os.path.basename(path)} lost the material it came in with')
+            self.assertTrue(any(key.startswith('TEXCOORD') for key in attributes), path)
+        self.assertIn('keeps 1 material, 1 texture', asked_result.get('content') or '',
+                      f'the file holds one of each and the answer said: '
+                      f'{asked_result.get("content")!r}')
+        stripped, _ = self.convert(self.single_material, 'stripped.glb', False)
+        self.assertEqual(self.named(stripped)[:2], (0, 0),
+                         'off left this file the way on left it, so the switch is not read')
+
+    def test_26_the_switch_is_about_the_texture_not_the_painted_vertices(self):
+        """Stripping a material must not quietly take the colours off the vertices too."""
+        on, on_result = self.convert(self.mixed, 'kept.gltf', True)
+        off, off_result = self.convert(self.mixed, 'stripped.gltf', False)
+        on_materials, _, on_attributes = self.named(on)
+        off_materials, _, off_attributes = self.named(off)
+        self.assertEqual(on_materials, 1, on)
+        self.assertEqual(off_materials, 0, off)
+        for path, attributes, result in ((on, on_attributes, on_result),
+                                         (off, off_attributes, off_result)):
+            self.assertTrue(any(key.startswith('COLOR_') for key in attributes),
+                            f'{os.path.basename(path)} lost the vertex colours that were '
+                            f'never being asked about: {sorted(attributes)}')
+            self.assertIn('vertex colours', result['content'] or '',
+                          f'{os.path.basename(path)} keeps vertex colours but the answer '
+                          f'did not say so: {result["content"]!r}')
+
+    def test_27_a_format_with_no_room_says_that_instead_of_counting_zero(self):
+        """.stl and .off are a triangle list; the choice cannot change what they hold."""
+        for fmt in ('stl', 'off'):
+            on, on_result = self.convert(self.two_material, f'kept.{fmt}', True)
+            off, off_result = self.convert(self.two_material, f'stripped.{fmt}', False)
+            for path, result in ((on, on_result), (off, off_result)):
+                self.assertIn('no place for materials', result['content'] or '',
+                              f'{os.path.basename(path)}: {result["content"]!r}')
+                self.assertEqual((result['method'], result['options_skipped']),
+                                 ('trimesh', []),
+                                 f'.{fmt} has a writer here, so the answer must not come from '
+                                 f'a library that cannot be told about materials')
+            with open(on, 'rb') as kept, open(off, 'rb') as stripped:
+                self.assertEqual(kept.read(), stripped.read(),
+                                 f'the two answers wrote different .{fmt} files, but .{fmt} '
+                                 f'has no field for either one')
+
+    def test_28_a_library_that_cannot_be_told_says_which_one_it_was(self):
+        """assimp and pymeshlab have no material parameter at all, so saying off is a no."""
+        # Read off the two libraries' own bytes: the .fbx assimp writes names no
+        # `Material::` and no `Texture::` record, and the .dae pymeshlab writes carries
+        # two materials, an image and texture coordinates. The switch was moot for both,
+        # but what each file still holds is a different answer, and the sentence has to
+        # say the one that is true.
+        holds = {'fbx': 'keeps no materials and no textures',
+                 'dae': 'keeps 2 materials, textures and texture coordinates'}
+        for fmt, library in (('fbx', 'assimp'), ('dae', 'pymeshlab')):
+            path, result = self.convert(self.two_material, f'via.{fmt}', True)
+            self.assertEqual(result['method'], library, path)
+            self.assertEqual(result['options_skipped'], ['preserve_materials'],
+                             f'.{fmt} cannot be told about materials, so the switch has to '
+                             f'name itself as not applied')
+            self.assertIn(holds[fmt], result.get('content') or '', path)
+            with self.signals() as captured:
+                self.convert(self.two_material, f'again.{fmt}', True)
+            emitted = captured.messages[-1][2]
+            self.assertIn('preserve_materials not applied', emitted,
+                          f'the pane was told only "{emitted}"')
+
+    def test_29_the_answer_is_read_off_the_bytes_not_out_of_the_reader(self):
+        """One merged mesh holds one visual, so the reader cannot count the two it left.
+
+        `read_mesh` concatenates the parts - which is what LOD generation wants, and what
+        makes a .glb holding two images look like a file holding one. Measured on this
+        build: the merged read-back has 24 faces, one material record, and its
+        `PBRMaterial` does not even carry an `image` to read. So the sentence counts the
+        container's own records.
+        """
+        path, result = self.convert(self.two_material, 'twice.glb', True)
+        self.assertEqual(self.named(path)[1], 2, path)
+        self.assertIn('2 textures', result['content'] or '',
+                      f'the file holds two images and the answer said: {result["content"]!r}')
+        mesh, note = self.converter.read_mesh(path)
+        self.assertIsNotNone(mesh, note)
+        self.assertEqual(len(mesh.faces), 24,
+                         'this is not the merged single mesh the reader hands back')
+        self.assertIsNone(getattr(mesh.visual.material, 'image', None),
+                          'if the reader could name both images, counting them there would '
+                          'be the simpler answer and this test should say so')
+
+    def test_30_a_file_that_cannot_be_read_back_leaves_the_conversion_won(self):
+        """An unreadable answer is no reason to report a written file as a failure."""
+        import src.processing.format_converter as product
+
+        def refuse(_path):
+            raise zipfile.BadZipFile('these bytes are not the container expected')
+
+        previous = product._content_sentence
+        product._content_sentence = refuse
+        try:
+            path = os.path.join(self.out, 'unreadable.glb')
+            result = self.converter.convert_file(self.two_material, path,
+                                                 {'preserve_materials': True})
+        finally:
+            product._content_sentence = previous
+        self.assertTrue(result['success'],
+                        f'the reader lost a file that was already on disk: {result["message"]}')
+        self.assertTrue(os.path.isfile(path), path)
+        self.assertIsNone(result['content'],
+                          'the sentence was missing but something claimed it anyway')
+
+    def test_31_a_ply_names_its_own_coordinate_columns(self):
+        """The .ply header is read for column names; the types beside them say nothing."""
+        path, result = self.convert(self.two_material, 'flat.ply', True)
+        header = open(path, 'rb').read(4096).decode('ascii', 'ignore').split('end_header')[0]
+        names = {line.split()[-1] for line in header.splitlines()
+                 if line.startswith('property')}
+        self.assertTrue({'s', 't'} <= names,
+                        f'this .ply holds no uv columns for the sentence to name: {sorted(names)}')
+        self.assertIn('keeps texture coordinates', result['content'] or '',
+                      f'the file names s and t and the answer said: {result["content"]!r}')
+
+    def test_32_an_obj_answers_with_the_materials_its_own_sidecar_names(self):
+        """A written .obj is answered from `usemtl` and the `map_` lines it points at.
+
+        The .glb and .obj branches are different readers, and the .obj one has to follow
+        the `mtllib` the file itself names: measured here, the file written with the
+        switch off holds no `mtllib` at all, so the sidecar the switch-on file left in the
+        same folder cannot be read into its answer.
+        """
+        kept, kept_result = self.convert(self.two_as_glb, 'apart.obj', True)
+        stripped, stripped_result = self.convert(self.two_as_glb, 'together.obj', False)
+        self.assertEqual(obj_material_names(kept), ['material_0', 'material_1'], kept)
+        self.assertEqual(obj_material_names(stripped), [], stripped)
+        self.assertIn('keeps 2 materials, 2 textures and texture coordinates',
+                      kept_result['content'] or '', f'{kept_result["content"]!r}')
+        self.assertIn('keeps no materials, no textures and no texture coordinates',
+                      stripped_result['content'] or '', f'{stripped_result["content"]!r}')
 
 
 if __name__ == '__main__':

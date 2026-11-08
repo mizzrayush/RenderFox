@@ -1825,7 +1825,12 @@ class AutomationTab(QWidget):
             box.setSpecialValueText('not set')
             return box
         if kind == 'bool':
-            return QCheckBox('on')
+            # The box starts on the answer the row names as the default, because that is
+            # what runs when nobody touches it, and a setting that starts "on" has to be
+            # showable as "on" for turning it off to mean anything.
+            box = QCheckBox('on')
+            box.setChecked(bool(field['default']))
+            return box
         box = QLineEdit()
         box.setPlaceholderText('not set')
         return box
@@ -1844,6 +1849,7 @@ class AutomationTab(QWidget):
                 item.widget().deleteLater()
         layout.setColumnStretch(1, 1)
         self._batch_param_fields = {}
+        self._batch_param_defaults = {}
         action = self._batch_action()
         fields = ActionRegistry.param_form(action) if action else []
         if not fields:
@@ -1856,33 +1862,41 @@ class AutomationTab(QWidget):
             widget = self._param_widget(field)
             widget.setToolTip(f"{field['name']} is sent as a {field['type']}; "
                               f"{self._default_words(field)}.")
-            layout.addWidget(QLabel('%s (%s)' % (field['name'], self._default_words(field))),
+            layout.addWidget(QLabel('%s (%s)' % (field.get('label') or field['name'],
+                                                 self._default_words(field))),
                              row, 0)
             layout.addWidget(widget, row, 1)
             self._batch_param_fields[field['name']] = widget
+            self._batch_param_defaults[field['name']] = bool(field['default']) \
+                if field['type'] == 'bool' else field['default']
 
-    @staticmethod
-    def _field_value(widget):
-        """What this field sends, or None when it is still showing its empty state.
+    def _field_value(self, name, widget):
+        """What this field sends, or None when it is still showing the default it names.
 
         None is left out of the call, which is what makes the action's own default the
         thing that runs. The empty state of a widget is not a value a person chose: a
-        spin box at zero, a box unchecked and a line left blank all say "not set", and
-        sending them would put a parameter in the call that nobody set.
+        spin box at zero, a box still where the row says the default sits and a line left
+        blank all say "nobody set this", and sending them would put a parameter in the
+        call that nobody chose. A check box is the one kind that has to be read against
+        its default rather than against its emptiness: a setting that starts "on" shows
+        that default as a ticked box, so only the move away from it is a choice - and
+        without that reading there is no way to say "off" for a switch that ships on.
         """
         if isinstance(widget, QSpinBox):
             return int(widget.value()) or None
         if isinstance(widget, QDoubleSpinBox):
             return float(widget.value()) or None
         if isinstance(widget, QCheckBox):
-            return True if widget.isChecked() else None
+            if widget.isChecked() == self._batch_param_defaults.get(name):
+                return None
+            return widget.isChecked()
         return widget.text().strip() or None
 
     def _form_parameters(self):
         """The values the fields hold, in the types the registry checks."""
         params = {}
         for name, widget in self._batch_param_fields.items():
-            value = self._field_value(widget)
+            value = self._field_value(name, widget)
             if value is not None:
                 params[name] = value
         return params
