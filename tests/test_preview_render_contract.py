@@ -4,7 +4,7 @@ Preview raster contract test - `src/processing/preview_render.py`.
 The Pipeline pane's Render and Thumbnail nodes are the last surface in Phase 6 that reports
 work it does not do (`pipeline_engine.py:843-845` logs "Rendering not fully implemented,
 skipping" and returns `True`). Before that engine can be rewritten, the picture it would
-produce has to be measured on this machine rather than assumed, because four of this
+produce has to be measured on this machine rather than assumed, because five of this
 module's rules are things Open3D 0.19 on Windows does differently from its own docs:
 
 - `OffscreenRenderer` does not start here (`EGL Headless is not supported`), so the Filament
@@ -17,6 +17,9 @@ module's rules are things Open3D 0.19 on Windows does differently from its own d
   filled every pixel with one flat colour and no fov changed the picture at all.
 - `options.light_on` must stay off. With the engine's own head light on, lit faces clip to 255
   and a dim lamp and a bright one print identical pixels - the lamp node would be decoration.
+- `create_window` answers a bool and `get_render_option()` answers None until a window exists,
+  so a machine that refuses the window has to be refused in words - which is the one condition
+  `WindowCase` asks by hand, because this machine does not refuse it on demand.
 
 And three things about the file, not the frame: the window will not open narrower than 148 px
 nor larger than the desktop, `o3d.geometry.Image` cannot write a PNG here so the encoders are
@@ -692,6 +695,76 @@ class WrittenFileCase(unittest.TestCase):
                          'a single lit column measured as nothing wide')
         self.assertEqual(verdict['silhouette_height'], 200)
         self.assertEqual(verdict['covered_pixels'], 200)
+
+
+class WindowCase(unittest.TestCase):
+    """The machine condition that used to leave the raster with a crash and no sentence.
+
+    `Visualizer.create_window` answers a bool, and `get_render_option()` answers None until a
+    window exists. One audit run of `tests/test_all_tabs_headless.py` hit exactly that: GLFW
+    refused the window, `_capture` went on to write `options.light_on`, and a raw
+    AttributeError walked out of `render_file` - which otherwise raises nothing but
+    PreviewError, and this module's own rule is "no picture, and a sentence that says why".
+    The condition is the library's; the refusal is the module's, so it is asked here by making
+    that one call answer False. The second test is the premise of the guard: on this machine a
+    window that opens answers True and the guard is inert, so the fix costs a working render
+    nothing.
+    """
+
+    def _refuse_window(self):
+        real = o3d.visualization.Visualizer.create_window
+        o3d.visualization.Visualizer.create_window = lambda self, *a, **k: False
+        self.addCleanup(setattr, o3d.visualization.Visualizer, 'create_window', real)
+
+    def test_a_window_the_machine_will_not_open_refuses_by_size(self):
+        out = os.path.join(TMP, 'no_window.png')
+        self._refuse_window()
+        with self.assertRaises(pr.PreviewError) as caught:
+            pr.render_file(BOX, out, 200, 200)
+        self.assertIn('200x200', str(caught.exception),
+                      'the refusal does not name the size it was refused')
+        self.assertFalse(os.path.exists(out), 'the refused frame still wrote a file')
+
+    def test_the_refusal_happens_before_the_option_write_it_replaces(self):
+        """The guard is only worth having if the line that crashed is never reached.
+
+        `get_render_option()` is what answered None, so a guard sitting below the option
+        writes would still crash and this test would still see the call happen.
+        """
+        real = o3d.visualization.Visualizer.get_render_option
+        asked = []
+
+        def record(self):
+            asked.append(1)
+            return real(self)
+
+        self._refuse_window()
+        o3d.visualization.Visualizer.get_render_option = record
+        self.addCleanup(setattr, o3d.visualization.Visualizer, 'get_render_option', real)
+        with self.assertRaises(pr.PreviewError):
+            pr.render_file(BOX, os.path.join(TMP, 'no_window2.png'), 320, 240)
+        self.assertEqual(asked, [], 'the option was asked for on a window that never opened')
+
+    def test_the_window_that_opens_is_still_the_window_that_draws(self):
+        """The guard reads the library's own answer, and here that answer is True."""
+        out = os.path.join(TMP, 'guard_inert.png')
+        real = o3d.visualization.Visualizer.create_window
+        seen = []
+
+        def record(self, *args, **kwargs):
+            answer = real(self, *args, **kwargs)
+            seen.append(answer)
+            return answer
+
+        o3d.visualization.Visualizer.create_window = record
+        try:
+            verdict = pr.render_file(BOX, out, 200, 200)
+        finally:
+            o3d.visualization.Visualizer.create_window = real
+        self.assertEqual(seen, [True], 'this machine stopped answering True for an opened '
+                                       'window, which is the fact the refusal is built on')
+        self.assertEqual((verdict['width'], verdict['height']), (200, 200))
+        self.assertEqual(verdict['window_opened'], [200, 200])
 
 
 class SourceContractCase(unittest.TestCase):

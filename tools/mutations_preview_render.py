@@ -404,4 +404,29 @@ MUTATIONS = [
         'expect': 'test_a_supersample_that_will_not_fit_is_cut_and_says_so',
         'note': 'a cut multiple is applied without a word about it',
     },
+    # ---- the window this machine may refuse ------------------------------------------
+    {
+        'file': 'src/processing/preview_render.py',
+        'find': '    opened = visualizer.create_window(visible=False, width=int(width), '
+                'height=int(height))',
+        'replace': '    visualizer.create_window(visible=False, width=int(width), '
+                   'height=int(height))',
+        'expect': 'test_a_window_the_machine_will_not_open_refuses_by_size',
+        'note': 'the answer is thrown away, which is how the crash was born',
+    },
+    {
+        'file': 'src/processing/preview_render.py',
+        'find': '        if not opened:',
+        'replace': '        if False:',
+        'expect': 'test_the_refusal_happens_before_the_option_write_it_replaces',
+        'note': 'a refused window goes on to write options on a renderer that was never made',
+    },
+    {
+        'file': 'src/processing/preview_render.py',
+        'find': "            raise PreviewError(f'this machine would not open the "
+               "{int(width)}x{int(height)} '",
+        'replace': "            raise PreviewError('this machine would not open the window '",
+        'expect': 'test_a_window_the_machine_will_not_open_refuses_by_size',
+        'note': 'the refusal does not say which size it was refused',
+    },
 ]

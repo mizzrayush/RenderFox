@@ -264,12 +264,21 @@ def _capture(geometry, width: int, height: int, camera: Camera, background_rgb,
 
     Answers the pixels and the size the window really opened at, which on this machine is not
     always the size that was asked: it will not open narrower than 148, and it will not open
-    larger than the desktop.
+    larger than the desktop. A size it will not open at all is a `PreviewError` naming it, not
+    an option write on a renderer that was never made.
     """
     import open3d as o3d
     visualizer = o3d.visualization.Visualizer()
-    visualizer.create_window(visible=False, width=int(width), height=int(height))
+    opened = visualizer.create_window(visible=False, width=int(width), height=int(height))
     try:
+        if not opened:
+            # `get_render_option()` answers None until a window exists, so without this line a
+            # machine that will not open one reaches `options.light_on` and raises
+            # AttributeError - a crash leaving no picture and no sentence about it, which is
+            # the one thing this module's own rule refuses.
+            raise PreviewError(f'this machine would not open the {int(width)}x{int(height)} '
+                               'window this raster draws into, so there is no picture and '
+                               'nothing was written')
         visualizer.add_geometry(geometry)
         options = visualizer.get_render_option()
         options.light_on = False
