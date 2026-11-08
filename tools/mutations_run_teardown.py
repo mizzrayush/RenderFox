@@ -13,8 +13,9 @@ it were pool work, a dialog the tree cannot see, and a step boundary that a stop
 
 Each entry names the suite it breaks and the test that has to fail for it. The twelve read by
 `tests/test_all_tabs_headless.py` drive the real window; the rest are read by
-`tests/test_run_teardown_contract.py`, `tests/test_download_teardown_contract.py` and
-`tests/test_automation_tasks_contract.py`, because the defects they plant end a process before
+`tests/test_run_teardown_contract.py`, `tests/test_download_teardown_contract.py`,
+`tests/test_automation_tasks_contract.py` and `tests/test_worker_holder_contract.py`, because
+the defects they plant end a process before
 any suite can report - an unconnected signal raising out of a slot, three ways a started run
 ends up referenced by nothing, and a download that carries on after the dialog that owned it
 has gone - and because the plain-thread and dialog shapes this pass added are not in the
@@ -152,9 +153,11 @@ MUTATIONS = [
         'file': 'src/ui/performance_tab.py',
         'find': '        self._workers.append(worker)',
         'replace': '        pass',
-        'suite': 'tests/test_run_teardown_contract.py',
-        'expect': 'test_02',
-        'note': 'a machine reader is started and forgotten, which is the shape that faulted',
+        'suite': 'tests/test_worker_holder_contract.py',
+        'expect': 'test_01',
+        'note': 'a machine reader is started and forgotten, which is the shape that faulted; '
+                'moved off the teardown contract file in 7b because that file builds this '
+                'pane, and the pane now starts three runs while it is being built',
     },
     {
         'file': 'src/ui/diagnostics_tab.py',

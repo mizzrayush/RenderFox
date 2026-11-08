@@ -14,12 +14,16 @@ as the plain Python function it is. That is the whole reason
 `tests/test_download_teardown_contract.py` exists beside it - the AI Model Manager's dialog
 stops its download inside `done()`, which Qt calls, so a defect in the clause this file's
 first test owns raises through that override and ends the process before any name is printed.
-Measured here as four named errors followed by exit `0xc0000409` and no report at all. Ten of
+Measured here as four named errors followed by exit `0xc0000409` and no report at all. Nine of
 the list's thirty-two entries are read here, and every one of them plants one of four steps:
 the clause that turns an empty `disconnect()` into "nothing came off", the lines that file a
 run in the bucket its close drains, the wait that answers for a runner which is not a
 `QThread`, and the pane's own answer - how many runs it reports owed, and whose receivers it
-takes off.
+takes off. The tenth, which asked the filing step of the Performance pane's own machine
+reader, is read by `tests/test_worker_holder_contract.py` instead, because this file's
+`setUpClass` builds the Performance pane and that pane now starts three runs while it is
+being built: with the keep-helper's append planted out, three of five runs ended at
+`0xc0000005` in `tearDownClass` before the name was printed.
 
 What is asked is the same three facts the panes are supposed to keep. A `Worker` handed to a
 pane's own keep-helper must end up in the list the pane's `shutdown_runs` drains, must leave

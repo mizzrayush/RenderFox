@@ -35,7 +35,8 @@ SUITES = [
         "id": "baseline_stability",
         "name": "Core Backend & Regression Suite",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "verify_all_fixes.py")],
-        "description": "Validates database integrity, translation matrices, process handles, engine bindings, and that a shut window leaves no file a DCC cannot re-export over"
+        "description": "Validates database integrity, translation matrices, process handles, engine bindings, and that a shut window leaves no file a DCC cannot re-export over",
+        "timeout_seconds": 240
     },
     {
         "id": "lod_mesh_pipeline",
@@ -200,6 +201,13 @@ SUITES = [
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_run_teardown_contract.py")],
         "description": "Asks the close-over-a-live-run questions where nothing enters a C++ frame, so a defect Qt otherwise answers with an access violation or a fail-fast arrives as a named test: a runner with nothing connected silences to nothing rather than raising out of closeEvent, every run a pane keeps is filed in the bucket its shutdown_runs drains and emptied by it - both of the Diagnostics lists included - and the Automation pane's plain worker is filed, joined, silenced and pruned by the pane that started it",
         "timeout_seconds": 180
+    },
+    {
+        "id": "worker_holder_contract",
+        "name": "Worker Holder Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_worker_holder_contract.py")],
+        "description": "The Performance pane's half of the same questions, asked in a file that builds no pane, because that pane starts three runs while it is being built and a defect that takes away their owner then takes away the process too: the keep-helper files the run it is handed and lets it go when that run's own `finished` arrives, and every one of the pane's eight pool starts calls the helper before it starts, which is read off the syntax tree because the only way to ask it by execution is to start a run nobody holds",
+        "timeout_seconds": 120
     },
     {
         "id": "download_teardown_contract",

@@ -591,11 +591,14 @@ MUTATIONS = [
     },
     {
         'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_worker_holder_contract.py',
         'find': '        self._workers.append(worker)',
         'replace': '        pass',
         'which': 1,
-        'expect': 'test_101',
-        'note': 'nothing holds the thread, so it can be collected mid-run',
+        'expect': 'test_01',
+        'note': 'nothing holds the started run, so its wrapper is collected mid-flight; read in '
+                'the file that hands a Worker to the pane and never to the pool, because every '
+                'suite that builds the pane can answer this only with 0xc0000005',
     },
     {
         'file': 'src/ui/performance_tab.py',
@@ -912,5 +915,17 @@ MUTATIONS = [
         'which': 2,
         'expect': 'test_126',
         'note': 'the four-kind run ignores the stored work the single-kind buttons honour',
+    },
+
+    # ---- 7b close-out: the two entries the sweep can only read without a live run --------
+    {
+        'file': 'src/ui/performance_tab.py',
+        'suite': 'tests/test_worker_holder_contract.py',
+        'find': '        self._keep_worker(worker)',
+        'replace': '        pass',
+        'which': 4,
+        'expect': 'test_02',
+        'note': 'the benchmark button hands its run to the pool without filing it, so nothing '
+                'silences it at the close and the pane does not know it owes a measurement',
     },
 ]
