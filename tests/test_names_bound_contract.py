@@ -37,7 +37,7 @@ CHECKER = Path(ROOT) / 'tools' / 'check_names_bound.py'
 
 # Measured off the checker's own walk, which is `check_paths_hygiene.app_files`: the files under
 # `src/` plus `main.py`. Re-counted by `tools/check_names_bound.py`'s first line on this tree.
-APP_SCOPE_FILES = 81
+APP_SCOPE_FILES = 83
 
 # The two defects, in the shape the phase made them: an assignment taken out of a function that
 # still reads the name, and a name read above the line that binds it.
