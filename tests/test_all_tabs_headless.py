@@ -238,6 +238,18 @@ class TestAllTabsHeadless(unittest.TestCase):
             win.model_tab.load_model_file = original_model
             win.mesh_tools_tab.load_mesh_file = original_mesh
 
+    def test_10c_workspace_handoffs_share_one_selected_asset(self):
+        win = self.window
+        path = self.assets['stress_mesh']
+        changes = []
+        win.asset_selection.changed.connect(changes.append)
+        win.open_in_rendering(path)
+        self.assertEqual(os.path.abspath(path), win.asset_selection.path)
+        self.assertEqual([os.path.abspath(path)], changes)
+        win.open_in_animation(path)
+        self.assertEqual([os.path.abspath(path)], changes,
+                         'reopening the selected file must not create a second selection event')
+
     def test_11_ai_asset_tagger_clip_inference(self):
         """Verify that AI Asset Tagger runs CLIP inference and returns categories + tags."""
         tagger_tab = self.window.library_tab.ai_tagger_tab

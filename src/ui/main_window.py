@@ -24,6 +24,7 @@ from .diagnostics_tab import DiagnosticsTab
 from .scripting_tab import ScriptingTab
 from ..utils.app_paths import bundled
 from ..core.job_manager import JobManager
+from ..core.asset_selection import AssetSelection
 from .pipeline_editor_tab import PipelineEditorTab
 from .rendering_tab import RenderingTab
 from .feedback_dialog import FeedbackDialog
@@ -42,6 +43,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.job_manager = JobManager()
+        self.asset_selection = AssetSelection(self)
         self.init_ui()
         self.setup_menu()
         self.setup_status_bar()
@@ -529,6 +531,7 @@ class MainWindow(QMainWindow):
 
     def open_in_model_viewer(self, file_path):
         """Open a model file in the Model Viewer tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.model_tab)
         
         # Load the model in Model Viewer
@@ -545,6 +548,7 @@ class MainWindow(QMainWindow):
             
     def open_in_point_clouds(self, file_path):
         """Open a point cloud file in the Point Clouds tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.point_clouds_tab)
         
         # Load the point cloud
@@ -555,6 +559,7 @@ class MainWindow(QMainWindow):
 
     def load_model_globally(self, file_path):
         """Load a model into all applicable tabs."""
+        self.asset_selection.select(file_path)
         # 1. Model Viewer
         if hasattr(self.model_tab, 'load_model_file'):
             self.model_tab.load_model_file(file_path)
@@ -588,6 +593,7 @@ class MainWindow(QMainWindow):
         self.library_tab.open_rendering_requested.connect(self.open_in_rendering)
         self.library_tab.open_animation_requested.connect(self.open_in_animation)
         self.library_tab.load_globally_requested.connect(self.load_model_globally)
+        self.library_tab.model_selected.connect(self.asset_selection.select)
 
         # Point Clouds Tab connections
         self.point_clouds_tab.mesh_generated.connect(self.open_in_mesh_tools)
@@ -599,30 +605,35 @@ class MainWindow(QMainWindow):
     
     def open_in_animation(self, file_path):
         """Open a model file in the Animation tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.animation_tab)
         if hasattr(self.animation_tab, 'load_model_from_path'):
             self.animation_tab.load_model_from_path(file_path)
 
     def open_in_rendering(self, file_path):
         """Open a model file in the Rendering tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.rendering_tab)
         if hasattr(self.rendering_tab, 'set_model'):
             self.rendering_tab.set_model(file_path)
 
     def open_in_mesh_tools(self, file_path):
         """Open a model file in the Mesh Tools tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.mesh_tools_tab)
         if hasattr(self.mesh_tools_tab, 'load_mesh_file'):
             self.mesh_tools_tab.load_mesh_file(file_path)
 
     def open_in_preprocessing(self, file_path):
         """Open a model file in the Pre-processing tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.preprocessing_tab)
         if hasattr(self.preprocessing_tab, 'load_model'):
             self.preprocessing_tab.load_model(file_path)
 
     def open_in_postprocessing(self, file_path):
         """Open a file in the Post-processing tab."""
+        self.asset_selection.select(file_path)
         self.tab_widget.setCurrentWidget(self.postprocessing_tab)
         if hasattr(self.postprocessing_tab, 'load_file'):
             self.postprocessing_tab.load_file(file_path)
