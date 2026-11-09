@@ -111,6 +111,12 @@ SUITES = [
         "description": "Writes ORM and mask PNGs from explicitly assigned image channels, reads the written RGBA pixels back, refuses mismatched source sizes, and proves the Texture Generator and shared automation registry call the same backend"
     },
     {
+        "id": "texture_mipmaps_contract",
+        "name": "Texture Mipmap Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_texture_mipmaps_contract.py")],
+        "description": "Writes a portable PNG mip chain and manifest from a texture, reads every recorded level back, and refuses a missing source instead of claiming engine-ready KTX/Basis compression"
+    },
+    {
         "id": "geometry_compression_contract",
         "name": "Geometry Compression Capability Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_geometry_compression_contract.py")],

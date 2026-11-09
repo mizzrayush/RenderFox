@@ -14,6 +14,7 @@ from PyQt6.QtGui import QIcon, QPixmap
 from ..features.texture_engine import TextureGenerationThread
 from ..processing.texture_packer import ChannelPacker
 from ..processing.texture_atlas import TextureAtlas
+from ..processing.texture_mipmaps import TextureMipmaps
 from ..utils.run_teardown import drain_attributes
 from .icon_provider import get_icon
 
@@ -205,6 +206,12 @@ class TextureGeneratorDialog(QDialog):
         self.build_atlas_btn.clicked.connect(self.build_atlas)
         atlas_layout.addWidget(self.build_atlas_btn)
         layout.addWidget(atlas_group)
+
+        self.generate_mipmaps_btn = QPushButton("Generate PNG Mipmaps...")
+        self.generate_mipmaps_btn.setIcon(get_icon("pipeline"))
+        self.generate_mipmaps_btn.setToolTip("Write a PNG mip chain and JSON manifest for the chosen texture")
+        self.generate_mipmaps_btn.clicked.connect(self.generate_mipmaps)
+        layout.addWidget(self.generate_mipmaps_btn)
         
         # Footer / Options
         footer_layout = QHBoxLayout()
@@ -288,6 +295,20 @@ class TextureGeneratorDialog(QDialog):
         self.path_input.setText(result.atlas_path)
         self.use_btn.setEnabled(True)
         QMessageBox.information(self, "Texture Atlas", result.message)
+
+    def generate_mipmaps(self):
+        source = self.generated_image_path or self.path_input.text().strip()
+        if not source:
+            QMessageBox.warning(self, "Generate Mipmaps", "Load or generate a texture first.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose Mipmap Output Folder")
+        if not folder:
+            return
+        result = TextureMipmaps.generate(source, folder)
+        if not result.success:
+            QMessageBox.warning(self, "Generate Mipmaps", result.message)
+            return
+        QMessageBox.information(self, "Generate Mipmaps", result.message)
 
     def browse_model_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
