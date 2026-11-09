@@ -111,6 +111,12 @@ SUITES = [
         "description": "Writes ORM and mask PNGs from explicitly assigned image channels, reads the written RGBA pixels back, refuses mismatched source sizes, and proves the Texture Generator and shared automation registry call the same backend"
     },
     {
+        "id": "texel_density_contract",
+        "name": "Texel Density & Engine LOD Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_texel_density_contract.py")],
+        "description": "Measures 3D surface area against UV texture coordinates, generates verified texel density reports, and builds engine-ready LOD groups with sidecar manifests"
+    },
+    {
         "id": "texture_mipmaps_contract",
         "name": "Texture Mipmap Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_texture_mipmaps_contract.py")],

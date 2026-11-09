@@ -11,7 +11,8 @@ try:
     PYMESHLAB_AVAILABLE = True
 except ImportError:
     PYMESHLAB_AVAILABLE = False
-from typing import List, Tuple, Dict, Optional, Callable
+import json
+from typing import List, Tuple, Dict, Optional, Callable, Any
 from dataclasses import dataclass
 
 # The packaged build has no console (`RenderFox.spec`: console=False), so the root logger is the
@@ -558,3 +559,87 @@ def batch_generate_lods(input_directory: str, output_directory: str,
                 results[file_path] = []
     
     return results
+
+def generate_engine_lod_group(
+    input_file: str,
+    output_dir: str,
+    lod_levels: int = 4,
+    reduction_curve: str = "exponential",
+    engine: str = "unreal"
+) -> Dict[str, Any]:
+    """Generate engine-ready LOD group with standardized naming and JSON manifest.
+    
+    Creates:
+      [ModelName]_LOD0.[ext], [ModelName]_LOD1.[ext], ...
+      [ModelName]_lod_manifest.json
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    base_name, ext = os.path.splitext(os.path.basename(input_file))
+    
+    # Calculate reduction ratios
+    lod_levels = max(1, min(int(lod_levels or 4), 8))
+    if reduction_curve == "linear":
+        ratios = [max(0.05, 1.0 - (i / max(1, lod_levels))) for i in range(lod_levels)]
+    elif reduction_curve == "half":
+        ratios = [max(0.05, 1.0 / (2 ** i)) for i in range(lod_levels)]
+    else:
+        ratios = [max(0.05, 0.5 ** (i * 0.75)) for i in range(lod_levels)]
+    ratios[0] = 1.0
+    
+    settings = LODSettings(levels=len(ratios), custom_ratios=ratios)
+    generator = LODGenerator(settings)
+    generated = generator.generate_lods(input_file, output_dir)
+    
+    renamed = []
+    level_info = []
+    for i, file_path in enumerate(generated):
+        target_name = f"{base_name}_LOD{i}{ext}"
+        target_path = os.path.join(output_dir, target_name)
+        if file_path != target_path and os.path.exists(file_path):
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            os.replace(file_path, target_path)
+            renamed.append(target_path)
+        else:
+            renamed.append(file_path)
+            
+        faces_count = 0
+        verts_count = 0
+        try:
+            m = trimesh.load(target_path, process=False)
+            faces_count = len(m.faces) if hasattr(m, 'faces') else 0
+            verts_count = len(m.vertices) if hasattr(m, 'vertices') else 0
+        except Exception:
+            pass
+            
+        screen_size = round(1.0 / (2 ** i), 3) if i > 0 else 1.0
+        level_info.append({
+            "level": i,
+            "filename": os.path.basename(target_path),
+            "ratio": ratios[i],
+            "target_screen_size": screen_size,
+            "faces": faces_count,
+            "vertices": verts_count
+        })
+        
+    manifest = {
+        "asset": base_name,
+        "source_file": os.path.basename(input_file),
+        "target_engine": engine,
+        "lod_count": len(renamed),
+        "levels": level_info
+    }
+    manifest_path = os.path.join(output_dir, f"{base_name}_lod_manifest.json")
+    try:
+        with open(manifest_path, 'w', encoding='utf-8') as mf:
+            json.dump(manifest, mf, indent=2)
+    except Exception:
+        pass
+        
+    return {
+        "success": len(renamed) > 0,
+        "output_files": renamed,
+        "manifest_path": manifest_path,
+        "levels_created": len(renamed),
+        "summary": f"Generated {len(renamed)} engine LODs for {base_name} with manifest."
+    }

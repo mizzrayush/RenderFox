@@ -13,6 +13,44 @@ from ..utils.app_paths import bundled
 _ICONS_DIR = bundled(os.path.join("resources", "icons")).replace("\\", "/")
 
 MODERN_DARK_THEME = """
+/* Studio Header Bar & Navigation HUD */
+QFrame#studioHeader {
+    background-color: #121318;
+    border-bottom: 1px solid #232734;
+}
+
+QFrame#studioHeader QPushButton {
+    background-color: #1b1e28;
+    border: 1px solid #2b3042;
+    border-radius: 5px;
+    color: #cfd4e8;
+    padding: 4px 10px;
+    font-size: 8.5pt;
+    font-weight: 500;
+}
+
+QFrame#studioHeader QPushButton:hover {
+    background-color: #262c3e;
+    border-color: #4b7bec;
+    color: #ffffff;
+}
+
+QToolButton#activeAssetPill {
+    background-color: #161821;
+    border: 1px solid #282d3e;
+    border-radius: 6px;
+    color: #8c93a8;
+    padding: 4px 12px;
+    font-size: 8.5pt;
+    font-weight: 500;
+}
+
+QToolButton#activeAssetPill:hover {
+    background-color: #1e2230;
+    border-color: #4b7bec;
+    color: #ffffff;
+}
+
 /* Global Window & Fonts */
 QMainWindow, QDialog {
     background-color: #15161c;

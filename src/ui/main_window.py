@@ -28,6 +28,7 @@ from ..core.asset_selection import AssetSelection
 from .pipeline_editor_tab import PipelineEditorTab
 from .rendering_tab import RenderingTab
 from .feedback_dialog import FeedbackDialog
+from .studio_header import StudioHeaderBar
 from .styles import get_theme_stylesheet, MODERN_DARK_THEME
 from .icon_provider import get_tab_icon, get_icon
 
@@ -81,6 +82,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         
         layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Studio Top Navigation & Telemetry Header
+        self.studio_header = StudioHeaderBar(self)
+        layout.addWidget(self.studio_header)
         
         # Create tab widget
         self.tab_widget = QTabWidget()
@@ -123,6 +130,13 @@ class MainWindow(QMainWindow):
         
         # Connect settings tab signals
         self.settings_tab.theme_changed.connect(self.on_theme_changed)
+        
+        # Connect Studio Header signals
+        self.asset_selection.changed.connect(self.studio_header.set_active_asset)
+        self.tab_widget.currentChanged.connect(self.studio_header.set_active_workspace)
+        self.studio_header.open_model_requested.connect(self.load_model_shortcut)
+        self.studio_header.theme_toggle_requested.connect(self.toggle_next_theme)
+        self.studio_header.handoff_requested.connect(self._handle_header_handoff)
         
         # Icon-only workspace rail: labels are deliberately in the tooltip so the
         # canvas stays clear.  Every former tab remains present and keyboard/menu
@@ -658,3 +672,29 @@ class MainWindow(QMainWindow):
     def on_theme_changed(self, theme_name):
         """Handle theme change signal."""
         self.setStyleSheet(get_theme_stylesheet(theme_name))
+
+    def toggle_next_theme(self):
+        """Cycle through available modern themes: Dark -> Midnight -> Light -> Dark."""
+        current = self.settings_tab.settings.value("theme", "Dark") if hasattr(self, 'settings_tab') else "Dark"
+        themes = ["Dark", "Midnight", "Light"]
+        next_idx = (themes.index(current) + 1) % len(themes) if current in themes else 0
+        next_theme = themes[next_idx]
+        if hasattr(self, 'settings_tab'):
+            self.settings_tab.settings.setValue("theme", next_theme)
+        self.setStyleSheet(get_theme_stylesheet(next_theme))
+        self.statusBar().showMessage(f"Theme switched to {next_theme}", 2000)
+
+    def _handle_header_handoff(self, target: str, file_path: str):
+        """Route active asset handoff to destination workspace."""
+        if target == "models":
+            self.open_in_model_viewer(file_path)
+        elif target == "mesh_tools":
+            self.open_in_mesh_tools(file_path)
+        elif target == "preprocessing":
+            self.open_in_preprocessing(file_path)
+        elif target == "rendering":
+            self.open_in_rendering(file_path)
+        elif target == "animation":
+            self.open_in_animation(file_path)
+        elif target == "postprocessing":
+            self.open_in_postprocessing(file_path)

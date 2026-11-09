@@ -702,6 +702,43 @@ class ActionRegistry:
             "size": {"type": "int", "required": False}
         }, batch=('input_file', 'destination'), batch_extension='png')
 
+        def analyze_texel_density(model_path: str, texture_size: int = 2048, target_density: float = 1024.0):
+            from ..processing.texel_density import calculate_texel_density
+            report = calculate_texel_density(model_path, int(texture_size or 2048), float(target_density or 1024.0))
+            return {
+                'success': report.rating not in ('Error', 'Empty'),
+                'result': report.summary,
+                'metrics': report.to_dict()
+            }
+
+        cls.register("processing.analyze_texel_density", analyze_texel_density,
+                     "Analyze UV texel density and surface metrics against texture resolution", {
+            "model_path": {"type": "str", "required": True},
+            "texture_size": {"type": "int", "required": False},
+            "target_density": {"type": "float", "required": False}
+        })
+
+        def generate_lod_group(input_file: str, output_dir: str, lod_levels: int = 4,
+                               reduction_curve: str = "exponential", engine: str = "unreal"):
+            from ..processing.lod_generator import generate_engine_lod_group
+            res = generate_engine_lod_group(input_file, output_dir, int(lod_levels or 4),
+                                            str(reduction_curve or 'exponential'), str(engine or 'unreal'))
+            return {
+                'success': res.get('success', False),
+                'result': res.get('summary', ''),
+                'manifest_path': res.get('manifest_path', ''),
+                'output_files': res.get('output_files', [])
+            }
+
+        cls.register("processing.generate_lod_group", generate_lod_group,
+                     "Generate game-engine-ready LOD group with manifest sidecar", {
+            "input_file": {"type": "str", "required": True},
+            "output_dir": {"type": "str", "required": True},
+            "lod_levels": {"type": "int", "required": False},
+            "reduction_curve": {"type": "str", "required": False},
+            "engine": {"type": "str", "required": False}
+        })
+
 
     @classmethod
     def batch_actions(cls) -> Dict[str, str]:
