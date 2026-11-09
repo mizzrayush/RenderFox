@@ -29,6 +29,7 @@ class EcosystemContract(unittest.TestCase):
     def test_workspace_rail_is_icon_only_and_accessible_by_tooltip(self):
         window = MainWindow()
         try:
+            self.assertEqual('workspaceRailBar', window.tab_widget.tabBar().objectName())
             for index in range(window.tab_widget.count()):
                 self.assertEqual('', window.tab_widget.tabText(index))
                 tooltip = window.tab_widget.tabToolTip(index)
@@ -70,6 +71,12 @@ class EcosystemContract(unittest.TestCase):
             self.assertIn('asset_loaded', ast.get_source_segment(source, class_node) or '')
         with open(os.path.join(ROOT, 'src', 'ui', 'main_window.py'), encoding='utf-8') as source_file:
             self.assertIn('pane.asset_loaded.connect(self.asset_selection.select)', source_file.read())
+
+    def test_compact_rail_style_does_not_match_nested_workspace_tabs(self):
+        with open(os.path.join(ROOT, 'src', 'ui', 'styles.py'), encoding='utf-8') as source_file:
+            stylesheet = source_file.read()
+        self.assertIn('QTabBar#workspaceRailBar::tab', stylesheet)
+        self.assertNotIn('QTabWidget#workspaceRail QTabBar::tab', stylesheet)
 
 
 if __name__ == '__main__':

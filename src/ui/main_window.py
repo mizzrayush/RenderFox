@@ -85,6 +85,10 @@ class MainWindow(QMainWindow):
         # Create tab widget
         self.tab_widget = QTabWidget()
         self.tab_widget.setObjectName("workspaceRail")
+        # Name the actual navigation bar as well as its container.  A stylesheet
+        # selector rooted at the container also matched every nested editor tab bar,
+        # which compressed labels such as Library > Collections into unreadable pills.
+        self.tab_widget.tabBar().setObjectName("workspaceRailBar")
         # A vertical workspace rail keeps all capabilities one click away without
         # reducing the app to fifteen competing document tabs across the title bar.
         self.tab_widget.setTabPosition(QTabWidget.TabPosition.West)
