@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QIcon, QPixmap
 from ..features.texture_engine import TextureGenerationThread
 from ..processing.texture_packer import ChannelPacker
+from ..processing.texture_atlas import TextureAtlas
 from ..utils.run_teardown import drain_attributes
 from .icon_provider import get_icon
 
@@ -189,6 +190,21 @@ class TextureGeneratorDialog(QDialog):
         self.pack_channels_btn.clicked.connect(self.pack_channels)
         pack_layout.addWidget(self.pack_channels_btn)
         layout.addWidget(pack_group)
+
+        atlas_group = QGroupBox("Build Texture Atlas")
+        atlas_layout = QHBoxLayout(atlas_group)
+        self.atlas_sources_input = QLineEdit()
+        self.atlas_sources_input.setReadOnly(True)
+        self.atlas_sources_input.setPlaceholderText("Choose equally sized sprite images")
+        atlas_layout.addWidget(self.atlas_sources_input)
+        atlas_browse = QPushButton("Choose Images...")
+        atlas_browse.clicked.connect(self.browse_atlas_sources)
+        atlas_layout.addWidget(atlas_browse)
+        self.build_atlas_btn = QPushButton("Build Atlas...")
+        self.build_atlas_btn.setIcon(get_icon("pipeline"))
+        self.build_atlas_btn.clicked.connect(self.build_atlas)
+        atlas_layout.addWidget(self.build_atlas_btn)
+        layout.addWidget(atlas_group)
         
         # Footer / Options
         footer_layout = QHBoxLayout()
@@ -252,6 +268,26 @@ class TextureGeneratorDialog(QDialog):
         self.path_input.setText(result.output_path)
         self.use_btn.setEnabled(True)
         QMessageBox.information(self, "Channel Packing", result.message)
+
+    def browse_atlas_sources(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose Atlas Images", "", "Images (*.png *.jpg *.jpeg *.tga *.bmp)")
+        if paths:
+            self.atlas_sources_input.setText(';'.join(paths))
+
+    def build_atlas(self):
+        output, _ = QFileDialog.getSaveFileName(
+            self, "Save Texture Atlas", "texture_atlas.png", "PNG Image (*.png)")
+        if not output:
+            return
+        result = TextureAtlas.build(output, self.atlas_sources_input.text().split(';'))
+        if not result.success:
+            QMessageBox.warning(self, "Texture Atlas", result.message)
+            return
+        self.generated_image_path = result.atlas_path
+        self.path_input.setText(result.atlas_path)
+        self.use_btn.setEnabled(True)
+        QMessageBox.information(self, "Texture Atlas", result.message)
 
     def browse_model_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
