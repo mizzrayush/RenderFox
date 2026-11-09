@@ -209,11 +209,16 @@ class ModelFormatConverter(QDialog):
         output_layout.addWidget(output_btn)
         settings_layout.addRow("Output Directory:", output_layout)
         
-        # Conversion options. "Merge all objects" and "Apply transforms" were checkboxes
-        # nothing read: the converter always joins the scene into one mesh and always
-        # bakes the node transforms while doing it, so the truth is a line of text, not
-        # a switch that cannot change anything.
-        settings_layout.addRow(QLabel("Always: objects merged into one mesh,\nscene transforms applied"))
+        # Conversion options
+        self.apply_transforms = QCheckBox("Apply Scene Transforms")
+        self.apply_transforms.setChecked(True)
+        self.apply_transforms.setToolTip("Bake scene and node transform matrices into mesh vertices.")
+        settings_layout.addRow("", self.apply_transforms)
+
+        self.merge_objects = QCheckBox("Merge all objects into single mesh")
+        self.merge_objects.setChecked(True)
+        self.merge_objects.setToolTip("Combine all geometries in multi-object scenes into a single unified mesh.")
+        settings_layout.addRow("", self.merge_objects)
 
         self.scale_factor = QDoubleSpinBox()
         self.scale_factor.setRange(0.001, 1000.0)
@@ -274,7 +279,9 @@ class ModelFormatConverter(QDialog):
         
         # Prepare options understood by FormatConverter
         options = {
-            'scale': self.scale_factor.value()
+            'scale': self.scale_factor.value(),
+            'apply_transforms': self.apply_transforms.isChecked(),
+            'merge_objects': self.merge_objects.isChecked(),
             # 'center', 'normalize', 'repair' could be added later
         }
         

@@ -44,6 +44,7 @@ class RenderJob:
     output_format: str = "png"
     # Quality: the sample count each engine emits its own flag for (Cycles, Arnold, MRQ).
     samples: int = 128
+    use_denoising: bool = True
     status: JobStatus = JobStatus.PENDING
     priority: Priority = Priority.NORMAL
     created_at: Optional[datetime] = None
@@ -182,6 +183,7 @@ class RenderSettings:
     """Advanced render settings."""
     # Quality settings
     samples: int = 128
+    use_denoising: bool = True
     render_engine: str = "cycles"  # cycles, eevee, arnold, etc.
     use_gpu: bool = True
     tile_size: int = 256

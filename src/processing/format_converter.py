@@ -98,6 +98,10 @@ def _meaningful_options(options: Optional[Dict]) -> List[str]:
     # from the route that runs when nobody mentions materials at all.
     if 'preserve_materials' in options:
         live.append('preserve_materials')
+    if options.get('merge_objects') is False:
+        live.append('merge_objects')
+    if options.get('apply_transforms') is False:
+        live.append('apply_transforms')
     return live
 
 
@@ -666,6 +670,25 @@ class FormatConverter(QObject):
         
         try:
             keep = options.get('preserve_materials')
+            merge_objects = options.get('merge_objects', True)
+            apply_transforms = options.get('apply_transforms', True)
+
+            if not merge_objects and (_extension(Path(output_file).suffix)
+                                      in self._SCENE_EXPORT_FORMATS):
+                scene, _reason = self.read_scene(input_file)
+                if scene is not None:
+                    if not apply_transforms:
+                        try:
+                            for node in scene.graph.nodes_geometry:
+                                scene.graph.update(node, matrix=np.eye(4))
+                        except Exception as e:
+                            logger.debug(f"Could not reset scene node transforms: {e}")
+                    if keep is False:
+                        scene = self.without_materials(scene)
+                    ok, reason = self.write_scene(scene, output_file)
+                    if not ok:
+                        return {'success': False, 'message': reason}
+                    return {'success': True, 'message': 'Conversion successful'}
             if keep is not None and (_extension(Path(output_file).suffix)
                                      in self._SCENE_EXPORT_FORMATS):
                 scene, _reason = self.read_scene(input_file)
@@ -681,7 +704,14 @@ class FormatConverter(QObject):
             mesh_or_scene = trimesh.load(input_file)
             
             # Normalize to a single mesh
-            mesh = as_trimesh(mesh_or_scene)
+            if not apply_transforms and isinstance(mesh_or_scene, trimesh.Scene):
+                try:
+                    geoms = [g.copy() for g in mesh_or_scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
+                    mesh = trimesh.util.concatenate(geoms) if geoms else as_trimesh(mesh_or_scene)
+                except Exception:
+                    mesh = as_trimesh(mesh_or_scene)
+            else:
+                mesh = as_trimesh(mesh_or_scene)
             if mesh is None:
                 return {'success': False, 'message': 'Could not load as mesh'}
             

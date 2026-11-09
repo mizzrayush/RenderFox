@@ -102,6 +102,10 @@ class AddJobDialog(QDialog):
         self.samples_spin.setValue(128)
         form_layout.addRow("Samples:", self.samples_spin)
 
+        self.denoise_cb = QCheckBox("AI Denoising (Cycles / OIDN)")
+        self.denoise_cb.setChecked(True)
+        form_layout.addRow("Denoising:", self.denoise_cb)
+
         # Output format
         self.format_combo = QComboBox()
         self.software_combo.currentIndexChanged.connect(self.update_format_choices)
@@ -281,6 +285,7 @@ class AddJobDialog(QDialog):
             'software_type': self.software_combo.currentData(),
             'resolution': (self.width_spin.value(), self.height_spin.value()),
             'samples': self.samples_spin.value(),
+            'use_denoising': self.denoise_cb.isChecked(),
             'output_format': self.format_combo.currentText(),
             'output_path': self.output_edit.text().strip()
         }
@@ -588,6 +593,7 @@ class DashboardTab(QWidget):
                 software_type=job_data['software_type'],
                 resolution=job_data['resolution'],
                 samples=job_data['samples'],
+                use_denoising=job_data.get('use_denoising', True),
                 output_format=job_data['output_format'],
                 output_path=job_data['output_path']
             )
@@ -802,6 +808,7 @@ class DashboardTab(QWidget):
                         "software_type": job.software_type.value,
                         "resolution": job.resolution,
                         "samples": job.samples,
+                        "use_denoising": getattr(job, "use_denoising", True),
                         "output_format": job.output_format,
                         "output_path": job.output_path,
                         "priority": job.priority.value,
@@ -852,6 +859,7 @@ class DashboardTab(QWidget):
                             software_type=SoftwareType(job_data.get("software_type", "blender")),
                             resolution=tuple(job_data.get("resolution", [1920, 1080])),
                             samples=job_data.get("samples", 128),
+                            use_denoising=job_data.get("use_denoising", True),
                             output_format=job_data.get("output_format", "png"),
                             output_path=job_data.get("output_path", ""),
                             priority=Priority(job_data.get("priority", "normal")),

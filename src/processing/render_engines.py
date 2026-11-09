@@ -466,7 +466,7 @@ class BlenderEngine(RenderEngine):
         # Add resolution
         cmd.extend([
             "--python-expr",
-            f"import bpy; bpy.context.scene.render.resolution_x = {job.resolution[0]}; bpy.context.scene.render.resolution_y = {job.resolution[1]}; bpy.context.scene.cycles.samples = {max(1, int(job.samples))}"
+            f"import bpy; bpy.context.scene.render.resolution_x = {job.resolution[0]}; bpy.context.scene.render.resolution_y = {job.resolution[1]}; bpy.context.scene.cycles.samples = {max(1, int(job.samples))}; bpy.context.scene.cycles.use_denoising = {'True' if (getattr(job, 'use_denoising', True) or getattr(job, 'apply_denoising', False)) else 'False'}"
         ])
 
         # Add frame range if specified
