@@ -117,6 +117,12 @@ SUITES = [
         "description": "Writes a portable PNG mip chain and manifest from a texture, reads every recorded level back, and refuses a missing source instead of claiming engine-ready KTX/Basis compression"
     },
     {
+        "id": "texture_compression_contract",
+        "name": "KTX2 / Basis Compression Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_texture_compression_contract.py")],
+        "description": "Uses Basis Universal's documented KTX2 output and validation flags when the optional encoder is installed, reads a non-empty result back, and otherwise names the missing encoder or its failure instead of labelling an ordinary image compressed"
+    },
+    {
         "id": "geometry_compression_contract",
         "name": "Geometry Compression Capability Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_geometry_compression_contract.py")],

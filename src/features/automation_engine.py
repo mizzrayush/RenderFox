@@ -304,6 +304,19 @@ class ActionRegistry:
                          "alpha": {"type": "str", "required": False},
                      })
 
+        def compress_texture_ktx2(input_path: str, output_path: str, generate_mipmaps: bool = True):
+            from ..processing.texture_compression import TextureCompressor
+            verdict = TextureCompressor.compress_ktx2(input_path, output_path, bool(generate_mipmaps))
+            return ({'success': True, 'result': verdict.message, 'output_path': verdict.output_path}
+                    if verdict.success else {'success': False, 'error': verdict.message})
+
+        cls.register("processing.compress_texture_ktx2", compress_texture_ktx2,
+                     "Compress a texture to verified KTX2/Basis", {
+                         "input_path": {"type": "str", "required": True},
+                         "output_path": {"type": "str", "required": True},
+                         "generate_mipmaps": {"type": "bool", "required": False},
+                     })
+
         def compress_geometry_meshopt(input_path: str, output_path: str):
             from ..processing.geometry_compression import GeometryCompressor
             verdict = GeometryCompressor.compress_meshopt(input_path, output_path)

@@ -15,6 +15,7 @@ from ..features.texture_engine import TextureGenerationThread
 from ..processing.texture_packer import ChannelPacker
 from ..processing.texture_atlas import TextureAtlas
 from ..processing.texture_mipmaps import TextureMipmaps
+from ..processing.texture_compression import TextureCompressor
 from ..utils.run_teardown import drain_attributes
 from .icon_provider import get_icon
 
@@ -212,6 +213,12 @@ class TextureGeneratorDialog(QDialog):
         self.generate_mipmaps_btn.setToolTip("Write a PNG mip chain and JSON manifest for the chosen texture")
         self.generate_mipmaps_btn.clicked.connect(self.generate_mipmaps)
         layout.addWidget(self.generate_mipmaps_btn)
+
+        self.compress_ktx2_btn = QPushButton("Compress KTX2 / Basis...")
+        self.compress_ktx2_btn.setIcon(get_icon("pipeline"))
+        self.compress_ktx2_btn.setToolTip("Encode the selected texture as a mipmapped KTX2 asset using Basis Universal")
+        self.compress_ktx2_btn.clicked.connect(self.compress_ktx2)
+        layout.addWidget(self.compress_ktx2_btn)
         
         # Footer / Options
         footer_layout = QHBoxLayout()
@@ -309,6 +316,24 @@ class TextureGeneratorDialog(QDialog):
             QMessageBox.warning(self, "Generate Mipmaps", result.message)
             return
         QMessageBox.information(self, "Generate Mipmaps", result.message)
+
+    def compress_ktx2(self):
+        """Encode the selected source only when the external Basis encoder can verify it."""
+        source = self.generated_image_path or self.path_input.text().strip()
+        if not source:
+            QMessageBox.warning(self, "KTX2 / Basis", "Load or generate a texture first.")
+            return
+        output, _ = QFileDialog.getSaveFileName(
+            self, "Save KTX2 Texture", "texture.ktx2", "KTX2 Texture (*.ktx2)")
+        if not output:
+            return
+        if not output.lower().endswith('.ktx2'):
+            output += '.ktx2'
+        result = TextureCompressor.compress_ktx2(source, output)
+        if not result.success:
+            QMessageBox.warning(self, "KTX2 / Basis", result.message)
+            return
+        QMessageBox.information(self, "KTX2 / Basis", result.message)
 
     def browse_model_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
