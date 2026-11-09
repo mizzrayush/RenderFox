@@ -71,6 +71,23 @@ QTabBar::tab:hover:!selected {
     color: #c0c6d8;
 }
 
+/* The main window uses a left workspace rail; nested editors keep their compact
+   horizontal tabs below. */
+QMainWindow QTabBar::tab {
+    min-width: 142px;
+    min-height: 28px;
+    text-align: left;
+    padding: 9px 12px;
+    border: 1px solid #232530;
+    border-radius: 5px;
+    margin: 2px 4px;
+}
+
+QMainWindow QTabBar::tab:selected {
+    border: 1px solid #4b7bec;
+    border-left: 3px solid #75a7ff;
+}
+
 /* Nested / Sub-Tabs Styling (Pill / Flat DCC style) */
 QTabWidget QTabWidget::pane {
     border: 1px solid #252836;

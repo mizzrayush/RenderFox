@@ -82,6 +82,11 @@ class MainWindow(QMainWindow):
         
         # Create tab widget
         self.tab_widget = QTabWidget()
+        # A vertical workspace rail keeps all capabilities one click away without
+        # reducing the app to fifteen competing document tabs across the title bar.
+        self.tab_widget.setTabPosition(QTabWidget.TabPosition.West)
+        self.tab_widget.setDocumentMode(True)
+        self.tab_widget.setMovable(False)
         layout.addWidget(self.tab_widget)
         
         # Create tabs
@@ -111,19 +116,22 @@ class MainWindow(QMainWindow):
         # Connect settings tab signals
         self.settings_tab.theme_changed.connect(self.on_theme_changed)
         
-        # Add tabs with vector icons and clean industry typography
-        self.tab_widget.addTab(self.library_tab, get_tab_icon("library"), "Library")
+        # Workspace flow: start with work in progress, then assets and geometry,
+        # move through look development and output, and leave automation/system
+        # controls together.  Widgets themselves are unchanged, so links and
+        # shortcuts can still select each workspace directly.
         self.tab_widget.addTab(self.dashboard_tab, get_tab_icon("batch_render"), "Batch Render")
+        self.tab_widget.addTab(self.library_tab, get_tab_icon("library"), "Library")
         self.tab_widget.addTab(self.model_tab, get_tab_icon("models"), "Models")
-        self.tab_widget.addTab(self.point_clouds_tab, get_tab_icon("point_clouds"), "Point Clouds")
         self.tab_widget.addTab(self.mesh_tools_tab, get_tab_icon("mesh_tools"), "Mesh Tools")
-        self.tab_widget.addTab(self.animation_tab, get_tab_icon("animation"), "Animation")
-        self.tab_widget.addTab(self.rendering_tab, get_tab_icon("rendering"), "Rendering")
+        self.tab_widget.addTab(self.point_clouds_tab, get_tab_icon("point_clouds"), "Point Clouds")
         self.tab_widget.addTab(self.preprocessing_tab, get_tab_icon("preprocessing"), "Pre-Processing")
         self.tab_widget.addTab(self.postprocessing_tab, get_tab_icon("postprocessing"), "Post-Processing")
+        self.tab_widget.addTab(self.rendering_tab, get_tab_icon("rendering"), "Rendering")
+        self.tab_widget.addTab(self.animation_tab, get_tab_icon("animation"), "Animation")
         self.tab_widget.addTab(self.automation_tab, get_tab_icon("automation"), "Automation")
-        self.tab_widget.addTab(self.scripting_tab, get_tab_icon("scripting"), "Scripting")
         self.tab_widget.addTab(self.pipeline_tab, get_tab_icon("pipeline"), "Pipeline")
+        self.tab_widget.addTab(self.scripting_tab, get_tab_icon("scripting"), "Scripting")
         self.tab_widget.addTab(self.performance_tab, get_tab_icon("performance"), "Performance")
         self.tab_widget.addTab(self.diagnostics_tab, get_tab_icon("diagnostics"), "Diagnostics")
         self.tab_widget.addTab(self.settings_tab, get_tab_icon("settings"), "Settings")
@@ -250,17 +258,17 @@ class MainWindow(QMainWindow):
         
         dashboard_action = QAction('Dashboard', self)
         dashboard_action.setShortcut('F1')
-        dashboard_action.triggered.connect(lambda: self.switch_to_tab(0))
+        dashboard_action.triggered.connect(lambda: self.switch_to_widget(self.dashboard_tab))
         view_menu.addAction(dashboard_action)
         
         models_view_action = QAction('Models', self)
         models_view_action.setShortcut('F7')
-        models_view_action.triggered.connect(lambda: self.switch_to_tab(1))
+        models_view_action.triggered.connect(lambda: self.switch_to_widget(self.model_tab))
         view_menu.addAction(models_view_action)
         
         library_view_action = QAction('Library', self)
         library_view_action.setShortcut('F8')
-        library_view_action.triggered.connect(lambda: self.switch_to_tab(2))
+        library_view_action.triggered.connect(lambda: self.switch_to_widget(self.library_tab))
         view_menu.addAction(library_view_action)
         
         # Help menu
@@ -351,6 +359,10 @@ class MainWindow(QMainWindow):
     def switch_to_tab(self, index):
         """Switch to a specific tab."""
         self.tab_widget.setCurrentIndex(index)
+
+    def switch_to_widget(self, widget):
+        """Select a workspace by identity, so navigation survives reordering."""
+        self.tab_widget.setCurrentWidget(widget)
     
     def open_user_guide(self):
         """Open user guide."""
