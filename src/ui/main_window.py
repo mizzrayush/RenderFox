@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
         
         # Create tab widget
         self.tab_widget = QTabWidget()
+        self.tab_widget.setObjectName("workspaceRail")
         # A vertical workspace rail keeps all capabilities one click away without
         # reducing the app to fifteen competing document tabs across the title bar.
         self.tab_widget.setTabPosition(QTabWidget.TabPosition.West)

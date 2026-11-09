@@ -73,7 +73,7 @@ QTabBar::tab:hover:!selected {
 
 /* The main window uses a left workspace rail; nested editors keep their compact
    horizontal tabs below. */
-QMainWindow QTabBar::tab {
+QTabWidget#workspaceRail QTabBar::tab {
     min-width: 34px;
     max-width: 34px;
     min-height: 34px;
@@ -84,7 +84,7 @@ QMainWindow QTabBar::tab {
     margin: 3px 5px;
 }
 
-QMainWindow QTabBar::tab:selected {
+QTabWidget#workspaceRail QTabBar::tab:selected {
     border: 1px solid #4b7bec;
     border-left: 2px solid #75a7ff;
 }
