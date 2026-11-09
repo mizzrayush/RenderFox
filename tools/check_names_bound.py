@@ -12,7 +12,7 @@ that resolves to nothing at the moment it is reached - and it cannot be caught b
 invention without re-writing a Python scope analyser. So the question is asked with the analyser
 that exists: pylint's two messages for a name no line binds (``used-before-assignment`` and
 ``undefined-variable``) over the same app scope `check_paths_hygiene` walks. Measured on this tree
-after the fix: 74 files, 0 findings, 59 s.
+after the fix: 81 files, 0 findings, 59 s.
 
     python -X utf8 tools/check_names_bound.py                   # report on this tree
     python -X utf8 tools/check_names_bound.py --strict          # exit 1 unless clean

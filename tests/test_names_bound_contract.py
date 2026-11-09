@@ -17,7 +17,7 @@ and a run that cannot start pylint is a finding rather than a clean answer.
 
     python -X utf8 tests/test_names_bound_contract.py
 
-Cost, measured: about a minute, almost all of it pylint over 74 files. It is one process and no
+Cost, measured: about a minute, almost all of it pylint over 81 files. It is one process and no
 `QApplication`, so it takes none of the timing risk the pane suites take.
 """
 
@@ -37,7 +37,7 @@ CHECKER = Path(ROOT) / 'tools' / 'check_names_bound.py'
 
 # Measured off the checker's own walk, which is `check_paths_hygiene.app_files`: the files under
 # `src/` plus `main.py`. Re-counted by `tools/check_names_bound.py`'s first line on this tree.
-APP_SCOPE_FILES = 74
+APP_SCOPE_FILES = 81
 
 # The two defects, in the shape the phase made them: an assignment taken out of a function that
 # still reads the name, and a name read above the line that binds it.
