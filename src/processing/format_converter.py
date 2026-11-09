@@ -724,7 +724,8 @@ class FormatConverter(QObject):
             return {'success': True, 'message': 'Conversion successful'}
             
         except Exception as e:
-            return {'success': False, 'message': f'PyMeshLab conversion failed: {str(e)}'}
+            err = str(e).strip() or f"{type(e).__name__} (format load refused)"
+            return {'success': False, 'message': f'PyMeshLab conversion failed: {err}'}
     
     def _convert_with_assimp(self, input_file: str, output_file: str, options: Dict) -> Dict[str, any]:
         """Convert using pyassimp - the only path here that can produce an .fbx."""
@@ -1012,7 +1013,8 @@ class FormatConverter(QObject):
                             process=False), 'pymeshlab'
                 tried.append('pymeshlab: no faces')
             except Exception as error:
-                tried.append(f'pymeshlab: {str(error)[:60]}')
+                err = str(error).strip() or f"{type(error).__name__} (format load refused)"
+                tried.append(f'pymeshlab: {err[:60]}')
 
         if ASSIMP_AVAILABLE:
             try:
