@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.setTabPosition(QTabWidget.TabPosition.West)
         self.tab_widget.setDocumentMode(True)
         self.tab_widget.setMovable(False)
+        self.tab_widget.setIconSize(QSize(20, 20))
         layout.addWidget(self.tab_widget)
         
         # Create tabs

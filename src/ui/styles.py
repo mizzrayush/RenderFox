@@ -78,7 +78,10 @@ QTabWidget#workspaceRail QTabBar::tab {
     max-width: 34px;
     min-height: 34px;
     max-height: 34px;
-    padding: 5px;
+    /* No label is drawn here; zero padding lets Qt centre the SVG's own box
+       rather than anchoring it to the text baseline used by ordinary tabs. */
+    padding: 0px;
+    text-align: center;
     border: 1px solid #232530;
     border-radius: 7px;
     margin: 3px 5px;
