@@ -123,6 +123,12 @@ SUITES = [
         "description": "Uses Basis Universal's documented KTX2 output and validation flags when the optional encoder is installed, reads a non-empty result back, and otherwise names the missing encoder or its failure instead of labelling an ordinary image compressed"
     },
     {
+        "id": "animation_importer_contract",
+        "name": "glTF Animation Playback Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_animation_importer_contract.py")],
+        "description": "Reads file-backed glTF animation accessors and samples transforms into the Animation viewport; it keeps unsupported skin deformation explicit instead of substituting generated motion"
+    },
+    {
         "id": "geometry_compression_contract",
         "name": "Geometry Compression Capability Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_geometry_compression_contract.py")],

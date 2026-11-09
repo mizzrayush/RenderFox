@@ -697,6 +697,7 @@ class AnimationTab(QWidget):
         self.clip = AnimationClip()
         self.engine.set_clip(self.clip)
         self.current_frame = 0
+        self.imported_animation_clip = None
         
         # Data
         # We'll use the clip's tracks directly, but keep a reference for UI helper
@@ -1060,15 +1061,28 @@ class AnimationTab(QWidget):
             success = self.viewport.load_model(path)
             if success:
                 self.asset_loaded.emit(path)
-                report = AnimationImporter.inspect(path)
+                report = AnimationImporter.load(path)
                 if report.success:
                     clips = ', '.join(f"{clip.name} ({clip.channel_count} channels)"
                                       for clip in report.clips) or 'no clips'
+                    self.imported_animation_clip = next(
+                        (clip for clip in report.clips if clip.channels), None)
+                    if self.imported_animation_clip:
+                        duration = self.imported_animation_clip.duration_seconds or 0.0
+                        self.clip.duration = max(1, round(duration * self.clip.fps))
+                        self.engine.set_clip(self.clip)
+                        self.engine.set_frame(0)
+                        playback_note = (
+                            f"Transform playback is active for node "
+                            f"{min(channel.node for channel in self.imported_animation_clip.channels)}.")
+                    else:
+                        playback_note = "The file exposes metadata but no readable transform curves."
                     self.animation_asset_status.setText(
                         f"Skeletal data read from file: {report.skeleton_count} skin(s), "
-                        f"{report.joint_count} joint(s); {clips}. "
-                        "Playback currently uses editable transform tracks.")
+                        f"{report.joint_count} joint(s); {clips}. {playback_note} "
+                        "Skin deformation is unavailable until the viewport has a skinned-mesh renderer.")
                 else:
+                    self.imported_animation_clip = None
                     self.animation_asset_status.setText(f"No playable skeletal data: {report.message}")
                 sb = self.statusBar()
                 if sb: sb.showMessage(f"Loaded model: {os.path.basename(path)}", 3000)
@@ -1200,6 +1214,31 @@ class AnimationTab(QWidget):
         self.viewport.model_rotation_z = rot[2]
         
         self.viewport.model_scale = scale[0] # Uniform scale for now
+
+        # A normal ModelViewer viewport has one global transform, so a verified glTF
+        # curve can drive its first animated node but cannot pretend to deform a skin.
+        # Editable timeline tracks remain the fallback for non-glTF assets.
+        if self.imported_animation_clip:
+            transforms = AnimationImporter.sample(self.imported_animation_clip,
+                                                  frame / max(1, self.clip.fps))
+            if transforms:
+                node = min(transforms)
+                transform = transforms[node]
+                translation = transform.get('translation')
+                if translation:
+                    self.viewport.model_translation_x, self.viewport.model_translation_y, self.viewport.model_translation_z = translation
+                scale_value = transform.get('scale')
+                if scale_value:
+                    self.viewport.model_scale = sum(scale_value) / 3.0
+                rotation = transform.get('rotation')
+                if rotation and len(rotation) == 4:
+                    x, y, z, w = rotation
+                    sinr_cosp, cosr_cosp = 2 * (w * x + y * z), 1 - 2 * (x * x + y * y)
+                    sinp = 2 * (w * y - z * x)
+                    siny_cosp, cosy_cosp = 2 * (w * z + x * y), 1 - 2 * (y * y + z * z)
+                    self.viewport.model_rotation_x = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+                    self.viewport.model_rotation_y = math.degrees(math.asin(max(-1.0, min(1.0, sinp))))
+                    self.viewport.model_rotation_z = math.degrees(math.atan2(siny_cosp, cosy_cosp))
         
         self.viewport.update()
 
