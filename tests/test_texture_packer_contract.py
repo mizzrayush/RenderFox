@@ -7,15 +7,21 @@ import tempfile
 import unittest
 
 from PIL import Image
+from unittest import mock
+
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+from PyQt6.QtWidgets import QApplication
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
 
 from src.processing.texture_packer import ChannelPacker
+from src.ui.texture_generator import TextureGeneratorDialog
 
 
 class TexturePackerCase(unittest.TestCase):
     def setUp(self):
+        self.app = QApplication.instance() or QApplication([])
         self.work = tempfile.mkdtemp(prefix='renderfox_channel_pack_')
 
     def tearDown(self):
@@ -56,6 +62,22 @@ class TexturePackerCase(unittest.TestCase):
         self.assertIn('at least one', ChannelPacker.pack(os.path.join(self.work, 'x.png'), {}).message)
         self.assertIn('unknown', ChannelPacker.pack(os.path.join(self.work, 'x.png'),
                                                      {'depth': 'nope.png'}).message)
+
+    def test_texture_dialog_exposes_and_runs_the_same_packer(self):
+        dialog = TextureGeneratorDialog()
+        try:
+            output = os.path.join(self.work, 'dialog_orm.png')
+            dialog.channel_inputs['red'].setText(self.mask('ao.png', 12))
+            dialog.channel_inputs['green'].setText(self.mask('rough.png', 34))
+            with mock.patch('src.ui.texture_generator.QFileDialog.getSaveFileName',
+                            return_value=(output, 'PNG Image (*.png)')), \
+                 mock.patch('src.ui.texture_generator.QMessageBox.information') as shown:
+                dialog.pack_channels()
+            self.assertEqual(output, dialog.generated_image_path)
+            self.assertTrue(os.path.isfile(output))
+            self.assertIn('PNG read back', shown.call_args.args[2])
+        finally:
+            dialog.deleteLater()
 
 
 if __name__ == '__main__':

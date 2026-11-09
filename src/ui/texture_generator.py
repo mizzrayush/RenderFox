@@ -12,7 +12,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QIcon, QPixmap
 from ..features.texture_engine import TextureGenerationThread
+from ..processing.texture_packer import ChannelPacker
 from ..utils.run_teardown import drain_attributes
+from .icon_provider import get_icon
 
 class TextureGeneratorDialog(QDialog):
     """
@@ -162,6 +164,31 @@ class TextureGeneratorDialog(QDialog):
         load_layout.addWidget(self.browse_btn)
         
         layout.addWidget(load_group)
+
+        # Channel packing is a file operation, not a fake material setting: the
+        # source masks stay visible and the resulting PNG is read back by the backend.
+        pack_group = QGroupBox("Pack Texture Channels")
+        pack_layout = QVBoxLayout(pack_group)
+        pack_layout.addWidget(QLabel("Create an ORM or mask texture from equally sized source images."))
+        self.channel_inputs = {}
+        for channel, label in (("red", "Red / Occlusion"), ("green", "Green / Roughness"),
+                               ("blue", "Blue / Metallic"), ("alpha", "Alpha")):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{label}:"))
+            field = QLineEdit()
+            field.setReadOnly(True)
+            field.setPlaceholderText("Optional source image")
+            self.channel_inputs[channel] = field
+            row.addWidget(field)
+            browse = QPushButton("Browse...")
+            browse.clicked.connect(lambda checked=False, key=channel: self.browse_channel(key))
+            row.addWidget(browse)
+            pack_layout.addLayout(row)
+        self.pack_channels_btn = QPushButton("Pack Channels to PNG...")
+        self.pack_channels_btn.setIcon(get_icon("pipeline"))
+        self.pack_channels_btn.clicked.connect(self.pack_channels)
+        pack_layout.addWidget(self.pack_channels_btn)
+        layout.addWidget(pack_group)
         
         # Footer / Options
         footer_layout = QHBoxLayout()
@@ -198,6 +225,33 @@ class TextureGeneratorDialog(QDialog):
             self.generated_image_path = file_path
             self.use_btn.setEnabled(True)
             self.use_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+
+    def browse_channel(self, channel):
+        """Choose the source for one output component of a packed mask."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Choose {channel.title()} Channel Source", "",
+            "Images (*.png *.jpg *.jpeg *.tga *.bmp);;All Files (*.*)")
+        if path:
+            self.channel_inputs[channel].setText(path)
+
+    def pack_channels(self):
+        """Write a channel-packed PNG after the backend validates every input."""
+        output, _ = QFileDialog.getSaveFileName(
+            self, "Save Packed Texture", "packed_orm.png", "PNG Image (*.png)")
+        if not output:
+            return
+        if not output.lower().endswith('.png'):
+            output += '.png'
+        sources = {name: field.text().strip() or None
+                   for name, field in self.channel_inputs.items()}
+        result = ChannelPacker.pack(output, sources)
+        if not result.success:
+            QMessageBox.warning(self, "Channel Packing", result.message)
+            return
+        self.generated_image_path = result.output_path
+        self.path_input.setText(result.output_path)
+        self.use_btn.setEnabled(True)
+        QMessageBox.information(self, "Channel Packing", result.message)
 
     def browse_model_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
