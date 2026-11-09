@@ -42,6 +42,8 @@ class RenderJob:
     resolution: tuple[int, int] = (1920, 1080)
     frame_range: Optional[tuple[int, int]] = None
     output_format: str = "png"
+    # Quality: the sample count each engine emits its own flag for (Cycles, Arnold, MRQ).
+    samples: int = 128
     status: JobStatus = JobStatus.PENDING
     priority: Priority = Priority.NORMAL
     created_at: Optional[datetime] = None

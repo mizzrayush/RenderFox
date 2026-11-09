@@ -95,7 +95,13 @@ class AddJobDialog(QDialog):
         resolution_layout.addWidget(preset_combo)
         
         form_layout.addRow("Resolution:", resolution_layout)
-        
+
+        # Samples: the count each engine emits its own flag for (Cycles, Arnold, MRQ).
+        self.samples_spin = QSpinBox()
+        self.samples_spin.setRange(1, 4096)
+        self.samples_spin.setValue(128)
+        form_layout.addRow("Samples:", self.samples_spin)
+
         # Output format
         self.format_combo = QComboBox()
         self.software_combo.currentIndexChanged.connect(self.update_format_choices)
@@ -274,6 +280,7 @@ class AddJobDialog(QDialog):
             'project_file': self.file_edit.text().strip(),
             'software_type': self.software_combo.currentData(),
             'resolution': (self.width_spin.value(), self.height_spin.value()),
+            'samples': self.samples_spin.value(),
             'output_format': self.format_combo.currentText(),
             'output_path': self.output_edit.text().strip()
         }
@@ -580,6 +587,7 @@ class DashboardTab(QWidget):
                 project_file=job_data['project_file'],
                 software_type=job_data['software_type'],
                 resolution=job_data['resolution'],
+                samples=job_data['samples'],
                 output_format=job_data['output_format'],
                 output_path=job_data['output_path']
             )
@@ -755,10 +763,10 @@ class DashboardTab(QWidget):
                     job.resolution = config["resolution"]
                 
                 if preset_data["override_quality"]:
-                    # Update render settings if they exist
-                    if hasattr(job, 'render_settings') and job.render_settings:
-                        job.render_settings.samples = config["samples"]
-                        job.render_settings.quality = config["quality"]
+                    # The sample count is the quality knob the engines emit a flag for;
+                    # it lives on the job itself, not on a render_settings object the
+                    # job never had (the old hasattr guard was always false).
+                    job.samples = config["samples"]
                 
                 self.job_manager.job_updated.emit(job)
             
@@ -793,6 +801,7 @@ class DashboardTab(QWidget):
                         "project_file": job.project_file,
                         "software_type": job.software_type.value,
                         "resolution": job.resolution,
+                        "samples": job.samples,
                         "output_format": job.output_format,
                         "output_path": job.output_path,
                         "priority": job.priority.value,
@@ -842,6 +851,7 @@ class DashboardTab(QWidget):
                             project_file=job_data.get("project_file", ""),
                             software_type=SoftwareType(job_data.get("software_type", "blender")),
                             resolution=tuple(job_data.get("resolution", [1920, 1080])),
+                            samples=job_data.get("samples", 128),
                             output_format=job_data.get("output_format", "png"),
                             output_path=job_data.get("output_path", ""),
                             priority=Priority(job_data.get("priority", "normal")),

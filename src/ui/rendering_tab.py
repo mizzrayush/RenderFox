@@ -628,7 +628,10 @@ class RenderSettingsPanel(BasePanel):
         # Quality
         qual_layout = self.add_section("Quality")
 
-        self.denoise = QCheckBox("Use AI Denoising")
+        self.denoise = QCheckBox("Denoise Preview (OpenCV)")
+        self.denoise.setToolTip(
+            "Applies a fast OpenCV cleanup to the look-development preview. "
+            "Final DCC renders keep their own renderer denoiser.")
         self.denoise.setChecked(True)
         qual_layout.addWidget(self.denoise)
 
@@ -902,7 +905,11 @@ class RenderingTab(QWidget):
         temporary = f"{head}.denoising{extension}"
         try:
             from ..processing.postprocessor import ImageDenoiser
-            done = ImageDenoiser().denoise_image(path, temporary)
+            # NLM is prohibitively slow on a 4K interactive preview and blocks the
+            # GUI thread.  A Gaussian cleanup is deliberately the default here: it
+            # is fast enough for a preview and the label above says exactly that.
+            done = ImageDenoiser().denoise_image(
+                path, temporary, method="OpenCV Gaussian")
         except Exception as error:
             logger.warning("Denoising unavailable: %s", error)
             done = False

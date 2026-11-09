@@ -93,6 +93,18 @@ SUITES = [
         "description": "Clicks every Rendering tab toolbar action and Render Image button and requires the viewport to change or a frame of the requested resolution and format to be written"
     },
     {
+        "id": "render_samples_contract",
+        "name": "Render Samples Command Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_render_samples_contract.py")],
+        "description": "Phase 15c-1: the sample count travels from the Dashboard's typable Samples box and the preset onto the RenderJob, and each engine emits its own flag for it - Blender's cycles.samples python-expr, Maya's Arnold AASamples MEL, Unreal's Movie Pipeline config - proven at the command line, never by a render. Cinema 4D, whose -render command has no sample parameter, is pinned to invent no flag, and a zero or negative count is made safe rather than emitted raw"
+    },
+    {
+        "id": "video_export_contract",
+        "name": "H.264 MP4 Export Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_video_export_contract.py")],
+        "description": "Phase 15c-2: the Animation tab's MP4 export reads its completed file back for an ISO-BMFF ftyp and moov plus an avc1/avc3 H.264 track, instead of trusting a filename or a zero ffmpeg exit code; missing, empty, truncated, non-MP4, and non-H.264 output reaches the user as a refusal"
+    },
+    {
         "id": "format_converter_contract",
         "name": "Format Conversion Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_format_converter_contract.py")],

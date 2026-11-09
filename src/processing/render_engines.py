@@ -466,7 +466,7 @@ class BlenderEngine(RenderEngine):
         # Add resolution
         cmd.extend([
             "--python-expr",
-            f"import bpy; bpy.context.scene.render.resolution_x = {job.resolution[0]}; bpy.context.scene.render.resolution_y = {job.resolution[1]}"
+            f"import bpy; bpy.context.scene.render.resolution_x = {job.resolution[0]}; bpy.context.scene.render.resolution_y = {job.resolution[1]}; bpy.context.scene.cycles.samples = {max(1, int(job.samples))}"
         ])
 
         # Add frame range if specified
@@ -572,6 +572,10 @@ class MayaEngine(RenderEngine):
         # Set format
         format_id = image_format_value(SoftwareType.MAYA, job.output_format, self.name)
         mel_commands.append(f"setAttr defaultRenderGlobals.imageFormat {format_id};")
+
+        # Arnold's anti-aliasing sample count - Maya's default renderer reads it here.
+        mel_commands.append(
+            f"setAttr defaultArnoldRenderOptions.AASamples {max(1, int(job.samples))};")
         
         # Frame range
         if job.frame_range:
@@ -648,6 +652,7 @@ class UnrealEngine(RenderEngine):
             "OutputDirectory": output_spec(job)[0],
             "OutputFormat": job.output_format,
             "Resolution": job.resolution,
+            "SpatialSampleCount": max(1, int(job.samples)),
             # The command line carries no frame range for Unreal, so the config
             # file has to or an animation job renders exactly one frame.
             "StartFrame": job.frame_range[0] if job.frame_range else 1,
@@ -715,7 +720,13 @@ class Cinema4DEngine(RenderEngine):
             return "Unknown"
     
     def get_render_command(self, job: RenderJob) -> List[str]:
-        """Generate Cinema 4D render command."""
+        """Generate Cinema 4D render command.
+
+        No samples flag is emitted: C4D's `-render` command line has no sample
+        parameter, and the count lives in the .c4d document's own render settings.
+        Inventing a `-samples` here would be a flag the renderer ignores, so the
+        command stays honest and the job's samples is left to the file.
+        """
         cmd = [
             self.executable_path,
             "-nogui",  # No GUI

@@ -52,6 +52,63 @@ def find_ffmpeg_executable() -> str:
     return "ffmpeg"
 
 
+def _iso_boxes(data: bytes):
+    """Top-level ISO-BMFF boxes as (type, payload_start, payload_end).
+
+    A 4-byte big-endian size precedes a 4-byte type. size==1 means the true length
+    is the following 8 bytes (a 16-byte header); size==0 means the box runs to the
+    end of the data. A header that does not fit, or a size that overruns the data,
+    ends the walk - a truncated file is not a container we can vouch for.
+    """
+    boxes = []
+    total = len(data)
+    offset = 0
+    while offset + 8 <= total:
+        size = int.from_bytes(data[offset:offset + 4], "big")
+        kind = data[offset + 4:offset + 8].decode("latin-1")
+        header = 8
+        if size == 1:
+            if offset + 16 > total:
+                break
+            size = int.from_bytes(data[offset + 8:offset + 16], "big")
+            header = 16
+        elif size == 0:
+            size = total - offset
+        if size < header or offset + size > total:
+            break
+        boxes.append((kind, offset + header, offset + size))
+        offset += size
+    return boxes
+
+
+def _container_verdict(path: str):
+    """Read the written file back and say what container it really is.
+
+    The extension is not evidence: ffmpeg can exit 0 having written nothing, or a
+    file that is not the H.264 MP4 the Animation tab promised. So the bytes are
+    asked directly - an ISO-BMFF `ftyp` and `moov`, and an `avc1`/`avc3` sample
+    entry inside the movie box, which is what libx264 writes. Returns (ok,
+    sentence); a refusal names the missing piece so the dialog can say why.
+    """
+    if not os.path.isfile(path):
+        return False, "no file was written"
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if not data:
+        return False, "the file is empty"
+    boxes = _iso_boxes(data)
+    kinds = {kind for kind, _, _ in boxes}
+    if "ftyp" not in kinds:
+        return False, "not an MP4 container (no ftyp box)"
+    moov = next(((start, end) for kind, start, end in boxes if kind == "moov"), None)
+    if moov is None:
+        return False, "not a playable MP4 (no moov box)"
+    payload = data[moov[0]:moov[1]]
+    if b"avc1" not in payload and b"avc3" not in payload:
+        return False, "no H.264 track (avc1/avc3) - this ffmpeg could not encode H.264"
+    return True, "H.264 MP4, container read back"
+
+
 class VideoExporter(QObject):
     """
     Handles the export of animations to video files.
@@ -86,6 +143,7 @@ class VideoExporter(QObject):
             audio_offset_frames: Audio alignment offset.
             frame_callback: Callback to update scene at each frame.
         """
+        temp_dir = None
         try:
             self._cancel_requested = False
             total_frames = (end_frame - start_frame) + 1
@@ -169,11 +227,16 @@ class VideoExporter(QObject):
             
             if process.returncode != 0:
                 logger.warning("FFmpeg Error: %s", stderr.decode())
-                self.finished.emit(False, f"FFmpeg failed: {stderr.decode()[:100]}...")
+                self.finished.emit(False, f"H.264 encode failed: {stderr.decode()[:100]}...")
                 return
-                
+
+            ok, sentence = _container_verdict(output_path)
+            if not ok:
+                self.finished.emit(False, f"H.264 MP4 not written: {sentence}")
+                return
+
             self.progress_changed.emit(100)
-            self.finished.emit(True, f"Render saved to {output_path}")
+            self.finished.emit(True, f"Render saved to {output_path} - {sentence}")
             
         except Exception as e:
             logger.warning("Render Error: %s", e)
@@ -181,7 +244,8 @@ class VideoExporter(QObject):
             
         finally:
             # Cleanup
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
             
     def cancel(self):
         self._cancel_requested = True
