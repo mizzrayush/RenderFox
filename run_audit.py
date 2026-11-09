@@ -105,6 +105,12 @@ SUITES = [
         "description": "Phase 15c-2: the Animation tab's MP4 export reads its completed file back for an ISO-BMFF ftyp and moov plus an avc1/avc3 H.264 track, instead of trusting a filename or a zero ffmpeg exit code; missing, empty, truncated, non-MP4, and non-H.264 output reaches the user as a refusal"
     },
     {
+        "id": "texture_packer_contract",
+        "name": "Texture Channel Packing Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_texture_packer_contract.py")],
+        "description": "Writes ORM and mask PNGs from explicitly assigned image channels, reads the written RGBA pixels back, refuses mismatched source sizes, and proves the Texture Generator and shared automation registry call the same backend"
+    },
+    {
         "id": "format_converter_contract",
         "name": "Format Conversion Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_format_converter_contract.py")],

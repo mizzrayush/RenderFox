@@ -17,6 +17,7 @@ sys.path.insert(0, ROOT)
 
 from src.processing.texture_packer import ChannelPacker
 from src.ui.texture_generator import TextureGeneratorDialog
+from src.features.automation_engine import ActionRegistry
 
 
 class TexturePackerCase(unittest.TestCase):
@@ -78,6 +79,16 @@ class TexturePackerCase(unittest.TestCase):
             self.assertIn('PNG read back', shown.call_args.args[2])
         finally:
             dialog.deleteLater()
+
+    def test_shared_automation_registry_runs_the_same_packer(self):
+        ActionRegistry.register_default_actions()
+        output = os.path.join(self.work, 'workflow_orm.png')
+        result = ActionRegistry.execute('processing.pack_texture_channels', output_path=output,
+                                        red=self.mask('ao.png', 20),
+                                        green=self.mask('rough.png', 200))
+        self.assertTrue(result['success'], result)
+        self.assertTrue(os.path.isfile(output))
+        self.assertIn('PNG read back', result['result'])
 
 
 if __name__ == '__main__':

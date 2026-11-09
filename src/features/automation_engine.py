@@ -282,6 +282,28 @@ class ActionRegistry:
             "resolution": {"type": "int", "required": False}
         })
 
+        def pack_texture_channels(output_path: str, red: str = "", green: str = "",
+                                  blue: str = "", alpha: str = ""):
+            """Write an ORM/mask PNG and return the backend's read-back verdict."""
+            from ..processing.texture_packer import ChannelPacker
+            verdict = ChannelPacker.pack(output_path, {
+                'red': red or None, 'green': green or None,
+                'blue': blue or None, 'alpha': alpha or None,
+            })
+            if not verdict.success:
+                return {'success': False, 'error': verdict.message}
+            return {'success': True, 'result': verdict.message,
+                    'output_path': verdict.output_path, 'size': verdict.size}
+
+        cls.register("processing.pack_texture_channels", pack_texture_channels,
+                     "Pack texture masks into an RGBA PNG", {
+                         "output_path": {"type": "str", "required": True},
+                         "red": {"type": "str", "required": False},
+                         "green": {"type": "str", "required": False},
+                         "blue": {"type": "str", "required": False},
+                         "alpha": {"type": "str", "required": False},
+                     })
+
         def generate_lod(input_file: str, output_dir: str, levels: int = 3):
             from ..processing.lod_generator import LODGenerator, LODSettings
             if not os.path.isfile(input_file):
