@@ -407,7 +407,8 @@ class AIAssetTaggerUI(QWidget):
             self.current_tags_list.clear()
             
             for tag in self.current_tags:
-                item = QListWidgetItem(f"🏷️ {tag}")
+                item = QListWidgetItem(tag)
+                item.setData(Qt.ItemDataRole.UserRole, tag)
                 self.current_tags_list.addItem(item)
         except RuntimeError:
             # Widget might be deleted
@@ -433,9 +434,9 @@ class AIAssetTaggerUI(QWidget):
         
         # Update button text to show AI is working
         if self.tagger.use_clip:
-            self.auto_tag_btn.setText("🤖 AI Analyzing...")
+            self.auto_tag_btn.setText("Analyzing with AI...")
         else:
-            self.auto_tag_btn.setText("📐 Analyzing Geometry...")
+            self.auto_tag_btn.setText("Analyzing Geometry...")
         
         # Start tagging worker
         self.tag_worker = TaggingWorker(self.current_model_path, self.tagger)
@@ -455,7 +456,7 @@ class AIAssetTaggerUI(QWidget):
         """Handle tagging completion with full analysis results."""
         self.auto_tag_btn.setEnabled(True)
         self.tag_progress.setVisible(False)
-        self.auto_tag_btn.setText("🤖 Generate Tags Automatically")
+        self.auto_tag_btn.setText("Generate Tags Automatically")
         
         # Extract tags from analysis
         suggested_tags = analysis.get('tags', [])
@@ -466,7 +467,8 @@ class AIAssetTaggerUI(QWidget):
         for tag in suggested_tags:
             # Don't suggest tags that already exist
             if tag not in self.current_tags:
-                item = QListWidgetItem(f"💡 {tag}")
+                item = QListWidgetItem(tag)
+                item.setData(Qt.ItemDataRole.UserRole, tag)
                 self.suggested_tags_list.addItem(item)
         
         self.add_suggested_btn.setEnabled(True)
@@ -519,7 +521,7 @@ class AIAssetTaggerUI(QWidget):
             selected_items = self.suggested_tags_list.selectedItems()
             
             for item in selected_items:
-                tag = item.text().replace("💡 ", "").strip()
+                tag = item.data(Qt.ItemDataRole.UserRole) or item.text().strip()
                 if tag not in self.current_tags:
                     self.current_tags.append(tag)
                     self.tagger.add_tag(self.current_model_path, tag)
@@ -551,7 +553,7 @@ class AIAssetTaggerUI(QWidget):
 
             for i in range(self.suggested_tags_list.count()):
                 item = self.suggested_tags_list.item(i)
-                tag = item.text().replace("💡 ", "").strip()
+                tag = item.data(Qt.ItemDataRole.UserRole) or item.text().strip()
                 if tag not in self.current_tags:
                     self.current_tags.append(tag)
                     self.tagger.add_tag(self.current_model_path, tag)
@@ -598,7 +600,7 @@ class AIAssetTaggerUI(QWidget):
             selected_items = self.current_tags_list.selectedItems()
             
             for item in selected_items:
-                tag = item.text().replace("🏷️ ", "").strip()
+                tag = item.data(Qt.ItemDataRole.UserRole) or item.text().strip()
                 if tag in self.current_tags:
                     self.current_tags.remove(tag)
                     self.tagger.remove_tag(self.current_model_path, tag)
@@ -621,7 +623,7 @@ class AIAssetTaggerUI(QWidget):
             # Clear from database/storage
             for i in range(self.current_tags_list.count()):
                 item = self.current_tags_list.item(i)
-                tag = item.text().replace("🏷️ ", "").strip()
+                tag = item.data(Qt.ItemDataRole.UserRole) or item.text().strip()
                 self.tagger.remove_tag(self.current_model_path, tag)
             
             self.refresh_current_tags_display()
