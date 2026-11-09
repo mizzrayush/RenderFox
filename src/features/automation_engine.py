@@ -304,6 +304,18 @@ class ActionRegistry:
                          "alpha": {"type": "str", "required": False},
                      })
 
+        def compress_geometry_meshopt(input_path: str, output_path: str):
+            from ..processing.geometry_compression import GeometryCompressor
+            verdict = GeometryCompressor.compress_meshopt(input_path, output_path)
+            return ({'success': True, 'result': verdict.message, 'output_path': verdict.output_path}
+                    if verdict.success else {'success': False, 'error': verdict.message})
+
+        cls.register("processing.compress_geometry_meshopt", compress_geometry_meshopt,
+                     "Compress glTF geometry with Meshopt", {
+                         "input_path": {"type": "str", "required": True},
+                         "output_path": {"type": "str", "required": True},
+                     })
+
         def generate_lod(input_file: str, output_dir: str, levels: int = 3):
             from ..processing.lod_generator import LODGenerator, LODSettings
             if not os.path.isfile(input_file):

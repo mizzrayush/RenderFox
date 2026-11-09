@@ -111,6 +111,12 @@ SUITES = [
         "description": "Writes ORM and mask PNGs from explicitly assigned image channels, reads the written RGBA pixels back, refuses mismatched source sizes, and proves the Texture Generator and shared automation registry call the same backend"
     },
     {
+        "id": "geometry_compression_contract",
+        "name": "Geometry Compression Capability Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_geometry_compression_contract.py")],
+        "description": "Requires Meshopt compression to use gltfpack and verify EXT_meshopt_compression from the written asset; without that encoder it refuses by name rather than calling an ordinary GLB compressed"
+    },
+    {
         "id": "format_converter_contract",
         "name": "Format Conversion Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_format_converter_contract.py")],
