@@ -2078,8 +2078,8 @@ class ModelTab(QWidget):
         
         # Quality metrics
         results.append(f"\nQuality Metrics:")
-        results.append(f"Watertight: {'✓' if mesh.is_watertight else '✗'}")
-        results.append(f"Winding Consistent: {'✓' if mesh.is_winding_consistent else '✗'}")
+        results.append(f"Watertight: {'Yes' if mesh.is_watertight else 'No'}")
+        results.append(f"Winding Consistent: {'Yes' if mesh.is_winding_consistent else 'No'}")
         
         # Face quality
         if hasattr(mesh, 'face_angles'):
@@ -2106,9 +2106,9 @@ class ModelTab(QWidget):
         
         # Topology validation
         results.append("Topology Validation:")
-        results.append(f"Is Volume: {'✓' if mesh.is_volume else '✗'}")
-        results.append(f"Is Watertight: {'✓' if mesh.is_watertight else '✗'}")
-        results.append(f"Winding Consistent: {'✓' if mesh.is_winding_consistent else '✗'}")
+        results.append(f"Is Volume: {'Yes' if mesh.is_volume else 'No'}")
+        results.append(f"Is Watertight: {'Yes' if mesh.is_watertight else 'No'}")
+        results.append(f"Winding Consistent: {'Yes' if mesh.is_winding_consistent else 'No'}")
         
         # Geometry validation
         results.append(f"\nGeometry Validation:")
@@ -2561,15 +2561,15 @@ class ModelTab(QWidget):
         self.analysis_table.setRowCount(0)
         
         properties = [
-            ("Vertices", f"{analysis['vertices']:,}", "✓"),
-            ("Faces", f"{analysis['faces']:,}", "✓"),
-            ("Edges", f"{analysis['edges']:,}", "✓"),
-            ("Surface Area", f"{analysis['surface_area']:.2f}", "✓"),
-            ("Volume", f"{analysis['volume']:.2f}", "✓"),
+            ("Vertices", f"{analysis['vertices']:,}", "OK"),
+            ("Faces", f"{analysis['faces']:,}", "OK"),
+            ("Edges", f"{analysis['edges']:,}", "OK"),
+            ("Surface Area", f"{analysis['surface_area']:.2f}", "OK"),
+            ("Volume", f"{analysis['volume']:.2f}", "OK"),
             ("Watertight", "Yes" if analysis['is_watertight'] else "No", 
-             "✓" if analysis['is_watertight'] else "⚠"),
+             "OK" if analysis['is_watertight'] else "Warning"),
             ("Winding Consistent", "Yes" if analysis['is_winding_consistent'] else "No",
-             "✓" if analysis['is_winding_consistent'] else "⚠"),
+             "OK" if analysis['is_winding_consistent'] else "Warning"),
         ]
         
         for i, (prop, value, status) in enumerate(properties):

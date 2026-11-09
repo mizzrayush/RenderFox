@@ -1006,8 +1006,8 @@ Faces: {stats.faces:,}
 Edges: {stats.edges:,}
 
 Topology:
-✓ Watertight: {'Yes' if stats.is_watertight else 'No'}
-✓ Manifold: {'Yes' if stats.is_manifold else 'No'}
+Watertight: {'Yes' if stats.is_watertight else 'No'}
+Manifold: {'Yes' if stats.is_manifold else 'No'}
 
 Geometry:
 Volume: {stats.volume:.4f} cubic units

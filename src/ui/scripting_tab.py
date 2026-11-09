@@ -144,7 +144,7 @@ class ScriptingTab(QWidget):
         
         main_layout.addWidget(self.scripting_tabs)
         
-    def populate_sample_scripts(self):  # ✅ ADD THIS METHOD HERE
+    def populate_sample_scripts(self):  # ADD THIS METHOD HERE
         """Populate the script library from ScriptTemplates."""
         self.script_tree.clear()
         
@@ -821,7 +821,7 @@ if __name__ == "__main__":
     def stop_script(self):
         """Stop script execution."""
         if self.executor and self.executor.isRunning():
-            self.script_engine.stop_execution()  # ✅ Use ScriptEngine method
+            self.script_engine.stop_execution()  # Use ScriptEngine method
             
         self.run_script_btn.setEnabled(True)
         self.stop_script_btn.setEnabled(False)
@@ -847,7 +847,7 @@ if __name__ == "__main__":
         if not current_item or not current_item.parent():
             return
         
-        # ✅ Get template from stored data
+        # Get template from stored data
         template = current_item.data(0, Qt.ItemDataRole.UserRole)
         if template:
             self.script_preview.setPlainText(template['code'])
@@ -940,7 +940,7 @@ if __name__ == "__main__":
         if not current_item:
             return
         
-        # ✅ GET docs from ScriptEngine
+        # GET docs from ScriptEngine
         full_docs = self.script_engine.get_api_documentation()
         self.api_docs_display.setPlainText(full_docs)
 #     def show_api_docs(self):
@@ -1003,7 +1003,7 @@ if __name__ == "__main__":
         self.console_output.appendPlainText(f">>> {command}")
         
         try:
-            # ✅ USE ScriptEngine API in globals
+            # USE ScriptEngine API in globals
             console_globals = {
                 'rfx': self.script_engine.api,
                 'api': self.script_engine.api,

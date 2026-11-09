@@ -853,9 +853,9 @@ class SettingsTab(QWidget):
             for software_type in SoftwareType:
                 if (software_type in available_software):
                     version = available_software[software_type]
-                    status_text += f"✓ {software_type.value.title()}: {version}\n"
+                    status_text += f"[Detected] {software_type.value.title()}: {version}\n"
                 else:
-                    status_text += f"✗ {software_type.value.title()}: Not detected\n"
+                    status_text += f"[Missing]  {software_type.value.title()}: Not detected\n"
             
             self.software_status.setPlainText(status_text)
             

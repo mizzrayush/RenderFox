@@ -23,7 +23,55 @@ class TextureGeneratorDialog(QDialog):
     """
     Dialog for generating textures or loading custom ones.
     """
-    
+
+    PACKING_PRESETS = {
+        "Unreal Engine 5 ORM (R: AO, G: Roughness, B: Metallic)": {
+            "channels": {
+                "red": ("Red (Ambient Occlusion)", "Select AO map"),
+                "green": ("Green (Roughness)", "Select Roughness map"),
+                "blue": ("Blue (Metallic)", "Select Metallic map"),
+                "alpha": ("Alpha (Cavity / Height)", "Optional Cavity or Height map"),
+            },
+            "default_name": "packed_orm.png",
+        },
+        "Unity HDRP Mask Map (R: Metallic, G: AO, B: Detail, A: Smoothness)": {
+            "channels": {
+                "red": ("Red (Metallic)", "Select Metallic map"),
+                "green": ("Green (Ambient Occlusion)", "Select AO map"),
+                "blue": ("Blue (Detail Mask)", "Optional Detail mask"),
+                "alpha": ("Alpha (Smoothness)", "Select Smoothness map"),
+            },
+            "default_name": "packed_maskmap.png",
+        },
+        "Unity URP Metallic/Smooth (R: Metallic, A: Smoothness)": {
+            "channels": {
+                "red": ("Red (Metallic)", "Select Metallic map"),
+                "green": ("Green (Unused)", "Unused channel (defaults to 0)"),
+                "blue": ("Blue (Unused)", "Unused channel (defaults to 0)"),
+                "alpha": ("Alpha (Smoothness)", "Select Smoothness map"),
+            },
+            "default_name": "packed_metallic_smooth.png",
+        },
+        "Blender Principled (G: Roughness, B: Metallic)": {
+            "channels": {
+                "red": ("Red (Ambient Occlusion / Unused)", "Optional AO map"),
+                "green": ("Green (Roughness)", "Select Roughness map"),
+                "blue": ("Blue (Metallic)", "Select Metallic map"),
+                "alpha": ("Alpha (Alpha / Transmission)", "Optional Alpha or Transmission map"),
+            },
+            "default_name": "packed_pbr.png",
+        },
+        "Custom Channel Mapping": {
+            "channels": {
+                "red": ("Red Channel", "Source image for Red channel"),
+                "green": ("Green Channel", "Source image for Green channel"),
+                "blue": ("Blue Channel", "Source image for Blue channel"),
+                "alpha": ("Alpha Channel", "Source image for Alpha channel"),
+            },
+            "default_name": "packed_custom.png",
+        },
+    }
+
     texture_ready = pyqtSignal(str, str)  # Emits (path, slot_name)
     
     def __init__(self, parent=None):
@@ -173,24 +221,48 @@ class TextureGeneratorDialog(QDialog):
         pack_group = QGroupBox("Pack Texture Channels")
         pack_layout = QVBoxLayout(pack_group)
         pack_layout.addWidget(QLabel("Create an ORM or mask texture from equally sized source images."))
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Target Engine Preset:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(list(self.PACKING_PRESETS.keys()))
+        self.preset_combo.currentTextChanged.connect(self._on_packing_preset_changed)
+        preset_row.addWidget(self.preset_combo)
+        pack_layout.addLayout(preset_row)
+
         self.channel_inputs = {}
-        for channel, label in (("red", "Red / Occlusion"), ("green", "Green / Roughness"),
-                               ("blue", "Blue / Metallic"), ("alpha", "Alpha")):
+        self.channel_labels = {}
+        channels_cfg = self.PACKING_PRESETS["Unreal Engine 5 ORM (R: AO, G: Roughness, B: Metallic)"]["channels"]
+        for channel in ("red", "green", "blue", "alpha"):
+            label, placeholder = channels_cfg[channel]
             row = QHBoxLayout()
-            row.addWidget(QLabel(f"{label}:"))
+            lbl = QLabel(f"{label}:")
+            lbl.setMinimumWidth(160)
+            self.channel_labels[channel] = lbl
+            row.addWidget(lbl)
             field = QLineEdit()
             field.setReadOnly(True)
-            field.setPlaceholderText("Optional source image")
+            field.setPlaceholderText(placeholder)
             self.channel_inputs[channel] = field
             row.addWidget(field)
             browse = QPushButton("Browse...")
             browse.clicked.connect(lambda checked=False, key=channel: self.browse_channel(key))
             row.addWidget(browse)
             pack_layout.addLayout(row)
+
+        self.current_packing_default_name = "packed_orm.png"
+
+        pack_btn_row = QHBoxLayout()
         self.pack_channels_btn = QPushButton("Pack Channels to PNG...")
         self.pack_channels_btn.setIcon(get_icon("pipeline"))
         self.pack_channels_btn.clicked.connect(self.pack_channels)
-        pack_layout.addWidget(self.pack_channels_btn)
+        pack_btn_row.addWidget(self.pack_channels_btn)
+
+        self.clear_channels_btn = QPushButton("Clear Channels")
+        self.clear_channels_btn.clicked.connect(self.clear_channels)
+        pack_btn_row.addWidget(self.clear_channels_btn)
+        pack_layout.addLayout(pack_btn_row)
+
         layout.addWidget(pack_group)
 
         atlas_group = QGroupBox("Build Texture Atlas")
@@ -256,6 +328,26 @@ class TextureGeneratorDialog(QDialog):
             self.use_btn.setEnabled(True)
             self.use_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
 
+    def _on_packing_preset_changed(self, preset_name):
+        """Update channel labels, placeholders, and default filename for selected engine preset."""
+        preset = self.PACKING_PRESETS.get(preset_name)
+        if not preset:
+            return
+        self.current_packing_default_name = preset.get("default_name", "packed_orm.png")
+        channels_cfg = preset.get("channels", {})
+        for channel in ("red", "green", "blue", "alpha"):
+            if channel in channels_cfg:
+                label, placeholder = channels_cfg[channel]
+                if channel in self.channel_labels:
+                    self.channel_labels[channel].setText(f"{label}:")
+                if channel in self.channel_inputs:
+                    self.channel_inputs[channel].setPlaceholderText(placeholder)
+
+    def clear_channels(self):
+        """Clear all loaded channel inputs."""
+        for field in self.channel_inputs.values():
+            field.clear()
+
     def browse_channel(self, channel):
         """Choose the source for one output component of a packed mask."""
         path, _ = QFileDialog.getOpenFileName(
@@ -266,8 +358,9 @@ class TextureGeneratorDialog(QDialog):
 
     def pack_channels(self):
         """Write a channel-packed PNG after the backend validates every input."""
+        default_name = getattr(self, "current_packing_default_name", "packed_orm.png")
         output, _ = QFileDialog.getSaveFileName(
-            self, "Save Packed Texture", "packed_orm.png", "PNG Image (*.png)")
+            self, "Save Packed Texture", default_name, "PNG Image (*.png)")
         if not output:
             return
         if not output.lower().endswith('.png'):

@@ -80,6 +80,26 @@ class TexturePackerCase(unittest.TestCase):
         finally:
             dialog.deleteLater()
 
+    def test_texture_dialog_presets_and_clearing(self):
+        dialog = TextureGeneratorDialog()
+        try:
+            self.assertGreaterEqual(dialog.preset_combo.count(), 4)
+            # Switch to Unity HDRP
+            hdrp_preset = "Unity HDRP Mask Map (R: Metallic, G: AO, B: Detail, A: Smoothness)"
+            dialog.preset_combo.setCurrentText(hdrp_preset)
+            self.assertEqual("packed_maskmap.png", dialog.current_packing_default_name)
+            self.assertIn("Metallic", dialog.channel_labels['red'].text())
+            self.assertIn("Smoothness", dialog.channel_labels['alpha'].text())
+
+            # Fill in channels and test clear
+            dialog.channel_inputs['red'].setText("dummy_metal.png")
+            dialog.channel_inputs['green'].setText("dummy_ao.png")
+            dialog.clear_channels()
+            self.assertEqual("", dialog.channel_inputs['red'].text())
+            self.assertEqual("", dialog.channel_inputs['green'].text())
+        finally:
+            dialog.deleteLater()
+
     def test_shared_automation_registry_runs_the_same_packer(self):
         ActionRegistry.register_default_actions()
         output = os.path.join(self.work, 'workflow_orm.png')
