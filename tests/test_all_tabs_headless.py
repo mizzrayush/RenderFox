@@ -219,6 +219,25 @@ class TestAllTabsHeadless(unittest.TestCase):
         
         print("✓ Inter-tab signal routing verified.")
 
+    def test_10b_library_navigation_uses_workspace_identity_not_tab_text_or_position(self):
+        """The icon-only rail has blank labels and can be reordered without breaking sends."""
+        win = self.window
+        loaded = []
+        original_model = win.model_tab.load_model_file
+        original_mesh = win.mesh_tools_tab.load_mesh_file
+        try:
+            win.model_tab.load_model_file = lambda path: loaded.append(('model', path))
+            win.library_tab.open_in_model_tab('asset.obj')
+            self.assertEqual(win.tab_widget.currentWidget(), win.model_tab)
+            self.assertEqual([('model', 'asset.obj')], loaded)
+            win.mesh_tools_tab.load_mesh_file = lambda path: loaded.append(('mesh', path))
+            win.library_tab.open_in_mesh_tools('asset.obj')
+            self.assertEqual(win.tab_widget.currentWidget(), win.mesh_tools_tab)
+            self.assertEqual(('mesh', 'asset.obj'), loaded[-1])
+        finally:
+            win.model_tab.load_model_file = original_model
+            win.mesh_tools_tab.load_mesh_file = original_mesh
+
     def test_11_ai_asset_tagger_clip_inference(self):
         """Verify that AI Asset Tagger runs CLIP inference and returns categories + tags."""
         tagger_tab = self.window.library_tab.ai_tagger_tab

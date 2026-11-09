@@ -3349,24 +3349,9 @@ class LibraryTab(QWidget):
     def open_in_model_tab(self, file_path):
         """Open the asset in the Model tab."""
         try:
-            # Get the main window (parent of parent)
-            main_window = self.parent()
-            while main_window and not hasattr(main_window, 'tab_widget'):
-                main_window = main_window.parent()
-            
-            if main_window and hasattr(main_window, 'tab_widget'):
-                # Switch to Model tab
-                for i in range(main_window.tab_widget.count()):
-                    if main_window.tab_widget.tabText(i) == "Model":
-                        main_window.tab_widget.setCurrentIndex(i)
-                        
-                        # Load the model in the Model tab
-                        model_tab = main_window.tab_widget.widget(i)
-                        if hasattr(model_tab, 'load_model_file'):
-                            model_tab.load_model_file(file_path)
-                        else:
-                            QMessageBox.warning(self, "Error", "Model tab doesn't support direct loading")
-                        break
+            main_window = self.window()
+            if main_window and hasattr(main_window, 'open_in_model_viewer'):
+                main_window.open_in_model_viewer(file_path)
             else:
                 QMessageBox.warning(self, "Error", "Could not find Model tab")
         except Exception as e:
@@ -3375,24 +3360,9 @@ class LibraryTab(QWidget):
     def open_in_mesh_tools(self, file_path):
         """Open the asset in the Mesh Tools tab."""
         try:
-            # Get the main window (parent of parent)
-            main_window = self.parent()
-            while main_window and not hasattr(main_window, 'tab_widget'):
-                main_window = main_window.parent()
-            
-            if main_window and hasattr(main_window, 'tab_widget'):
-                # Switch to Mesh Tools tab
-                for i in range(main_window.tab_widget.count()):
-                    if main_window.tab_widget.tabText(i) == "Mesh Tools":
-                        main_window.tab_widget.setCurrentIndex(i)
-                        
-                        # Load the mesh in the Mesh Tools tab
-                        mesh_tools_tab = main_window.tab_widget.widget(i)
-                        if hasattr(mesh_tools_tab, 'load_mesh_file'):
-                            mesh_tools_tab.load_mesh_file(file_path)
-                        else:
-                            QMessageBox.warning(self, "Error", "Mesh Tools tab doesn't support direct loading")
-                        break
+            main_window = self.window()
+            if main_window and hasattr(main_window, 'open_in_mesh_tools'):
+                main_window.open_in_mesh_tools(file_path)
             else:
                 QMessageBox.warning(self, "Error", "Could not find Mesh Tools tab")
         except Exception as e:
@@ -3481,23 +3451,13 @@ Accessed: {datetime.fromtimestamp(stats.st_atime).strftime('%Y-%m-%d %H:%M:%S')}
     def _open_in_model_viewer(self, model_path, dialog):
         """Open model in Model Viewer tab."""
         dialog.accept()
-        # Switch to Model tab (index 2)
         main_window = self.window()
-        if main_window:
-            if hasattr(main_window, 'tab_widget'):
-                main_window.tab_widget.setCurrentIndex(2)
-            # Load model
-            if hasattr(main_window, 'model_tab'):
-                main_window.model_tab.load_model(model_path)
+        if main_window and hasattr(main_window, 'open_in_model_viewer'):
+            main_window.open_in_model_viewer(model_path)
 
     def _open_in_mesh_tools(self, model_path, dialog):
         """Open model in Mesh Tools tab."""
         dialog.accept()
-        # Switch to Mesh Tools tab (index 4)
         main_window = self.window()
-        if main_window:
-            if hasattr(main_window, 'tab_widget'):
-                main_window.tab_widget.setCurrentIndex(4)
-            # Load model
-            if hasattr(main_window, 'mesh_tools_tab'):
-                main_window.mesh_tools_tab.load_model(model_path)
+        if main_window and hasattr(main_window, 'open_in_mesh_tools'):
+            main_window.open_in_mesh_tools(model_path)
