@@ -175,7 +175,7 @@ class StudioHeaderBar(QFrame):
         self.asset_btn = QToolButton()
         self.asset_btn.setObjectName("activeAssetPill")
         self.asset_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.asset_btn.setText("No Asset Loaded — Drop a 3D model or click to browse")
+        self.asset_btn.setText("No Asset Loaded (Click to Browse)")
         self.asset_btn.setIcon(get_icon("models"))
         self.asset_btn.setStyleSheet("""
             QToolButton#activeAssetPill {
@@ -184,7 +184,7 @@ class StudioHeaderBar(QFrame):
                 border-radius: 6px;
                 color: #8c93a8;
                 padding: 4px 12px;
-                font-size: 9pt;
+                font-size: 8.5pt;
                 font-weight: 500;
             }
             QToolButton#activeAssetPill:hover {
@@ -201,27 +201,32 @@ class StudioHeaderBar(QFrame):
         # 4. Quick Action Buttons (Right)
         # Load Model Button
         self.open_btn = QPushButton("Open Model")
-        self.open_btn.setIcon(get_icon("library"))
+        self.open_btn.setIcon(get_icon("import_model", size=16))
+        self.open_btn.setIconSize(QSize(16, 16))
+        self.open_btn.setMinimumWidth(104)
+        self.open_btn.setMinimumHeight(26)
         self.open_btn.setToolTip("Open a 3D model from disk (Ctrl+O)")
         self.open_btn.clicked.connect(self.open_model_requested.emit)
-        self.open_btn.setStyleSheet("padding: 4px 10px; font-size: 8.5pt;")
         layout.addWidget(self.open_btn)
 
         # Texel Density Tool Button
         self.texel_btn = QPushButton("Texel Density")
-        self.texel_btn.setIcon(get_icon("mesh_tools"))
+        self.texel_btn.setIcon(get_icon("mesh_tools", size=16))
+        self.texel_btn.setIconSize(QSize(16, 16))
+        self.texel_btn.setMinimumWidth(110)
+        self.texel_btn.setMinimumHeight(26)
         self.texel_btn.setToolTip("Inspect UV texel density and surface resolution")
         self.texel_btn.clicked.connect(self.open_texel_density)
-        self.texel_btn.setStyleSheet("padding: 4px 10px; font-size: 8.5pt;")
         layout.addWidget(self.texel_btn)
 
         # Theme Toggle Button
         self.theme_btn = QPushButton()
-        self.theme_btn.setIcon(get_icon("settings"))
+        self.theme_btn.setIcon(get_icon("settings", size=16))
+        self.theme_btn.setIconSize(QSize(16, 16))
+        self.theme_btn.setFixedSize(28, 26)
         self.theme_btn.setToolTip("Toggle Theme (Dark / Midnight / Light)")
         self.theme_btn.clicked.connect(self.theme_toggle_requested.emit)
-        self.theme_btn.setFixedWidth(32)
-        self.theme_btn.setStyleSheet("padding: 4px;")
+        self.theme_btn.setStyleSheet("padding: 0px;")
         layout.addWidget(self.theme_btn)
 
     def setup_asset_menu(self):
@@ -279,7 +284,7 @@ class StudioHeaderBar(QFrame):
                 }
             """)
         else:
-            self.asset_btn.setText("No Asset Loaded — Drop a 3D model or click to browse")
+            self.asset_btn.setText("No Asset Loaded (Click to Browse)")
             self.asset_btn.setStyleSheet("""
                 QToolButton#activeAssetPill {
                     background-color: #191b24;
@@ -287,7 +292,7 @@ class StudioHeaderBar(QFrame):
                     border-radius: 6px;
                     color: #8c93a8;
                     padding: 4px 12px;
-                    font-size: 9pt;
+                    font-size: 8.5pt;
                     font-weight: 500;
                 }
                 QToolButton#activeAssetPill:hover {

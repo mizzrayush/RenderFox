@@ -27,6 +27,7 @@ QFrame#studioHeader QPushButton {
     padding: 4px 10px;
     font-size: 8.5pt;
     font-weight: 500;
+    text-align: center;
 }
 
 QFrame#studioHeader QPushButton:hover {
@@ -112,17 +113,17 @@ QTabBar::tab:hover:!selected {
 /* The main window uses a left workspace rail; nested editors keep their compact
    horizontal tabs below. */
 QTabBar#workspaceRailBar::tab {
-    min-width: 34px;
-    max-width: 34px;
-    min-height: 34px;
-    max-height: 34px;
-    /* No label is drawn here; zero padding lets Qt centre the SVG's own box
-       rather than anchoring it to the text baseline used by ordinary tabs. */
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    /* Zero padding with calibrated rail tab margins centers the SVG icon box
+       cleanly across both axes and ensures all 15 workspaces fit on screen. */
     padding: 0px;
     text-align: center;
     border: 1px solid #232530;
-    border-radius: 7px;
-    margin: 3px 5px;
+    border-radius: 6px;
+    margin: 1px 2px;
 }
 
 QTabBar#workspaceRailBar::tab:selected {

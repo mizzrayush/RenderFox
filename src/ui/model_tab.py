@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QTableWidgetItem, QHeaderView, QListWidget, QListWidgetItem,
                              QDialog, QDialogButtonBox, QScrollArea, QProgressDialog,
                              QColorDialog, QInputDialog)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from src.core.worker_base import SafeWorker
 from PyQt6.QtGui import QPixmap, QIcon, QColor, QFont
 
@@ -383,15 +383,21 @@ class ModelTab(QWidget):
         # Browser controls
         browser_controls = QHBoxLayout()
         self.load_model_btn = QPushButton("Load Model")
-        self.load_model_btn.setIcon(get_icon("import_model"))
+        self.load_model_btn.setIcon(get_icon("import_model", size=16))
+        self.load_model_btn.setIconSize(QSize(16, 16))
         self.load_folder_btn = QPushButton("Load Folder")
-        self.load_folder_btn.setIcon(get_icon("import_folder"))
+        self.load_folder_btn.setIcon(get_icon("import_folder", size=16))
+        self.load_folder_btn.setIconSize(QSize(16, 16))
         self.refresh_btn = QPushButton()
-        self.refresh_btn.setIcon(get_icon("refresh"))
-        self.refresh_btn.setMaximumWidth(36)
+        self.refresh_btn.setIcon(get_icon("refresh", size=16))
+        self.refresh_btn.setIconSize(QSize(16, 16))
+        self.refresh_btn.setFixedSize(32, 28)
+        self.refresh_btn.setStyleSheet("padding: 0px;")
         self.remove_model_btn = QPushButton()
-        self.remove_model_btn.setIcon(get_icon("delete"))
-        self.remove_model_btn.setMaximumWidth(36)
+        self.remove_model_btn.setIcon(get_icon("delete", size=16))
+        self.remove_model_btn.setIconSize(QSize(16, 16))
+        self.remove_model_btn.setFixedSize(32, 28)
+        self.remove_model_btn.setStyleSheet("padding: 0px;")
         
         browser_controls.addWidget(self.load_model_btn)
         browser_controls.addWidget(self.load_folder_btn)
