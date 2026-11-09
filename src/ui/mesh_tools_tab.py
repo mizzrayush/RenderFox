@@ -25,6 +25,7 @@ class MeshToolsTab(QWidget):
     """Advanced mesh processing tools using PyMeshLab."""
 
     add_to_library_requested = pyqtSignal(str)
+    asset_loaded = pyqtSignal(str)
     
     mesh_processed = pyqtSignal(str)
     operation_completed = pyqtSignal(str, dict)
@@ -1344,6 +1345,7 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
                 # Update status
                 file_name = os.path.basename(file_path)
                 self.operation_label.setText(f"Loaded: {file_name}")
+                self.asset_loaded.emit(file_path)
                 
                 if notify:
                     QMessageBox.information(

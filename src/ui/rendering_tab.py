@@ -669,6 +669,7 @@ class RenderingTab(QWidget):
     
     
     status_message = pyqtSignal(str)
+    asset_loaded = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
@@ -937,6 +938,7 @@ class RenderingTab(QWidget):
         """Load a model into the viewport."""
         self.model_path = model_path
         self.viewport.load_model(model_path)
+        self.asset_loaded.emit(model_path)
         self.status_message.emit(f"Loaded model: {os.path.basename(model_path)}")
         
     def on_material_updated(self, data):

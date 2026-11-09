@@ -595,6 +595,14 @@ class MainWindow(QMainWindow):
         self.library_tab.load_globally_requested.connect(self.load_model_globally)
         self.library_tab.model_selected.connect(self.asset_selection.select)
 
+        # Direct loads in a workspace are just as meaningful as Library hand-offs.
+        # Each pane emits only after it accepted the file; AssetSelection suppresses
+        # duplicates, so an inter-workspace hand-off cannot create a feedback loop.
+        for pane in (self.model_tab, self.point_clouds_tab, self.mesh_tools_tab,
+                     self.preprocessing_tab, self.postprocessing_tab,
+                     self.animation_tab, self.rendering_tab):
+            pane.asset_loaded.connect(self.asset_selection.select)
+
         # Point Clouds Tab connections
         self.point_clouds_tab.mesh_generated.connect(self.open_in_mesh_tools)
         self.point_clouds_tab.add_to_library_requested.connect(self.library_tab.add_model_to_library)

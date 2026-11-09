@@ -303,6 +303,10 @@ class ModelFormatConverter(QDialog):
 
 class ModelTab(QWidget):
     """Comprehensive model management tab using OpenGL viewer."""
+
+    # Lets the application retain the user's active asset even when it was opened
+    # from this pane rather than handed here by the Library.
+    asset_loaded = pyqtSignal(str)
     
     def __init__(self, parent=None, library_path=None):
         super().__init__(parent)
@@ -2430,6 +2434,7 @@ class ModelTab(QWidget):
                     self.painting_tab.set_model(file_path)
             except Exception as e:
                 logger.warning("Error updating features: %s", e)
+            self.asset_loaded.emit(file_path)
             return True
         else:
             self.operation_label.setText("Failed to load model")

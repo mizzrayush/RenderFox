@@ -685,6 +685,8 @@ class PropertyInspector(QWidget):
 
 class AnimationTab(QWidget):
     """The main Animation Tab widget."""
+
+    asset_loaded = pyqtSignal(str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1057,6 +1059,7 @@ class AnimationTab(QWidget):
         if hasattr(self.viewport, 'load_model'):
             success = self.viewport.load_model(path)
             if success:
+                self.asset_loaded.emit(path)
                 report = AnimationImporter.inspect(path)
                 if report.success:
                     clips = ', '.join(f"{clip.name} ({clip.channel_count} channels)"

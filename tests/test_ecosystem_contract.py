@@ -51,6 +51,26 @@ class EcosystemContract(unittest.TestCase):
             self.assertIn('asset_selection.select(file_path)', methods[name])
         self.assertTrue(os.path.isfile(path))
 
+    def test_direct_workspace_loads_also_publish_the_active_asset(self):
+        panes = {
+            'model_tab.py': 'ModelTab',
+            'point_clouds_tab.py': 'PointCloudsTab',
+            'mesh_tools_tab.py': 'MeshToolsTab',
+            'preprocessing_tab.py': 'PreProcessingTab',
+            'postprocessing_tab.py': 'PostProcessingTab',
+            'animation_tab.py': 'AnimationTab',
+            'rendering_tab.py': 'RenderingTab',
+        }
+        for filename, class_name in panes.items():
+            with open(os.path.join(ROOT, 'src', 'ui', filename), encoding='utf-8') as source_file:
+                source = source_file.read()
+            tree = ast.parse(source)
+            class_node = next(node for node in tree.body
+                              if isinstance(node, ast.ClassDef) and node.name == class_name)
+            self.assertIn('asset_loaded', ast.get_source_segment(source, class_node) or '')
+        with open(os.path.join(ROOT, 'src', 'ui', 'main_window.py'), encoding='utf-8') as source_file:
+            self.assertIn('pane.asset_loaded.connect(self.asset_selection.select)', source_file.read())
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

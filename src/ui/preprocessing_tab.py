@@ -316,6 +316,8 @@ class OptimizationThread(QThread):
 
 class PreProcessingTab(QWidget):
     """Enhanced pre-processing tab with model extraction, format conversion, and 3D preview."""
+
+    asset_loaded = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
@@ -467,6 +469,7 @@ class PreProcessingTab(QWidget):
         self.current_file = file_path
         self.file_path.setText(file_path)
         self.model_viewer.load_model(file_path)
+        self.asset_loaded.emit(file_path)
         self.toggle_lod_controls(self.enable_lod.isChecked())
         self._forget_previous_run()
         self._refresh_target_availability()

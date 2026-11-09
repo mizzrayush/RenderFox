@@ -177,6 +177,7 @@ class PointCloudsTab(QWidget):
 
     mesh_generated = pyqtSignal(str)
     add_to_library_requested = pyqtSignal(str)
+    asset_loaded = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1220,6 +1221,7 @@ class PointCloudsTab(QWidget):
 
         replaced = os.path.normcase(file_path) != os.path.normcase(self.current_model_path or '')
         self.current_model_path = file_path
+        self.asset_loaded.emit(file_path)
         if replaced:
             # A surface or a distance report describes the points it was made from, so a
             # different cloud retires them. The same file coming back - Reload, or a verb

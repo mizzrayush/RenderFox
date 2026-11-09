@@ -74,6 +74,7 @@ class PostProcessingTab(QWidget):
     
     processing_started = pyqtSignal()
     processing_completed = pyqtSignal(object)
+    asset_loaded = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
@@ -116,6 +117,7 @@ class PostProcessingTab(QWidget):
             self.update_file_info()
             self.update_preview_files()
             self.update_button_states()
+        self.asset_loaded.emit(file_path)
     
     def create_left_panel(self) -> QWidget:
         """Create the left control panel."""
