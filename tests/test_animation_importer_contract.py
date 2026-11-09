@@ -71,6 +71,15 @@ class AnimationImporterContract(unittest.TestCase):
         finally:
             tab.deleteLater()
 
+    def test_workspace_starts_without_fabricated_animation_tracks(self):
+        app = QApplication.instance() or QApplication([])
+        tab = AnimationTab()
+        try:
+            self.assertEqual([], tab.tracks)
+            self.assertIn('No animation loaded', tab.animation_asset_status.text())
+        finally:
+            tab.deleteLater()
+
     def _translation_fixture(self):
         path = os.path.join(self.work, 'workspace_translate.gltf')
         payload = struct.pack('<2f6f', 0.0, 2.0, 0.0, 0.0, 0.0, 8.0, 4.0, 2.0)

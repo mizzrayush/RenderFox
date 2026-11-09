@@ -705,7 +705,8 @@ class AnimationTab(QWidget):
         
         self.init_ui()
         self.setup_connections()
-        self.create_sample_data()
+        self.animation_asset_status.setText(
+            "No animation loaded. Load a model, import a clip, or key transform properties to begin.")
         
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -912,33 +913,6 @@ class AnimationTab(QWidget):
             # TODO: If we had a 3D viewport, we would update the actual object here too
             # e.g. scene.find_object(track.object_name).set_property(track.property_name, val)
 
-    def create_sample_data(self):
-        """Create some dummy tracks and keys for visualization."""
-        # Track 1: Position X
-        t1 = TrackData("Position X", "transform.position.x")
-        t1.keyframes.append(KeyframeData(0, 0.0))
-        t1.keyframes.append(KeyframeData(30, 10.0, EasingType.EASE_IN_OUT))
-        t1.keyframes.append(KeyframeData(60, 0.0))
-        self.add_track(t1)
-        
-        # Track 2: Rotation Y
-        t2 = TrackData("Rotation Y", "transform.rotation.y")
-        t2.keyframes.append(KeyframeData(0, 0.0))
-        t2.keyframes.append(KeyframeData(90, 360.0))
-        self.add_track(t2)
-        
-        # Track 3: Scale
-        t3 = TrackData("Scale Uniform", "transform.scale")
-        t3.keyframes.append(KeyframeData(15, 1.0))
-        t3.keyframes.append(KeyframeData(45, 1.5))
-        t3.keyframes.append(KeyframeData(75, 1.0))
-        self.add_track(t3)
-        
-        # Track 4: Audio (Sample)
-        # Note: File path needs to be valid for actual playback, but this visualizes it
-        t4 = AudioTrack("Background Music", "C:/Windows/Media/chimes.wav", start_frame=10)
-        self.add_track(t4)
-        
     def add_track(self, track_data: TrackData):
         """Add a track to the UI."""
         self.tracks.append(track_data)
