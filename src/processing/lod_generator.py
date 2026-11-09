@@ -243,8 +243,7 @@ class LODGenerator:
         Good for very low poly LODs.
         """
         try:
-            if not self.settings.use_vertex_clustering:
-                return self._quadric_simplify(mesh, target_faces)
+            # Vertex clustering requested for this pass
             
             # Ensure target_faces is valid
             target_faces = max(4, min(target_faces, len(mesh.faces)))

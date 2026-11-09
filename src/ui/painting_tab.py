@@ -294,10 +294,16 @@ class PaintingTab(QWidget):
             self.viewer.update()
             
     def update_brush_settings(self):
-        """Update brush settings in the viewer (to be implemented)."""
-        size = self.brush_size_slider.value()
-        strength = self.brush_strength_slider.value() / 100.0
-        mode = self.brush_mode_combo.currentText()
+        """Update brush settings on the tab and viewer."""
+        self.brush_size = self.brush_size_slider.value()
+        self.brush_strength = self.brush_strength_slider.value() / 100.0
+        self.brush_mode = self.brush_mode_combo.currentText()
+        if hasattr(self.viewer, 'brush_size'):
+            self.viewer.brush_size = self.brush_size
+        if hasattr(self.viewer, 'brush_strength'):
+            self.viewer.brush_strength = self.brush_strength
+        if hasattr(self.viewer, 'brush_mode'):
+            self.viewer.brush_mode = self.brush_mode
 
     def perform_painting(self, pos):
         # Get settings

@@ -54,6 +54,12 @@ class ShaderNode:
             node.inputs.append(NodeSocket("Base Color", "vec3", [0.8, 0.8, 0.8]))
             node.inputs.append(NodeSocket("Metallic", "float", 0.0))
             node.inputs.append(NodeSocket("Roughness", "float", 0.5))
+            node.inputs.append(NodeSocket("IOR", "float", 1.45))
+            node.inputs.append(NodeSocket("Specular", "float", 0.5))
+            node.inputs.append(NodeSocket("Transmission", "float", 0.0))
+            node.inputs.append(NodeSocket("Emission", "vec3", [0.0, 0.0, 0.0]))
+            node.inputs.append(NodeSocket("Emission Strength", "float", 1.0))
+            node.inputs.append(NodeSocket("Alpha", "float", 1.0))
             node.inputs.append(NodeSocket("Normal", "vec3", [0.0, 0.0, 1.0]))
             node.outputs.append(NodeSocket("BSDF", "shader", is_output=True))
             

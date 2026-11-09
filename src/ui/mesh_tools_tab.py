@@ -3,6 +3,7 @@ Mesh Tools tab for PyMeshLab-based advanced mesh processing.
 """
 
 import os
+import numpy as np
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter, 
                              QPushButton, QComboBox, QLabel, QGroupBox, QFormLayout, 
                              QSpinBox, QDoubleSpinBox, QSlider, QTabWidget, QCheckBox,
@@ -1895,8 +1896,13 @@ Colors: {'Yes' if stats.has_colors else 'No'}"""
         self.info_edges.setText(f"{len(self.current_mesh.edges):,}")
         
         # Check properties if available
-        is_watertight = getattr(self.current_mesh, 'is_watertight', False)
-        is_manifold = getattr(self.current_mesh, 'is_winding_consistent', False)
+        is_watertight = bool(getattr(self.current_mesh, 'is_watertight', False))
+        if is_watertight:
+            is_manifold = True
+        elif hasattr(self.current_mesh, 'edges_unique_inverse') and len(self.current_mesh.edges_unique_inverse) > 0:
+            is_manifold = bool(np.all(np.bincount(self.current_mesh.edges_unique_inverse) <= 2))
+        else:
+            is_manifold = bool(getattr(self.current_mesh, 'is_winding_consistent', False))
         
         self.info_watertight.setText("Yes" if is_watertight else "No")
         self.info_manifold.setText("Yes" if is_manifold else "No")

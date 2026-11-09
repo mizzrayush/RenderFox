@@ -950,9 +950,15 @@ class LibraryManager(QObject):
         """Create a high quality shaded 3D visual thumbnail."""
         try:
             base = os.path.splitext(os.path.basename(model_path))[0]
-            thumb_path = os.path.join(self.thumbs_dir, f"{base}.png")
+            norm_path = os.path.normcase(os.path.abspath(model_path))
+            path_hash = hashlib.sha256(norm_path.encode('utf-8', errors='replace')).hexdigest()[:12]
+            thumb_path = os.path.join(self.thumbs_dir, f"{base}_{path_hash}.png")
             
-            if force or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
+            model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else 0.0
+            thumb_mtime = os.path.getmtime(thumb_path) if os.path.exists(thumb_path) else 0.0
+            is_stale = os.path.exists(thumb_path) and (model_mtime > thumb_mtime)
+            
+            if force or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0 or is_stale:
                 try:
                     from src.utils.thumbnail_renderer import generate_3d_thumbnail
                     outcome = generate_3d_thumbnail(model_path, thumb_path, size=256) or {}

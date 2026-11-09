@@ -119,8 +119,13 @@ class MeshAnalyzer:
             faces = len(mesh.faces) if hasattr(mesh, 'faces') else 0
             edges = len(mesh.edges) if hasattr(mesh, 'edges') else 0
             
-            is_watertight = mesh.is_watertight if hasattr(mesh, 'is_watertight') else False
-            is_manifold = mesh.is_winding_consistent if hasattr(mesh, 'is_winding_consistent') else False
+            is_watertight = bool(mesh.is_watertight) if hasattr(mesh, 'is_watertight') else False
+            if is_watertight:
+                is_manifold = True
+            elif hasattr(mesh, 'edges_unique_inverse') and len(mesh.edges_unique_inverse) > 0:
+                is_manifold = bool(np.all(np.bincount(mesh.edges_unique_inverse) <= 2))
+            else:
+                is_manifold = bool(mesh.is_winding_consistent) if hasattr(mesh, 'is_winding_consistent') else False
             
             volume = float(mesh.volume) if hasattr(mesh, 'volume') else 0.0
             surface_area = float(mesh.area) if hasattr(mesh, 'area') else 0.0
