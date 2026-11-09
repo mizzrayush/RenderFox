@@ -16,6 +16,7 @@ from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
+import queue
 import schedule
 import uuid
 
@@ -1454,6 +1455,12 @@ class WorkflowExecutor:
         return success
 
 
+# The most files one batch will work on at once. The pane's thread box is deliberately
+# wider than this so a typed extreme is accepted there and capped here - the runner is the
+# real bound, not the widget, and an out-of-range number is made safe rather than clamped away.
+MAX_BATCH_WORKERS = 16
+
+
 class BatchProcessor(QObject):
     """Run one action over a list of items, and stop or pause when it is asked to.
 
@@ -1461,6 +1468,12 @@ class BatchProcessor(QObject):
     success whenever the callable came back without raising, and registry actions answer
     `{'success': False, 'error': ...}` instead of raising - so a batch in which every
     file failed reported every file as processed, and the pane printed the total.
+
+    `workers` chooses how many files run at once. One worker is the plain sequential loop;
+    more than one feeds that many threads from a single queue, each taking its own item -
+    never two threads over one loaded model, because the mesh loaders are not reentrant.
+    Either way a pause or a stop only bites between items, and the results come back in the
+    order the files were given.
     """
 
     progress_updated = pyqtSignal(int, int, str)  # current, total, the item about to run
@@ -1493,15 +1506,20 @@ class BatchProcessor(QObject):
             time.sleep(0.05)
 
     def process_batch(self, items: List[Any], operation: Callable,
-                     progress_callback: Optional[Callable] = None) -> List[Dict[str, Any]]:
+                     progress_callback: Optional[Callable] = None,
+                     workers: int = 1) -> List[Dict[str, Any]]:
         """Every item through `operation`, then one summary that tells the truth about it.
 
         A pause or a stop only bites between items. An action that already started - a
         copy halfway through, a command still running - finishes first, because pulling
-        the rug out from under those is how a file gets left half-written.
+        the rug out from under those is how a file gets left half-written. `workers` over
+        one runs that many files at once through `_run_parallel`; the sequential loop below
+        is the one-worker path, and walks an empty list when the parallel runner has already
+        filled the results.
         """
         items = list(items or [])
         total = len(items)
+        effective = self._effective_workers(workers, total)
         results: List[Dict[str, Any]] = []
         self.is_processing = True
         self._stop = False
@@ -1509,7 +1527,12 @@ class BatchProcessor(QObject):
         self.current_batch = {'total': total, 'done': 0, 'item': None,
                                 'started_at': time.time()}
         try:
-            for index, item in enumerate(items):
+            if effective > 1:
+                self._run_parallel(items, operation, progress_callback, effective, results)
+                sequential_items = []
+            else:
+                sequential_items = items
+            for index, item in enumerate(sequential_items):
                 self._hold()
                 if self._stop:
                     break
@@ -1532,7 +1555,7 @@ class BatchProcessor(QObject):
                     progress_callback(index + 1, total, item)
         finally:
             ran = len(results)
-            summary = {'results': results, 'total': total, 'ran': ran,
+            summary = {'results': results, 'total': total, 'ran': ran, 'workers': effective,
                        'succeeded': sum(1 for one in results if one['success']),
                        'failed': sum(1 for one in results if not one['success']),
                        'not_run': total - ran, 'stopped': ran < total}
@@ -1548,6 +1571,88 @@ class BatchProcessor(QObject):
             self._stop = False
             self._pause = False
         return results
+
+    @staticmethod
+    def _effective_workers(workers: Any, total: int) -> int:
+        """How many files to run at once: at least one, never past the cap or the list.
+
+        A typed extreme is capped here rather than refused, and a zero or a nonsense value
+        falls back to the sequential path. Capping by `total` keeps the count the summary
+        names honest - three files cannot keep four workers busy.
+        """
+        try:
+            asked = int(workers)
+        except (TypeError, ValueError):
+            asked = 1
+        return max(1, min(asked, MAX_BATCH_WORKERS, total or 1))
+
+    @staticmethod
+    def _judge(item: Any, operation: Callable) -> Dict[str, Any]:
+        """One item's verdict, judged exactly as the sequential loop judges it."""
+        try:
+            outcome = operation(item)
+        except Exception as error:
+            return {'item': item, 'success': False, 'error': str(error)}
+        if isinstance(outcome, dict) and outcome.get('success') is False:
+            return {'item': item, 'success': False,
+                    'error': str(outcome.get('error') or
+                                 'the action said no and gave no reason')}
+        return {'item': item, 'success': True, 'result': outcome}
+
+    def _run_parallel(self, items: List[Any], operation: Callable,
+                      progress_callback: Optional[Callable], workers: int,
+                      results: List[Dict[str, Any]]):
+        """Feed `workers` threads from one queue and collect their verdicts in input order.
+
+        Each worker takes its own item, so no two threads share one loaded model. Results
+        land in index-keyed slots under a lock and are read out in the order the files were
+        given, whichever worker finishes first. The threads are joined before this returns,
+        so the caller's summary counts a settled run.
+        """
+        total = len(items)
+        work: queue.Queue = queue.Queue()
+        for index, item in enumerate(items):
+            work.put((index, item))
+        state = {'work': work, 'operation': operation, 'total': total,
+                 'progress_callback': progress_callback, 'slots': [None] * total,
+                 'lock': threading.Lock(), 'done': 0}
+        threads = [threading.Thread(target=self._parallel_worker, args=(state,),
+                                    daemon=True, name='_batch_worker')
+                   for _ in range(workers)]
+        for one in threads:
+            one.start()
+        for one in threads:
+            one.join()
+        results.extend(one for one in state['slots'] if one is not None)
+
+    def _parallel_worker(self, state: Dict[str, Any]):
+        """Take items off the queue until it is empty or the run is asked to stop.
+
+        Pause and stop are read before the next item is taken, so a file already in hand
+        finishes - the same boundary the sequential loop keeps.
+        """
+        work = state['work']
+        operation = state['operation']
+        total = state['total']
+        while True:
+            self._hold()
+            if self._stop:
+                return
+            try:
+                index, item = work.get_nowait()
+            except queue.Empty:
+                return
+            record = self._judge(item, operation)
+            with state['lock']:
+                state['slots'][index] = record
+                state['done'] += 1
+                count = state['done']
+                self.current_batch['done'] = count
+                self.current_batch['item'] = str(item)
+            self.progress_updated.emit(count, total, str(item))
+            if state['progress_callback']:
+                state['progress_callback'](count, total, item)
+            work.task_done()
 
 
 class ConditionEvaluator:
@@ -2064,11 +2169,13 @@ class AutomationEngine(QObject):
         return thread
 
     def batch_process(self, items: List[Any], operation: Callable,
-                     progress_callback: Optional[Callable] = None) -> List[Dict[str, Any]]:
+                     progress_callback: Optional[Callable] = None,
+                     workers: int = 1) -> List[Dict[str, Any]]:
         """Process items in batch."""
-        return self.batch_processor.process_batch(items, operation, progress_callback)
+        return self.batch_processor.process_batch(items, operation, progress_callback,
+                                                  workers=workers)
     
-    def run_batch(self, items: List[Any], operation: Callable) -> bool:
+    def run_batch(self, items: List[Any], operation: Callable, workers: int = 1) -> bool:
         """Repeat one action over many files on a worker thread; its signals tell the tale.
 
         The processor is claimed here rather than on the thread, because the click that
@@ -2077,13 +2184,13 @@ class AutomationEngine(QObject):
         if self.batch_processor.is_processing or not items:
             return False
         self.batch_processor.is_processing = True
-        self._spawn(self._run_batch, (list(items), operation))
+        self._spawn(self._run_batch, (list(items), operation, workers))
         return True
 
-    def _run_batch(self, items: List[Any], operation: Callable):
+    def _run_batch(self, items: List[Any], operation: Callable, workers: int = 1):
         """The worker's whole job: run the batch, and never leave it claimed."""
         try:
-            ran = self.batch_processor.process_batch(items, operation)
+            ran = self.batch_processor.process_batch(items, operation, workers=workers)
             self._note_finished(bool(ran) and len(ran) == len(items)
                                 and all(one['success'] for one in ran))
         finally:

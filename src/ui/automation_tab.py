@@ -358,9 +358,20 @@ class AutomationTab(QWidget):
         controls_layout.addWidget(self.overwrite_cb, 6, 0, 1, 4)
         controls_layout.addWidget(self.backup_cb, 7, 0, 1, 4)
 
+        self.parallel_processing_cb = QCheckBox("Parallel Processing")
+        self.parallel_processing_cb.setChecked(True)
+        controls_layout.addWidget(self.parallel_processing_cb, 8, 0, 1, 2)
+        controls_layout.addWidget(QLabel("Max Threads:"), 8, 2)
+        self.max_threads_spin = QSpinBox()
+        # Wide on purpose: a typed extreme is accepted here and capped by the runner
+        # (MAX_BATCH_WORKERS), not clamped away by the widget. Off makes the box inert.
+        self.max_threads_spin.setRange(1, 4096)
+        self.max_threads_spin.setValue(4)
+        controls_layout.addWidget(self.max_threads_spin, 8, 3)
+
         self.batch_hint_label = QLabel()
         self.batch_hint_label.setWordWrap(True)
-        controls_layout.addWidget(self.batch_hint_label, 8, 0, 1, 4)
+        controls_layout.addWidget(self.batch_hint_label, 9, 0, 1, 4)
 
         self.controls_group.setLayout(controls_layout)
         layout.addWidget(self.controls_group)
@@ -1136,6 +1147,8 @@ class AutomationTab(QWidget):
         self.pause_batch_btn.clicked.connect(self.toggle_batch_pause)
         self.stop_batch_btn.clicked.connect(self.stop_batch_operation)
         self.preview_batch_btn.clicked.connect(self.preview_batch)
+        self.parallel_processing_cb.toggled.connect(self.max_threads_spin.setEnabled)
+        self.max_threads_spin.setEnabled(self.parallel_processing_cb.isChecked())
         self.refresh_processes_btn.clicked.connect(self.rebuild_process_table)
         self.kill_process_btn.clicked.connect(self.kill_process)
         self.process_details_btn.clicked.connect(self.show_process_details)
@@ -2124,7 +2137,8 @@ class AutomationTab(QWidget):
         items = [item for item, _ in plan['ready']]
         operation = self._batch_operation(plan['action'], plan['output_dir'],
                                           plan['params'], plan['switches'])
-        if not self.automation_engine.run_batch(items, operation):
+        workers = self.max_threads_spin.value() if self.parallel_processing_cb.isChecked() else 1
+        if not self.automation_engine.run_batch(items, operation, workers=workers):
             self.batch_status_label.setText('A batch is already running.')
             QMessageBox.warning(self, 'Batch',
                                 'a batch is already running - wait for it, or stop it first')
@@ -2199,6 +2213,9 @@ class AutomationTab(QWidget):
             head = 'Ran nothing - there were no files to work on'
         else:
             head = f'Finished {total} file(s): {succeeded} ok, {failed} failed'
+        workers = summary.get('workers', 1)
+        if workers > 1:
+            head = f'{head} ({workers} workers)'
         self.batch_status_label.setText(head)
         self.batch_log.appendPlainText('\n'.join(lines) + ('\n' if lines else '') + head)
         if total - ran:

@@ -1,8 +1,8 @@
 # What's next
 
-Written 2026-11-08 on `main` at `5853054`, the commit before Phase 15b-1. 15b-1 (Preserve Materials)
-is finished on this tree and lands in the same commit that carries this file, so read the first
-section as "what this commit does", not as "what is still uncommitted". This file is the handover: what is true right now, what runs next,
+Written 2026-11-09 on `main`, updated as Phase 15b-2 lands. 15b-2 (Parallel Processing) is finished
+on this tree and lands in the same commit that carries this file, so read the first section as
+"what this commit does", not as "what is still uncommitted". This file is the handover: what is true right now, what runs next,
 in what order, and how each step gets proven. Read it together with `REPAIR_LOG.md`, which holds
 the evidence for every claim this file makes about the past.
 
@@ -12,16 +12,26 @@ the evidence for every claim this file makes about the past.
   `ActionRegistry.param_form(action_id)` - one typed field per parameter the batch cannot fill for
   itself, each caption naming the default the action's own signature carries, and an untouched form
   sends nothing at all so the action's default is what runs.
-- **Phase 15b-1** (this tree): `preserve_materials` is a real switch. It changes the call
+- **Phase 15b-1** (committed): `preserve_materials` is a real switch. It changes the call
   (`FormatConverter` scene route: `write_scene(scene)` vs `write_scene(without_materials(scene))`),
   and the run reports what the written file still holds by reading the container back - material,
   image and texture-coordinate records off the bytes, not the filter's claim. The registry owns the
   control's words (`"label": "Preserve Materials"`), the pane draws that label and keeps the
   parameter name in the tooltip, and a default-on checkbox is read against its recorded default, so
   "off" is sayable while "nothing moved means nothing sent" still holds.
-- **Debt list status** (`REPAIR_LOG.md:187-191`): item 6 closed by 15a, item 4 closed by 15b-1.
-  Still owed: item 5 (Parallel Processing - the next commit), item 2 (Samples) and item 3 (MP4) in
-  #67, item 1 (Focus Selected) in #68.
+- **Phase 15b-2** (this tree): `Parallel Processing` and `Max Threads` are back on the Batch pane
+  (`automation_tab.py:361`, `:365`) and reach a real runner. `BatchProcessor.process_batch` gained a
+  `workers` argument (`src/features/automation_engine.py:1510`): `workers=1` keeps the exact
+  sequential loop, `workers>1` runs the same operation on that many queue-fed threads over a
+  lock-guarded, index-keyed result list - not a pool over a shared mesh, each worker loads its own
+  model. Pause and stop bite only at item boundaries, `progress_updated` still emits per item, the
+  runner caps at `MAX_BATCH_WORKERS = 16` (`:1461`) and by item count so a typed extreme is the
+  runner's problem not the widget's, and the status line appends `(N workers)` only when more than
+  one ran. The box is a typable `QSpinBox(1..4096)` (`:368`), inert when the switch is off. Measured
+  3.96x on a wait-bound batch (1 worker 2.007 s vs 4 workers 0.507 s), identical in-order results.
+- **Debt list status** (`REPAIR_LOG.md:187-191`): item 6 closed by 15a, item 4 closed by 15b-1,
+  item 5 closed by 15b-2. Still owed: item 2 (Samples) and item 3 (MP4) in #67, item 1 (Focus
+  Selected) in #68.
 
 ## Rules that bind every step below
 
@@ -43,38 +53,7 @@ the evidence for every claim this file makes about the past.
 
 ## The queue, in order
 
-### Next commit - 15b-2: "Parallel Processing" and "Max Threads" come back with a runner (#66)
-
-Baseline `automation_tab.py:372-383` held both controls; `test_41_no_invented_operation_or_source_names_are_left_in_the_code`
-(`tests/test_automation_batch_contract.py:747`) currently *requires* `parallel_processing_cb` and
-`max_threads_spin` to be absent from the batch pane, because they were deleted as controls that
-reached nothing. So this step is: write the runner, restore the two controls, and move `test_41`'
-ghost list to match - remove those two names from it (leave `target_format_combo`,
-`batch_progress_value`, `batch_timer` and the invented operation names) and add the tests below.
-
-- Backend: `BatchProcessor.process_batch` (`src/features/automation_engine.py:1495`) is a plain
-  `for` loop over items with `_hold()` and `_stop` checked between them. Give it a `workers`
-  argument: `workers=1` keeps that exact path, and `workers>1` runs the same `operation` on that
-  many queue-fed workers over a shared result list. Pause and stop must bite at *item boundaries*
-  only - a file halfway through gets finished, because pulling the rug is how half-written files
-  happen - and `progress_updated` must still emit per item with the right `current`/`total`.
-- Design constraint from the debt list (item 5): concurrency through the one `BatchProcessor` and
-  the one job queue (invariant 4), **not** a `ThreadPoolExecutor` over a shared mesh. The mesh
-  loaders are not reentrant, so each worker takes its own loaded model; nothing shares one
-  `MeshSets`.
-- Pane: `Parallel Processing` starts on (matching baseline), `Max Threads` is a `QSpinBox(1..16)`
-  default 4 **with a typable value box that accepts out-of-range values** - the runner is the real
-  cap, not the widget. Off means `workers=1` and the box is said to be inert.
-- Proven by: a measured speedup or an honest "no faster here" verdict from a real batch, the same
-  results list and the same ok/failed counts at 1, 2 and 4 workers, stop mid-run leaving exactly
-  the in-hand items finished and the rest never started, pause holding and releasing, and the
-  status line naming how many workers ran. Mutation entries for: `workers` ignored, results
-  appended out of order without a lock, pause checked only in the sequential path, the checkbox
-  not reaching the call.
-- Do not touch the "Replace a file already in the output folder" / "Include subfolders" semantics
-  or the 15a form to make this fit.
-
-### Then #67 (15c): "Samples" and "MP4 (H.264)" get real backends
+### Next commit - #67 (15c): "Samples" and "MP4 (H.264)" get real backends
 
 - **Samples** (debt item 2): `src/core/models.py:182` already carries `samples: int = 128` on
   `RenderSettings`, and nothing in the UI can set it. Put a `QSpinBox(1..4096)` with a typable
@@ -123,11 +102,11 @@ invariant suite exists.
 
 | Command | What it proves | Measured cost |
 |---|---|---|
-| `python -X utf8 tests/test_automation_batch_contract.py` | the Batch pane + registry contract | 127 tests, 31.9 s |
+| `python -X utf8 tests/test_automation_batch_contract.py` | the Batch pane + registry contract | 139 tests, 53.4 s |
 | `python -X utf8 tests/test_format_converter_contract.py` | conversions, the capability table, what written files hold | 32 tests, 7.4 s |
-| `python -X utf8 tools/mutation_check.py tests/test_automation_batch_contract.py tools/mutations_automation_batch.py` | the batch pane cannot drift | 104 entries |
+| `python -X utf8 tools/mutation_check.py tests/test_automation_batch_contract.py tools/mutations_automation_batch.py` | the batch pane cannot drift | 113 entries |
 | `python -X utf8 tools/mutation_check.py tests/test_format_converter_contract.py tools/mutations_format_converter.py` | the converter cannot drift | 16 entries |
-| `python -X utf8 tools/check_mutations_absent.py` | no planted defect is left in the tree | 25 lists / 945 files |
+| `python -X utf8 tools/check_mutations_absent.py` | no planted defect is left in the tree | 25 lists / 954 files |
 | `python -X utf8 tools/check_unreachable_code.py`, `tools/check_names_bound.py` | no dead branch, no used-before-assignment | seconds |
 | `python -X utf8 run_audit.py` | the whole product | 42 suites, ~800 s; **exit 0 only at 42/42** (`run_audit.py:414`) |
 
@@ -149,7 +128,7 @@ re-verified with `check_mutations_absent.py` before anything is committed.
 - `src/processing/preview_render.py` window refusal is closed (Phase 6i-4, `5853054`), but a
   chain-only Open3D window refusal still reads as a machine condition; if audit 15 fails on
   `'NoneType' object has no attribute 'light_on'` again, reproduce it standalone before believing it.
-- Item 1-3 and 5 of the debt list, by the queue above.
+- Item 1-3 of the debt list, by the queue above.
 
 ## Close-out checklist, every commit
 

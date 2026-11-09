@@ -53,7 +53,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QFileDialo
 
 from src.features import automation_engine as engine_module
 from src.features.automation_engine import (
-    ActionRegistry, AutomationEngine, BatchProcessor)
+    ActionRegistry, AutomationEngine, BatchProcessor, MAX_BATCH_WORKERS)
 from src.ui.automation_tab import BACKUP_SUBFOLDER, AutomationTab
 
 APP = QApplication.instance() or QApplication([])
@@ -423,6 +423,117 @@ class ProcessorCase(DirCase):
         self.assertIsNone(self.processor.current_batch)
         self.assertFalse(self.processor.is_paused)
 
+    # --- more than one worker (15b-2) ------------------------------------------
+    def test_126_the_same_files_give_the_same_verdicts_at_one_two_and_four_workers(self):
+        def half(item):
+            return {'success': item.endswith('a.obj'), 'result': item}
+
+        for workers in (1, 2, 4):
+            self.processor.process_batch(self.items, half, workers=workers)
+            summary = self.summaries[-1]
+            self.assertEqual([(one['item'], one['success']) for one in summary['results']],
+                             [('a.obj', True), ('b.obj', False), ('c.obj', False)],
+                             f'workers={workers} reordered or misjudged the files')
+            self.assertEqual((summary['ran'], summary['succeeded'], summary['failed'],
+                              summary['not_run'], summary['stopped']),
+                             (3, 1, 2, 0, False), summary)
+
+    def test_127_four_workers_really_run_four_files_at_once(self):
+        """The speedup is concurrency, proved without a flaky clock: four files can only
+        clear a four-party barrier if four workers are inside the action together."""
+        ready = threading.Barrier(4, timeout=5)
+
+        def together(item):
+            ready.wait()
+            return {'success': True}
+
+        self.processor.process_batch(['a.obj', 'b.obj', 'c.obj', 'd.obj'], together, workers=4)
+        summary = self.summaries[-1]
+        self.assertEqual(summary['succeeded'], 4, summary)
+        self.assertEqual(summary['workers'], 4, summary)
+
+    def test_128_the_runner_caps_the_workers_it_was_asked_for(self):
+        items = [f'f{i}.obj' for i in range(20)]
+        self.processor.process_batch(items, lambda item: {'success': True}, workers=100)
+        summary = self.summaries[-1]
+        self.assertEqual(summary['workers'], MAX_BATCH_WORKERS, summary)
+        self.assertEqual(summary['succeeded'], 20, summary)
+
+    def test_129_a_parallel_stop_finishes_the_files_in_hand_and_starts_no_more(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        started = []
+        lock = threading.Lock()
+
+        def slow(item):
+            with lock:
+                started.append(item)
+            gate.wait(5)
+            return {'success': True}
+
+        thread = threading.Thread(target=self.processor.process_batch,
+                                  args=(self.items, slow), kwargs={'workers': 2}, daemon=True)
+        thread.start()
+        deadline = time.time() + 5
+        while len(started) < 2 and time.time() < deadline:
+            APP.processEvents()
+            time.sleep(0.02)
+        self.assertEqual(len(started), 2, 'two workers never both got a file')
+        self.processor.request_stop()
+        gate.set()
+        thread.join(10)
+        APP.processEvents()
+        summary = self.summaries[-1]
+        self.assertEqual(summary['ran'], 2, summary)
+        self.assertEqual(summary['not_run'], 1, summary)
+        self.assertTrue(summary['stopped'], summary)
+        self.assertEqual(sorted(started), ['a.obj', 'b.obj'])
+
+    def test_130_a_parallel_pause_holds_at_the_boundary_and_resumes(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        started = []
+        lock = threading.Lock()
+
+        def slow(item):
+            with lock:
+                started.append(item)
+            gate.wait(5)
+            return {'success': True}
+
+        thread = threading.Thread(target=self.processor.process_batch,
+                                  args=(self.items, slow), kwargs={'workers': 2}, daemon=True)
+        thread.start()
+        deadline = time.time() + 5
+        while len(started) < 2 and time.time() < deadline:
+            APP.processEvents()
+            time.sleep(0.02)
+        self.assertEqual(len(started), 2, 'two workers never both got a file')
+        self.processor.set_paused(True)
+        gate.set()
+        time.sleep(0.4)
+        APP.processEvents()
+        self.assertEqual(len(started), 2, 'a paused parallel batch started another file')
+        self.assertTrue(self.processor.is_paused)
+        self.processor.set_paused(False)
+        thread.join(10)
+        APP.processEvents()
+        self.assertEqual(sorted(started), ['a.obj', 'b.obj', 'c.obj'])
+        self.assertFalse(self.summaries[-1]['stopped'])
+
+    def test_131_one_worker_keeps_the_sequential_progress_story(self):
+        self.processor.process_batch(self.items, lambda item: None, workers=1)
+        self.assertEqual(self.progress, [(1, 3, 'a.obj'), (2, 3, 'b.obj'), (3, 3, 'c.obj')])
+        self.assertEqual(self.summaries[-1]['workers'], 1)
+
+    def test_132_a_typable_extreme_is_capped_and_a_zero_falls_back_to_one(self):
+        items = [f'f{i}.obj' for i in range(20)]
+        for asked, want in ((0, 1), (-3, 1), (100000, MAX_BATCH_WORKERS), (4, 4)):
+            self.processor.process_batch(items, lambda item: {'success': True}, workers=asked)
+            summary = self.summaries[-1]
+            self.assertEqual(summary['workers'], want, (asked, summary))
+            self.assertEqual(summary['succeeded'], 20, summary)
+
 
 class EngineRunCase(DirCase):
     """The engine owns the thread; the pane only reports what its signals say."""
@@ -520,6 +631,19 @@ class EngineRunCase(DirCase):
             ['a.obj', 'b.obj'], lambda item: {'success': False, 'error': 'nope'})
         self.assertEqual([one['success'] for one in results], [False, False])
 
+    def test_133_run_batch_carries_the_worker_count_into_the_verdict(self):
+        self.assertTrue(self.engine.run_batch(['a.obj', 'b.obj', 'c.obj', 'd.obj'],
+                                              lambda item: {'success': True}, workers=2))
+        self.assertTrue(self.wait(lambda: len(self.finished) == 1), 'no completion arrived')
+        self.assertEqual(self.finished[-1]['workers'], 2)
+        self.assertEqual(self.finished[-1]['succeeded'], 4)
+
+    def test_134_the_plain_python_door_runs_parallel_and_judges_the_same(self):
+        results = self.engine.batch_process(
+            ['a.obj', 'b.obj', 'c.obj', 'd.obj'],
+            lambda item: {'success': False, 'error': 'nope'}, workers=2)
+        self.assertEqual([one['success'] for one in results], [False, False, False, False])
+
 
 class PaneCase(DirCase):
     """The Batch tab the user clicks, over a real folder of real files."""
@@ -593,7 +717,7 @@ class PaneCase(DirCase):
 
     def configure(self, operation='file.copy', folder=None,
                   output=None, params=None, kinds=None, recursive=None,
-                  overwrite=None, backup=None, library=False):
+                  overwrite=None, backup=None, library=False, parallel=False, threads=None):
         self.tab.source_type_combo.setCurrentText('Model Library' if library else 'Folder')
         if operation:
             self.pick(self.tab.operation_combo, operation)
@@ -611,6 +735,9 @@ class PaneCase(DirCase):
             self.tab.overwrite_cb.setChecked(overwrite)
         if backup is not None:
             self.tab.backup_cb.setChecked(backup)
+        self.tab.parallel_processing_cb.setChecked(bool(parallel))
+        if threads is not None:
+            self.tab.max_threads_spin.setValue(int(threads))
         self.tab._update_batch_controls()
 
     def ready_folder(self, *names, **kw):
@@ -748,8 +875,7 @@ class PaneCase(DirCase):
         for ghost in ('Format Conversion', 'Texture Optimization', 'Metadata Extraction',
                       'Thumbnail Generation', 'Quality Analysis', 'Custom Script',
                       'Selected Models', 'Search Results', 'File List', 'Model Validation',
-                      'parallel_processing_cb', 'max_threads_spin', 'target_format_combo',
-                      'batch_progress_value', 'batch_timer'):
+                      'target_format_combo', 'batch_progress_value', 'batch_timer'):
             self.assertNotIn(ghost, self.batch_source(), ghost)
 
     # --- which files a source gives up -----------------------------------------
@@ -1084,6 +1210,34 @@ class PaneCase(DirCase):
         self.tab.pause_batch_btn.setEnabled(True)
         self.tab.toggle_batch_pause()
         self.assertEqual(self.tab.batch_status_label.text(), 'Nothing is running to pause.')
+
+    # --- parallel processing and max threads (15b-2) ---------------------------
+    def test_135_the_pane_opens_with_parallel_on_and_four_threads(self):
+        self.assertTrue(self.tab.parallel_processing_cb.isChecked())
+        self.assertEqual(self.tab.max_threads_spin.value(), 4)
+        self.assertTrue(self.tab.max_threads_spin.isEnabled())
+
+    def test_136_turning_parallel_off_makes_the_thread_box_inert_and_runs_one_worker(self):
+        self.ready_folder('a.obj', 'b.obj')
+        self.tab.parallel_processing_cb.setChecked(False)
+        self.assertFalse(self.tab.max_threads_spin.isEnabled())
+        self.tab.start_batch_btn.click()
+        self.settle()
+        self.assertEqual(self.tab.batch_status_label.text(),
+                         'Finished 2 file(s): 2 ok, 0 failed')
+
+    def test_137_a_parallel_run_names_its_workers_and_starts_files_together(self):
+        started, gate = self.slow_probe()
+        self.ready_folder('a.obj', 'b.obj', 'c.obj', 'd.obj', operation='probe.slow',
+                          output=None, parallel=True, threads=4)
+        self.assertTrue(self.tab.max_threads_spin.isEnabled())
+        self.tab.start_batch_btn.click()
+        self.assertTrue(self.spin(lambda: len(started) == 4),
+                        'four workers never all got a file at once')
+        gate.set()
+        self.settle()
+        self.assertEqual(self.tab.batch_status_label.text(),
+                         'Finished 4 file(s): 4 ok, 0 failed (4 workers)')
 
     # --- the plumbing that made the old pane unable to report anything ----------
     def test_73_the_pane_listens_to_the_processor_that_actually_runs(self):
