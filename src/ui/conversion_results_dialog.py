@@ -269,8 +269,8 @@ class ConversionResultsDialog(QDialog):
         success_layout = QVBoxLayout(success_group)
         
         success_table = QTableWidget()
-        success_table.setColumnCount(3)
-        success_table.setHorizontalHeaderLabels(["Input File", "Output File", "Method"])
+        success_table.setColumnCount(4)
+        success_table.setHorizontalHeaderLabels(["Input File", "Output File", "Method", "Coverage Read Back"])
         
         # Populate successful files
         successful_files = self.results.get('successful', [])
@@ -293,12 +293,24 @@ class ConversionResultsDialog(QDialog):
             method = item.get('method', 'Unknown')
             method_item = QTableWidgetItem(method)
             success_table.setItem(row, 2, method_item)
+
+            coverage = item.get('coverage')
+            if coverage is None:
+                text = "No container coverage available"
+            else:
+                retained = ', '.join(coverage.get('retained') or []) or 'no source fields retained'
+                missing = ', '.join(coverage.get('not_retained') or [])
+                text = f"Retained: {retained}" + (f"; not retained: {missing}" if missing else '')
+            coverage_item = QTableWidgetItem(text)
+            coverage_item.setToolTip(text)
+            success_table.setItem(row, 3, coverage_item)
         
         # Auto-resize columns
         header = success_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         
         success_layout.addWidget(success_table)
         layout.addWidget(success_group)

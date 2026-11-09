@@ -262,6 +262,21 @@ def _content_sentence(path: str) -> Optional[str]:
     return f'the .{ext} that was written keeps {_joined(kept, "and")}'
 
 
+def _coverage_report(source_path: str, output_path: str) -> Optional[Dict[str, Any]]:
+    """Compare file-backed material data before and after a conversion."""
+    source = _content_findings(source_path)
+    output = _content_findings(output_path)
+    if source is None or output is None:
+        return None
+    categories = sorted(set(source) | set(output))
+    return {
+        'source': source,
+        'output': output,
+        'retained': [name for name in categories if bool(source.get(name)) and bool(output.get(name))],
+        'not_retained': [name for name in categories if bool(source.get(name)) and not bool(output.get(name))],
+    }
+
+
 # Helper: ensure we return a trimesh.Trimesh from a trimesh.Scene or Trimesh. A PointCloud and
 # an empty Scene both answer None: this gives a triangle mesh or says there is not one, and
 # callers that also record points have to ask trimesh for the shape themselves.
@@ -600,6 +615,7 @@ class FormatConverter(QObject):
                                if not self._CAPABILITIES[method_name]['applies_options']]
                     result['method'] = method_name
                     result['options_skipped'] = skipped
+                    result['coverage'] = _coverage_report(input_file, output_file)
                     message = f"Converted using {method_name}"
                     if skipped:
                         message += f" ({', '.join(skipped)} not applied)"

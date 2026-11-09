@@ -140,6 +140,17 @@ class TestClaimsAreTrue(FormatCase):
             self.assertEqual(len(mesh.faces), expected, f'obj -> {fmt} changed the face count')
             self.assertGreater(len(mesh.vertices), 0, f'obj -> {fmt} has no vertices')
 
+    def test_02b_each_success_reports_file_backed_coverage(self):
+        src = self.require_seed('obj')
+        result = self.converter.convert_file(src, self.target('ply'))
+        self.assertTrue(result['success'], result['message'])
+        coverage = result.get('coverage')
+        self.assertIsNotNone(coverage)
+        self.assertIn('source', coverage)
+        self.assertIn('output', coverage)
+        self.assertIn('retained', coverage)
+        self.assertIn('not_retained', coverage)
+
     def test_03_an_unclaimed_pair_refuses_without_crashing(self):
         """Same-format and impossible pairs return a reason instead of an exception."""
         src = self.require_seed('obj')

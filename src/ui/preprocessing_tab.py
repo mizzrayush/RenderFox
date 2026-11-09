@@ -195,6 +195,7 @@ class FormatConversionThread(QThread):
                 entry = {'input': input_file, 'output': output_file,
                          'method': result.get('method') or 'nothing'}
                 entry['options_skipped'] = result.get('options_skipped') or []
+                entry['coverage'] = result.get('coverage')
                 if result.get('success'):
                     converted.append(entry)
                 else:
