@@ -38,6 +38,7 @@ from .icon_provider import get_icon
 
 from ..core.animation_data import Keyframe, AnimationTrack, AnimationClip, EasingType, AudioTrack
 from ..core.animation_engine import AnimationEngine
+from ..core.animation_importer import AnimationImporter
 from ..core.video_exporter import VideoExporter
 from .model_viewer import ModelViewer3D
 
@@ -726,6 +727,11 @@ class AnimationTab(QWidget):
         # 3D Viewport
         self.viewport = ModelViewer3D()
         viewport_layout.addWidget(self.viewport)
+        self.animation_asset_status = QLabel("No skeletal animation data loaded")
+        self.animation_asset_status.setObjectName("animationAssetStatus")
+        self.animation_asset_status.setWordWrap(True)
+        self.animation_asset_status.setStyleSheet("padding: 6px 10px; color: #9aa0b4;")
+        viewport_layout.addWidget(self.animation_asset_status)
         
         self.top_splitter.addWidget(self.viewport_container)
         
@@ -1051,6 +1057,16 @@ class AnimationTab(QWidget):
         if hasattr(self.viewport, 'load_model'):
             success = self.viewport.load_model(path)
             if success:
+                report = AnimationImporter.inspect(path)
+                if report.success:
+                    clips = ', '.join(f"{clip.name} ({clip.channel_count} channels)"
+                                      for clip in report.clips) or 'no clips'
+                    self.animation_asset_status.setText(
+                        f"Skeletal data read from file: {report.skeleton_count} skin(s), "
+                        f"{report.joint_count} joint(s); {clips}. "
+                        "Playback currently uses editable transform tracks.")
+                else:
+                    self.animation_asset_status.setText(f"No playable skeletal data: {report.message}")
                 sb = self.statusBar()
                 if sb: sb.showMessage(f"Loaded model: {os.path.basename(path)}", 3000)
             else:
