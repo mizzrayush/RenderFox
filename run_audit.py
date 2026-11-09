@@ -123,6 +123,12 @@ SUITES = [
         "description": "Requires Meshopt compression to use gltfpack and verify EXT_meshopt_compression from the written asset; without that encoder it refuses by name rather than calling an ordinary GLB compressed"
     },
     {
+        "id": "ecosystem_contract",
+        "name": "Cross-Workspace Ecosystem Contract",
+        "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_ecosystem_contract.py")],
+        "description": "Protects shared asset selection and icon-only workspace accessibility so cross-pane sends cannot silently return to positional navigation or disconnected selection state"
+    },
+    {
         "id": "format_converter_contract",
         "name": "Format Conversion Contract",
         "command": [sys.executable, "-X", "utf8", os.path.join(ROOT_DIR, "tests", "test_format_converter_contract.py")],
