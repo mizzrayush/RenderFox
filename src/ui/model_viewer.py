@@ -189,6 +189,7 @@ class ModelViewer3D(QOpenGLWidget):
     """3D model viewer using OpenGL (only available when PyOpenGL is installed)."""
     
     model_loaded = pyqtSignal(dict)
+    selection_changed = pyqtSignal(int)
     # On the class, not in `__init__`: that method returns before its attribute block when
     # PyOpenGL is missing, and the first paint reads this name either way.
     _last_paint_failure = None
@@ -222,6 +223,8 @@ class ModelViewer3D(QOpenGLWidget):
         self.camera_rotation_x = 0.0
         self.camera_rotation_y = 0.0
         self.last_mouse_pos = None
+        self._press_position = None
+        self.selected_mesh_index = None
         
         # Model transform
         self.model_scale = 1.0
@@ -1567,6 +1570,7 @@ class ModelViewer3D(QOpenGLWidget):
         # Middle click: Pan
         if event.button() == Qt.MouseButton.LeftButton:
             self.last_mouse_pos = event.position()
+            self._press_position = event.position()
             self.mouse_mode = 'rotate'
         elif event.button() == Qt.MouseButton.RightButton:
             self.last_mouse_pos = event.position()
@@ -1595,8 +1599,44 @@ class ModelViewer3D(QOpenGLWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         """Handle mouse release."""
+        if (event.button() == Qt.MouseButton.LeftButton and self._press_position is not None
+                and (event.position() - self._press_position).manhattanLength() <= 4):
+            self.select_mesh_at(int(event.position().x()), int(event.position().y()))
         self.last_mouse_pos = None
+        self._press_position = None
         self.mouse_mode = None
+
+    def select_mesh_at(self, x: int, y: int) -> bool:
+        """Select the mesh under a click, leaving a missed click unchanged."""
+        mesh_index, _, _ = self.get_vertex_at_screen_pos(x, y)
+        if mesh_index < 0:
+            return False
+        self.selected_mesh_index = mesh_index
+        self.selection_changed.emit(mesh_index)
+        self.update()
+        return True
+
+    def focus_selected(self) -> bool:
+        """Centre and fit the selected mesh using the viewport's existing camera."""
+        index = self.selected_mesh_index
+        if index is None or index < 0 or index >= len(self.meshes):
+            return False
+        vertices = self.meshes[index]['vertices']
+        if len(vertices) == 0:
+            return False
+        minimum = np.min(vertices, axis=0)
+        maximum = np.max(vertices, axis=0)
+        centre = (minimum + maximum) / 2.0
+        radius = max(float(np.linalg.norm(maximum - minimum)) / 2.0, 0.05)
+        # The vertical FOV is the limiting dimension.  Leave a small margin so
+        # the selected object never touches the frame.
+        half_fov = np.deg2rad(max(1.0, self.camera_fov) / 2.0)
+        self.camera_distance = max(0.1, min(20.0, radius / np.sin(half_fov) * 1.15))
+        self.model_translation_x = -float(centre[0])
+        self.model_translation_y = -float(centre[1])
+        self.model_translation_z = -float(centre[2])
+        self.update()
+        return True
     
     def set_show_edges(self, enabled: bool):
         self.show_edges = enabled
@@ -1822,6 +1862,9 @@ class ModelViewer3D(QOpenGLWidget):
         self.model_rotation_y = 0.0
         self.model_rotation_z = 0.0
         self.model_scale = 1.0
+        self.model_translation_x = 0.0
+        self.model_translation_y = 0.0
+        self.model_translation_z = 0.0
         self.update()
 
     def clear(self):

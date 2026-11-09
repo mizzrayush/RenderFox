@@ -110,15 +110,11 @@ class TestToolbarWiring(RenderingTabCase):
                 self.assertGreater(button.receivers(button.clicked), 0,
                                    f'{name} is drawn but connected to nothing')
 
-    def test_02_a_button_cannot_claim_a_selection_there_is_no_way_to_make(self):
-        """Nothing in this tab selects a part of the model, so "Focus Selected" was a lie.
-
-        The viewport frames every model to a 2-unit box as it loads, and Reset View
-        returns the camera to that framing, so the action had no distinct behaviour
-        to be given either.
-        """
-        self.assertNotIn('Focus Selected',
-                         [action.text() for action in self.toolbar().actions()])
+    def test_02_focus_selected_is_connected_and_refuses_an_empty_selection(self):
+        action = self.action('Focus Selected')
+        self.assertGreater(action.receivers(action.triggered), 0)
+        action.trigger()
+        self.assertIn('needs an object clicked', self.statuses())
 
     def test_03_the_settings_panel_the_tab_can_reach_is_the_one_on_screen(self):
         self.assertIs(self.tab.tool_panel.widget(3).widget(), self.tab.settings_panel)
@@ -162,6 +158,22 @@ class TestViewportModes(RenderingTabCase):
         self.assertEqual(5.0, viewer.camera_distance)
         self.assertEqual(0.0, viewer.model_rotation_z)
         self.assertIn('View reset', self.statuses())
+
+    def test_06b_focus_selected_centres_and_fits_the_selected_mesh(self):
+        import numpy as np
+        viewer = self.tab.viewport
+        viewer.meshes = [{'vertices': np.array([[4.0, -1.0, 0.0],
+                                                [6.0, 1.0, 2.0]], dtype=np.float32)}]
+        viewer.selected_mesh_index = 0
+        viewer.camera_distance = 0.2
+        self.action('Focus Selected').trigger()
+        self.assertGreater(viewer.camera_distance, 1.0)
+        self.assertAlmostEqual(-5.0, viewer.model_translation_x)
+        self.assertAlmostEqual(0.0, viewer.model_translation_y)
+        self.assertAlmostEqual(-1.0, viewer.model_translation_z)
+        self.assertIn('Focused selected object', self.statuses())
+        self.action('Reset View').trigger()
+        self.assertEqual(0.0, viewer.model_translation_x)
 
     def test_07_snapshot_writes_the_file_the_dialog_named(self):
         self.action('Snapshot').trigger()

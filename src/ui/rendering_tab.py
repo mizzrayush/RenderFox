@@ -763,6 +763,11 @@ class RenderingTab(QWidget):
         action_reset.setIcon(get_icon("reset_view"))
         action_reset.triggered.connect(self.reset_view)
 
+        action_focus = toolbar.addAction("Focus Selected")
+        action_focus.setIcon(get_icon("focus"))
+        action_focus.setToolTip("Click an object in the viewport, then fit it in view")
+        action_focus.triggered.connect(self.focus_selected)
+
         toolbar.addSeparator()
 
         # Tools
@@ -816,6 +821,13 @@ class RenderingTab(QWidget):
         """Put the camera and the model transform back where they started."""
         self.viewport.reset_view()
         self.status_message.emit("View reset")
+
+    def focus_selected(self):
+        """Fit the object the user clicked, never pretending an object was selected."""
+        if self.viewport.focus_selected():
+            self.status_message.emit("Focused selected object")
+        else:
+            self.status_message.emit("Focus Selected needs an object clicked in the viewport")
 
     def toggle_grid(self):
         show = not getattr(self.viewport, 'show_grid', False)
