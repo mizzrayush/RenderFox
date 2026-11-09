@@ -110,25 +110,35 @@ QTabBar::tab:hover:!selected {
     color: #c0c6d8;
 }
 
-/* The main window uses a left workspace rail; nested editors keep their compact
-   horizontal tabs below. */
+/* The main window uses a continuous left workspace rail with grouped dividers */
+QTabBar#workspaceRailBar {
+    background-color: #12131a;
+    border-right: 1px solid #202330;
+}
+
 QTabBar#workspaceRailBar::tab {
-    min-width: 28px;
-    max-width: 28px;
+    min-width: 32px;
+    max-width: 32px;
     min-height: 28px;
     max-height: 28px;
     /* Zero padding with calibrated rail tab margins centers the SVG icon box
        cleanly across both axes and ensures all 15 workspaces fit on screen. */
     padding: 0px;
     text-align: center;
-    border: 1px solid #232530;
-    border-radius: 6px;
-    margin: 1px 2px;
+    border: none;
+    border-radius: 5px;
+    margin: 1px 3px;
+    background-color: transparent;
+}
+
+QTabBar#workspaceRailBar::tab:hover {
+    background-color: #1e2230;
 }
 
 QTabBar#workspaceRailBar::tab:selected {
-    border: 1px solid #4b7bec;
-    border-left: 2px solid #75a7ff;
+    background-color: #23283a;
+    border-left: 2px solid #5b8dfa;
+    border-radius: 4px;
 }
 
 /* Nested / Sub-Tabs Styling (Pill / Flat DCC style) */

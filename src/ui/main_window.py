@@ -4,10 +4,11 @@ Main window for RenderFox application.
 
 import os
 import logging
-from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QVBoxLayout, 
-                             QWidget, QMenuBar, QStatusBar, QMessageBox)
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QTabBar, QVBoxLayout, 
+                             QWidget, QMenuBar, QStatusBar, QMessageBox,
+                             QStyleOptionTab, QStyle, QToolTip)
+from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QEvent
+from PyQt6.QtGui import QAction, QIcon, QPainter, QColor, QPen
 
 from .dashboard_tab import DashboardTab
 from .preprocessing_tab import PreProcessingTab
@@ -33,6 +34,123 @@ from .styles import get_theme_stylesheet, MODERN_DARK_THEME
 from .icon_provider import get_tab_icon, get_icon
 
 logger = logging.getLogger(__name__)
+
+class WorkspaceRailTabBar(QTabBar):
+    """Continuous left workspace rail with grouped dividers and bottom-anchored settings."""
+
+    TAB_H = 28
+    DIV_H = 8
+    SETTINGS_INDEX = 14
+    DIVIDER_AFTER_INDICES = (2, 5, 8, 13)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("workspaceRailBar")
+        self._hover_index = -1
+        self.setMouseTracking(True)
+
+    def _calc_tab_y(self, index: int) -> int:
+        if index <= 2:
+            return index * self.TAB_H
+        elif index <= 5:
+            return (3 * self.TAB_H + self.DIV_H) + (index - 3) * self.TAB_H
+        elif index <= 8:
+            return (6 * self.TAB_H + 2 * self.DIV_H) + (index - 6) * self.TAB_H
+        elif index <= 13:
+            return (9 * self.TAB_H + 3 * self.DIV_H) + (index - 9) * self.TAB_H
+        else:
+            normal_y = 14 * self.TAB_H + 4 * self.DIV_H
+            bottom_y = self.height() - self.TAB_H - 4
+            return max(normal_y, bottom_y)
+
+    def sizeHint(self) -> QSize:
+        sz = super().sizeHint()
+        min_h = 15 * self.TAB_H + 4 * self.DIV_H + 8
+        h = max(min_h, self.parent().height()) if self.parent() else min_h
+        return QSize(sz.width(), h)
+
+    def tabRect(self, index: int) -> QRect:
+        r = super().tabRect(index)
+        y = self._calc_tab_y(index)
+        return QRect(r.x(), y, r.width(), self.TAB_H)
+
+    def tabAt(self, pos: QPoint) -> int:
+        for i in range(self.count()):
+            if self.tabRect(i).contains(pos):
+                return i
+        return -1
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        hover = self.tabAt(pos)
+        if hover != self._hover_index:
+            self._hover_index = hover
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_index = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        idx = self.tabAt(pos)
+        if idx >= 0:
+            self.setCurrentIndex(idx)
+        else:
+            super().mousePressEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.ToolTip:
+            idx = self.tabAt(event.pos())
+            if idx >= 0:
+                tip = self.tabToolTip(idx)
+                if tip:
+                    QToolTip.showText(event.globalPos(), tip, self, self.tabRect(idx))
+                    return True
+            QToolTip.hideText()
+            return True
+        return super().event(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        is_light = self.palette().window().color().lightness() > 150
+        rail_bg = QColor("#f0f2f5") if is_light else QColor("#12131a")
+        rail_border = QColor("#d0d4dc") if is_light else QColor("#202330")
+        divider_color = QColor("#d8dce6") if is_light else QColor("#252838")
+
+        p.fillRect(self.rect(), rail_bg)
+        p.setPen(rail_border)
+        p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+
+        for i in range(self.count()):
+            opt = QStyleOptionTab()
+            self.initStyleOption(opt, i)
+            opt.rect = self.tabRect(i)
+            if i == self._hover_index and i != self.currentIndex():
+                opt.state |= QStyle.StateFlag.State_MouseOver
+            else:
+                opt.state &= ~QStyle.StateFlag.State_MouseOver
+            self.style().drawControl(QStyle.ControlElement.CE_TabBarTab, opt, p, self)
+
+        # Draw group dividers
+        p.setPen(QPen(divider_color, 1))
+        for after_idx in (2, 5, 8, 13):
+            if after_idx < self.count() - 1:
+                r_prev = self.tabRect(after_idx)
+                div_y = r_prev.bottom() + 4
+                p.drawLine(6, div_y, self.width() - 6, div_y)
+
+        # Divider above Settings if pinned to bottom
+        if self.count() > self.SETTINGS_INDEX:
+            sr = self.tabRect(self.SETTINGS_INDEX)
+            r13 = self.tabRect(13)
+            if sr.top() > r13.bottom() + self.DIV_H + 4:
+                p.drawLine(6, sr.top() - 4, self.width() - 6, sr.top() - 4)
+
+        p.end()
+
 
 class MainWindow(QMainWindow):
     """Main application window with tabbed interface."""
@@ -92,6 +210,7 @@ class MainWindow(QMainWindow):
         # Create tab widget
         self.tab_widget = QTabWidget()
         self.tab_widget.setObjectName("workspaceRail")
+        self.tab_widget.setTabBar(WorkspaceRailTabBar(self.tab_widget))
         # Name the actual navigation bar as well as its container.  A stylesheet
         # selector rooted at the container also matched every nested editor tab bar,
         # which compressed labels such as Library > Collections into unreadable pills.
