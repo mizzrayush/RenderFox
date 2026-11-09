@@ -48,7 +48,7 @@ class TestAllTabsHeadless(unittest.TestCase):
         cls.window = MainWindow()
 
     def test_01_tab_count_and_titles(self):
-        """Verify that all 15 tabs are initialized with expected names."""
+        """Verify every icon workspace has an accessible name and purpose."""
         expected_tabs = [
             "Library", "Batch Render", "Models", "Point Clouds", "Mesh Tools",
             "Animation", "Rendering", "Pre-Processing", "Post-Processing",
@@ -58,9 +58,13 @@ class TestAllTabsHeadless(unittest.TestCase):
         actual_count = self.window.tab_widget.count()
         self.assertEqual(actual_count, len(expected_tabs), f"Expected {len(expected_tabs)} tabs, found {actual_count}")
         
-        actual_titles = [self.window.tab_widget.tabText(i) for i in range(actual_count)]
+        actual_titles = [self.window.tab_widget.tabToolTip(i).split('\n', 1)[0]
+                         for i in range(actual_count)]
         for expected in expected_tabs:
             self.assertIn(expected, actual_titles, f"Missing tab: {expected}")
+        for index in range(actual_count):
+            self.assertEqual('', self.window.tab_widget.tabText(index))
+            self.assertIn('\n', self.window.tab_widget.tabToolTip(index))
         print(f"✓ All {actual_count} tabs validated: {', '.join(actual_titles)}")
 
     def test_02_tab_switching_cycle(self):

@@ -116,25 +116,39 @@ class MainWindow(QMainWindow):
         # Connect settings tab signals
         self.settings_tab.theme_changed.connect(self.on_theme_changed)
         
-        # Workspace flow: start with work in progress, then assets and geometry,
-        # move through look development and output, and leave automation/system
-        # controls together.  Widgets themselves are unchanged, so links and
-        # shortcuts can still select each workspace directly.
-        self.tab_widget.addTab(self.dashboard_tab, get_tab_icon("batch_render"), "Batch Render")
-        self.tab_widget.addTab(self.library_tab, get_tab_icon("library"), "Library")
-        self.tab_widget.addTab(self.model_tab, get_tab_icon("models"), "Models")
-        self.tab_widget.addTab(self.mesh_tools_tab, get_tab_icon("mesh_tools"), "Mesh Tools")
-        self.tab_widget.addTab(self.point_clouds_tab, get_tab_icon("point_clouds"), "Point Clouds")
-        self.tab_widget.addTab(self.preprocessing_tab, get_tab_icon("preprocessing"), "Pre-Processing")
-        self.tab_widget.addTab(self.postprocessing_tab, get_tab_icon("postprocessing"), "Post-Processing")
-        self.tab_widget.addTab(self.rendering_tab, get_tab_icon("rendering"), "Rendering")
-        self.tab_widget.addTab(self.animation_tab, get_tab_icon("animation"), "Animation")
-        self.tab_widget.addTab(self.automation_tab, get_tab_icon("automation"), "Automation")
-        self.tab_widget.addTab(self.pipeline_tab, get_tab_icon("pipeline"), "Pipeline")
-        self.tab_widget.addTab(self.scripting_tab, get_tab_icon("scripting"), "Scripting")
-        self.tab_widget.addTab(self.performance_tab, get_tab_icon("performance"), "Performance")
-        self.tab_widget.addTab(self.diagnostics_tab, get_tab_icon("diagnostics"), "Diagnostics")
-        self.tab_widget.addTab(self.settings_tab, get_tab_icon("settings"), "Settings")
+        # Icon-only workspace rail: labels are deliberately in the tooltip so the
+        # canvas stays clear.  Every former tab remains present and keyboard/menu
+        # navigation still targets its widget directly.
+        self._add_workspace(self.dashboard_tab, "batch_render", "Batch Render",
+                            "Queue and send jobs to your installed DCC renderers.")
+        self._add_workspace(self.library_tab, "library", "Library",
+                            "Browse, tag, organize, and open your asset collection.")
+        self._add_workspace(self.model_tab, "models", "Models",
+                            "Inspect, convert, analyze, and prepare mesh assets.")
+        self._add_workspace(self.mesh_tools_tab, "mesh_tools", "Mesh Tools",
+                            "Repair, optimize, simplify, and edit mesh geometry.")
+        self._add_workspace(self.point_clouds_tab, "point_clouds", "Point Clouds",
+                            "Import, process, and convert point-cloud data.")
+        self._add_workspace(self.preprocessing_tab, "preprocessing", "Pre-Processing",
+                            "Prepare geometry and textures before your main operation.")
+        self._add_workspace(self.postprocessing_tab, "postprocessing", "Post-Processing",
+                            "Polish completed assets and organize deliverables.")
+        self._add_workspace(self.rendering_tab, "rendering", "Rendering",
+                            "Look-develop models and export viewport preview frames.")
+        self._add_workspace(self.animation_tab, "animation", "Animation",
+                            "Animate, preview, and export a timeline to H.264 MP4.")
+        self._add_workspace(self.automation_tab, "automation", "Automation",
+                            "Watch folders, schedule work, and run batch operations.")
+        self._add_workspace(self.pipeline_tab, "pipeline", "Pipeline",
+                            "Build and run reusable multi-step asset workflows.")
+        self._add_workspace(self.scripting_tab, "scripting", "Scripting",
+                            "Automate RenderFox through its supported rfx API.")
+        self._add_workspace(self.performance_tab, "performance", "Performance",
+                            "Tune RenderFox and measure system-aware workload results.")
+        self._add_workspace(self.diagnostics_tab, "diagnostics", "Diagnostics",
+                            "Review application health, logs, and machine checks.")
+        self._add_workspace(self.settings_tab, "settings", "Settings",
+                            "Set preferences, paths, themes, and application behavior.")
         # This is just for any additional handling needed
     
     def setup_menu(self):
@@ -359,6 +373,12 @@ class MainWindow(QMainWindow):
     def switch_to_tab(self, index):
         """Switch to a specific tab."""
         self.tab_widget.setCurrentIndex(index)
+
+    def _add_workspace(self, widget, icon_name, title, description):
+        """Add an icon-only workspace and expose its name and purpose on hover."""
+        index = self.tab_widget.addTab(widget, get_tab_icon(icon_name), "")
+        self.tab_widget.setTabToolTip(index, f"{title}\n{description}")
+        self.tab_widget.setTabWhatsThis(index, f"{title}: {description}")
 
     def switch_to_widget(self, widget):
         """Select a workspace by identity, so navigation survives reordering."""
