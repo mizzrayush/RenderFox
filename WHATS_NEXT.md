@@ -1,6 +1,6 @@
 # What's next
 
-Written 2026-11-09 on `main`, updated as Phase 15b-2 lands. 15b-2 (Parallel Processing) is finished
+Written 2026-11-09 on `main`, updated after Phase 15d lands. 15b-2 (Parallel Processing) is finished
 on this tree and lands in the same commit that carries this file, so read the first section as
 "what this commit does", not as "what is still uncommitted". This file is the handover: what is true right now, what runs next,
 in what order, and how each step gets proven. Read it together with `REPAIR_LOG.md`, which holds
@@ -29,9 +29,9 @@ the evidence for every claim this file makes about the past.
   runner's problem not the widget's, and the status line appends `(N workers)` only when more than
   one ran. The box is a typable `QSpinBox(1..4096)` (`:368`), inert when the switch is off. Measured
   3.96x on a wait-bound batch (1 worker 2.007 s vs 4 workers 0.507 s), identical in-order results.
-- **Debt list status** (`REPAIR_LOG.md:187-191`): item 6 closed by 15a, item 4 closed by 15b-1,
-  item 5 closed by 15b-2. Still owed: item 2 (Samples) and item 3 (MP4) in #67, item 1 (Focus
-  Selected) in #68.
+- **Debt list status** (`REPAIR_LOG.md:187-191`): all six recovered controls now have real
+  backends. Items 2 and 3 closed in `bfad104` (Samples and read-back-verified H.264 MP4), item 1
+  closed in `ff02ec6` (click-select and Focus Selected). The next work is ecosystem enforcement.
 
 ## Rules that bind every step below
 
@@ -53,7 +53,7 @@ the evidence for every claim this file makes about the past.
 
 ## The queue, in order
 
-### Next commit - #67 (15c): "Samples" and "MP4 (H.264)" get real backends
+### Completed - #67 (15c): "Samples" and "MP4 (H.264)" get real backends
 
 - **Samples** (debt item 2): `src/core/models.py:182` already carries `samples: int = 128` on
   `RenderSettings`, and nothing in the UI can set it. Put a `QSpinBox(1..4096)` with a typable
@@ -68,14 +68,14 @@ the evidence for every claim this file makes about the past.
   real container instead of trusting the extension. If this machine's ffmpeg cannot encode H.264,
   the refusal prints that - the entry is not removed.
 
-### Then #68 (15d): "Focus Selected" (#68)
+### Completed - #68 (15d): "Focus Selected" (#68)
 
 Debt item 1. Needs a selection model on the viewport (`src/ui/model_viewer.py`) - click-pick an
 object - then a frame that centres and fits it, reusing the camera math `reset_view` (`:178`,
 `:1816`) already uses rather than inventing a second camera. The pane must say what it selected
 and what it fitted; with nothing selected it says so instead of moving the camera.
 
-### Then #13 (Phase 9): enforce the ecosystem contract
+### Next - #13 (Phase 9): enforce the ecosystem contract
 
 The seven invariants at `REPAIR_LOG.md:175-183` - one selection, one vocabulary per operation, one
 verdict shape, one queue and history, one way to be sent from, one theme and icon set, one config.
