@@ -136,6 +136,19 @@ class AnimationImporterContract(unittest.TestCase):
             self.assertEqual(2, len(rot_track.keyframes))
             self.assertEqual(0.0, rot_track.keyframes[0].value)
             self.assertEqual(360.0, rot_track.keyframes[1].value)
+
+            export_path = os.path.join(self.work, "rig_export.json")
+            with mock.patch('PyQt6.QtWidgets.QFileDialog.getSaveFileName', return_value=(export_path, 'JSON Files (*.json)')), \
+                 mock.patch('PyQt6.QtWidgets.QMessageBox.information'):
+                tab.rig_inspector.export_rig_json()
+            self.assertTrue(os.path.isfile(export_path))
+            with open(export_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.assertIn("skeletons", data)
+            self.assertEqual(1, len(data["skeletons"]))
+            self.assertEqual(2, len(data["skeletons"][0]["joints"]))
+            self.assertEqual("Hips", data["skeletons"][0]["joints"][0]["name"])
+            self.assertEqual("Spine", data["skeletons"][0]["joints"][1]["name"])
         finally:
             tab.deleteLater()
 

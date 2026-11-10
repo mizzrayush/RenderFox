@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QAbstractSlider, QFileDialog
 )
 import os
+import json
 from .icon_provider import get_icon
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QPointF, QRectF, QSize, QTimer, QLineF,
@@ -739,6 +740,11 @@ class RigInspectorWidget(QWidget):
         
         layout.addWidget(self.details_group)
 
+        self.export_btn = QPushButton("Export Rig JSON...")
+        self.export_btn.setIcon(get_icon("save"))
+        self.export_btn.clicked.connect(self.export_rig_json)
+        layout.addWidget(self.export_btn)
+
     def load_skeleton(self, report):
         self.report = report
         self.tree.clear()
@@ -837,6 +843,46 @@ class RigInspectorWidget(QWidget):
             name = item.text(0).lower()
             match = (not search) or (search in name) or (search in item.text(1))
             item.setHidden(not match)
+
+
+    def export_rig_json(self):
+        if not self.report or not getattr(self.report, "skeletons", None):
+            QMessageBox.warning(self, "Export Rig", "No skeleton data available to export.")
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Export Rig Hierarchy JSON", "skeleton_hierarchy.json", "JSON Files (*.json)"
+        )
+        if not dest:
+            return
+        try:
+            data = {
+                "source_file": getattr(self.report, "file_path", ""),
+                "skeletons": [
+                    {
+                        "name": skel.name,
+                        "skin_index": skel.skin_index,
+                        "joint_count": len(skel.joints),
+                        "joints": [
+                            {
+                                "node_index": j.node_index,
+                                "name": j.name,
+                                "parent_index": j.parent_index,
+                                "children_indices": list(j.children_indices),
+                                "local_translation": list(j.local_translation),
+                                "local_rotation": list(j.local_rotation),
+                                "local_scale": list(j.local_scale),
+                            }
+                            for j in skel.joints
+                        ],
+                    }
+                    for skel in self.report.skeletons
+                ],
+            }
+            with open(dest, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            QMessageBox.information(self, "Export Rig", f"Skeleton hierarchy exported to {dest}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Failed to export rig JSON: {e}")
 
 
 class AnimationTab(QWidget):
@@ -982,7 +1028,7 @@ class AnimationTab(QWidget):
         render_act.setIcon(get_icon("video"))
         render_act.triggered.connect(self.render_video)
         
-        turntable_act = toolbar.addAction("Turntable 360°")
+        turntable_act = toolbar.addAction("Turntable 360")
         turntable_act.setIcon(get_icon("rotate"))
         turntable_act.setToolTip("Generate a 360-degree turntable lookdev rotation animation")
         turntable_act.triggered.connect(self.generate_turntable)
