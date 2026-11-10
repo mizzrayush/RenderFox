@@ -3,7 +3,13 @@ Animation Engine for RenderFox.
 Handles the playback loop, time management, and frame updates.
 """
 
+import os
+import sys
+
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, QUrl
+
+if sys.platform.startswith('win') and 'QT_MEDIA_BACKEND' not in os.environ:
+    os.environ['QT_MEDIA_BACKEND'] = 'windows'
 
 try:
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput

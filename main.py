@@ -14,6 +14,10 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
+# Ensure QtMultimedia initializes Windows Media Foundation backend on Windows
+if sys.platform.startswith('win') and 'QT_MEDIA_BACKEND' not in os.environ:
+    os.environ['QT_MEDIA_BACKEND'] = 'windows'
+
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import QSplashScreen
 from PyQt6.QtCore import Qt
