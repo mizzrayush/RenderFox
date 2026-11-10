@@ -383,7 +383,7 @@ class TimelineView(QGraphicsView):
         
         # Update data model selection state
         # First clear all
-        for track in self.tracks:
+        for track in list(self.clip.tracks):
             for kf in track.track_data.keyframes:
                 kf.selected = False
                 
@@ -683,6 +683,162 @@ class PropertyInspector(QWidget):
 # MAIN ANIMATION TAB
 # ============================================================================
 
+class RigInspectorWidget(QWidget):
+    """Panel for inspecting skeleton joint hierarchy, bind poses, and active bones."""
+    
+    joint_selected = pyqtSignal(int)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.report = None
+        self.selected_joint = None
+        self.joint_items: Dict[int, QTreeWidgetItem] = {}
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        
+        self.summary_label = QLabel("No skeleton loaded")
+        self.summary_label.setStyleSheet("font-weight: bold; color: #888;")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+        
+        self.show_skeleton_cb = QCheckBox("Show Skeleton in 3D View")
+        self.show_skeleton_cb.setChecked(True)
+        layout.addWidget(self.show_skeleton_cb)
+        
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Filter bones by name...")
+        self.search_edit.textChanged.connect(self.filter_bones)
+        layout.addWidget(self.search_edit)
+        
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Bone / Joint", "Node"])
+        self.tree.setColumnWidth(0, 180)
+        self.tree.itemSelectionChanged.connect(self.on_selection_changed)
+        layout.addWidget(self.tree)
+        
+        self.details_group = QGroupBox("Selected Joint Details")
+        details_layout = QFormLayout(self.details_group)
+        details_layout.setContentsMargins(8, 8, 8, 8)
+        details_layout.setSpacing(4)
+        
+        self.lbl_name = QLabel("-")
+        self.lbl_node = QLabel("-")
+        self.lbl_parent = QLabel("-")
+        self.lbl_local_pos = QLabel("-")
+        self.lbl_world_pos = QLabel("-")
+        
+        details_layout.addRow("Name:", self.lbl_name)
+        details_layout.addRow("Node Index:", self.lbl_node)
+        details_layout.addRow("Parent:", self.lbl_parent)
+        details_layout.addRow("Local Pos:", self.lbl_local_pos)
+        details_layout.addRow("World Pos:", self.lbl_world_pos)
+        
+        layout.addWidget(self.details_group)
+
+    def load_skeleton(self, report):
+        self.report = report
+        self.tree.clear()
+        self.joint_items.clear()
+        self.selected_joint = None
+        self._reset_details()
+        
+        if not report or not getattr(report, 'skeletons', None):
+            self.summary_label.setText("No skeleton or skinning found in asset")
+            self.summary_label.setStyleSheet("font-weight: bold; color: #888;")
+            return
+            
+        total_joints = sum(len(s.joints) for s in report.skeletons)
+        total_bones = len(AnimationImporter.get_bones(report))
+        self.summary_label.setText(
+            f"Skins: {len(report.skeletons)} | Joints: {total_joints} | Bones: {total_bones}"
+        )
+        self.summary_label.setStyleSheet("font-weight: bold; color: #4FC3F7;")
+        
+        for skel in report.skeletons:
+            skel_item = QTreeWidgetItem(self.tree, [skel.name, f"Skin {skel.skin_index}"])
+            skel_item.setExpanded(True)
+            
+            joint_map = {j.node_index: j for j in skel.joints}
+            root_indices = [
+                j.node_index for j in skel.joints
+                if j.parent_index is None or j.parent_index not in joint_map
+            ]
+            if not root_indices and skel.joints:
+                root_indices = [skel.joints[0].node_index]
+                
+            def add_joint_tree(j_idx, parent_item):
+                joint = joint_map.get(j_idx)
+                if not joint:
+                    return
+                item = QTreeWidgetItem(parent_item, [joint.name, str(joint.node_index)])
+                item.setData(0, Qt.ItemDataRole.UserRole, joint.node_index)
+                item.setExpanded(True)
+                self.joint_items[joint.node_index] = item
+                for c_idx in joint.children_indices:
+                    if c_idx in joint_map:
+                        add_joint_tree(c_idx, item)
+                        
+            for r_idx in root_indices:
+                add_joint_tree(r_idx, skel_item)
+
+    def clear_skeleton(self):
+        self.report = None
+        self.tree.clear()
+        self.joint_items.clear()
+        self.selected_joint = None
+        self.summary_label.setText("No skeleton loaded")
+        self.summary_label.setStyleSheet("font-weight: bold; color: #888;")
+        self._reset_details()
+
+    def _reset_details(self):
+        self.lbl_name.setText("-")
+        self.lbl_node.setText("-")
+        self.lbl_parent.setText("-")
+        self.lbl_local_pos.setText("-")
+        self.lbl_world_pos.setText("-")
+
+    def on_selection_changed(self):
+        items = self.tree.selectedItems()
+        if not items:
+            self.selected_joint = None
+            self._reset_details()
+            return
+        node_idx = items[0].data(0, Qt.ItemDataRole.UserRole)
+        if node_idx is None:
+            self.selected_joint = None
+            self._reset_details()
+            return
+        self.selected_joint = int(node_idx)
+        self.joint_selected.emit(self.selected_joint)
+        
+        if self.report:
+            for skel in getattr(self.report, 'skeletons', ()):
+                for j in skel.joints:
+                    if j.node_index == self.selected_joint:
+                        self.lbl_name.setText(j.name)
+                        self.lbl_node.setText(str(j.node_index))
+                        self.lbl_parent.setText(str(j.parent_index) if j.parent_index is not None else "Root")
+                        t = j.local_translation
+                        self.lbl_local_pos.setText(f"({t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f})")
+                        break
+
+    def update_animated_positions(self, world_positions):
+        if self.selected_joint is not None and self.selected_joint in world_positions:
+            w = world_positions[self.selected_joint]
+            self.lbl_world_pos.setText(f"({w[0]:.2f}, {w[1]:.2f}, {w[2]:.2f})")
+
+    def filter_bones(self, text: str):
+        search = text.strip().lower()
+        for idx, item in self.joint_items.items():
+            name = item.text(0).lower()
+            match = (not search) or (search in name) or (search in item.text(1))
+            item.setHidden(not match)
+
+
 class AnimationTab(QWidget):
     """The main Animation Tab widget."""
 
@@ -698,6 +854,8 @@ class AnimationTab(QWidget):
         self.engine.set_clip(self.clip)
         self.current_frame = 0
         self.imported_animation_clip = None
+        self.skeleton_report = None
+        self.joint_names = {}
         
         # Data
         # We'll use the clip's tracks directly, but keep a reference for UI helper
@@ -740,8 +898,14 @@ class AnimationTab(QWidget):
         self.top_splitter.addWidget(self.viewport_container)
         
         # 2. Property Inspector
+        self.right_tabs = QTabWidget()
         self.inspector = PropertyInspector()
-        self.top_splitter.addWidget(self.inspector)
+        self.rig_inspector = RigInspectorWidget()
+        self.right_tabs.addTab(self.inspector, "Properties")
+        self.right_tabs.addTab(self.rig_inspector, "Skeleton & Rig")
+        self.rig_inspector.show_skeleton_cb.toggled.connect(self.viewport.set_show_skeleton)
+        self.rig_inspector.joint_selected.connect(self.on_joint_selected)
+        self.top_splitter.addWidget(self.right_tabs)
         self.top_splitter.setSizes([800, 300])
         
         self.main_splitter.addWidget(self.top_splitter)
@@ -817,6 +981,11 @@ class AnimationTab(QWidget):
         render_act = toolbar.addAction("Render Video")
         render_act.setIcon(get_icon("video"))
         render_act.triggered.connect(self.render_video)
+        
+        turntable_act = toolbar.addAction("Turntable 360°")
+        turntable_act.setIcon(get_icon("rotate"))
+        turntable_act.setToolTip("Generate a 360-degree turntable lookdev rotation animation")
+        turntable_act.triggered.connect(self.generate_turntable)
         
         toolbar.addSeparator()
         
@@ -903,7 +1072,7 @@ class AnimationTab(QWidget):
         
     def update_inspector_values(self, frame):
         """Update property inspector based on interpolated values."""
-        for track in self.tracks:
+        for track in list(self.clip.tracks):
             # Calculate value at current frame (interpolated)
             val = track.get_value_at_frame(frame)
             
@@ -915,7 +1084,8 @@ class AnimationTab(QWidget):
 
     def add_track(self, track_data: TrackData):
         """Add a track to the UI."""
-        self.tracks.append(track_data)
+        if track_data not in self.tracks:
+            self.tracks.append(track_data)
         
         # Add to Header
         item = QTreeWidgetItem([track_data.name, ""])
@@ -1037,6 +1207,16 @@ class AnimationTab(QWidget):
                 self.asset_loaded.emit(path)
                 report = AnimationImporter.load(path)
                 if report.success:
+                    self.skeleton_report = report
+                    if getattr(report, 'skeletons', None):
+                        self.rig_inspector.load_skeleton(report)
+                        self.joint_names = {j.node_index: j.name for skel in report.skeletons for j in skel.joints}
+                        bones = AnimationImporter.get_bones(report)
+                        world_pos = AnimationImporter.get_skeleton_world_positions(report)
+                        self.viewport.set_skeleton(world_pos, bones, names=self.joint_names)
+                    else:
+                        self.rig_inspector.clear_skeleton()
+                        self.viewport.clear_skeleton()
                     clips = ', '.join(f"{clip.name} ({clip.channel_count} channels)"
                                       for clip in report.clips) or 'no clips'
                     self.imported_animation_clip = next(
@@ -1057,6 +1237,10 @@ class AnimationTab(QWidget):
                         "Skin deformation is unavailable until the viewport has a skinned-mesh renderer.")
                 else:
                     self.imported_animation_clip = None
+                    self.skeleton_report = None
+                    self.joint_names = {}
+                    self.rig_inspector.clear_skeleton()
+                    self.viewport.clear_skeleton()
                     self.animation_asset_status.setText(f"No playable skeletal data: {report.message}")
                 sb = self.statusBar()
                 if sb: sb.showMessage(f"Loaded model: {os.path.basename(path)}", 3000)
@@ -1077,7 +1261,7 @@ class AnimationTab(QWidget):
         self.timeline_view.tracks.clear()
         
         # Re-add tracks
-        for track in self.tracks:
+        for track in list(self.clip.tracks):
             self.add_track(track)
 
     def render_video(self):
@@ -1088,7 +1272,7 @@ class AnimationTab(QWidget):
         # Find audio track
         audio_path = None
         audio_offset = 0
-        for track in self.tracks:
+        for track in list(self.clip.tracks):
             if isinstance(track, AudioTrack) and not track.muted:
                 audio_path = track.file_path
                 audio_offset = track.start_frame
@@ -1214,5 +1398,44 @@ class AnimationTab(QWidget):
                     self.viewport.model_rotation_y = math.degrees(math.asin(max(-1.0, min(1.0, sinp))))
                     self.viewport.model_rotation_z = math.degrees(math.atan2(siny_cosp, cosy_cosp))
         
+        # Update skeleton joint positions if rig data is present
+        if getattr(self, 'skeleton_report', None) and getattr(self.skeleton_report, 'skeletons', None):
+            seconds = frame / max(1, self.clip.fps)
+            world_pos = AnimationImporter.get_skeleton_world_positions(
+                self.skeleton_report, self.imported_animation_clip, seconds
+            )
+            bones = AnimationImporter.get_bones(self.skeleton_report)
+            active_j = getattr(self.rig_inspector, 'selected_joint', None)
+            self.viewport.set_skeleton(world_pos, bones, active_j, getattr(self, 'joint_names', None))
+            self.rig_inspector.update_animated_positions(world_pos)
+        
         self.viewport.update()
+
+    def on_joint_selected(self, joint_idx: int):
+        """Handle bone selection in the Rig Inspector tree."""
+        self.viewport.selected_joint = joint_idx
+        self.viewport.update()
+
+    def generate_turntable(self):
+        """Generate a 360-degree turntable camera/model rotation track."""
+        rot_y_track = None
+        for t in self.clip.tracks:
+            if t.property_path == "rotation_y":
+                rot_y_track = t
+                break
+        if not rot_y_track:
+            rot_y_track = AnimationTrack("Rotation Y", "rotation_y")
+            self.clip.add_track(rot_y_track)
+
+        rot_y_track.keyframes.clear()
+        duration_frames = 120
+        rot_y_track.add_keyframe(0, 0.0, EasingType.LINEAR)
+        rot_y_track.add_keyframe(duration_frames, 360.0, EasingType.LINEAR)
+        self.clip.duration = duration_frames
+        self.engine.set_clip(self.clip)
+        self.refresh_timeline()
+        self.playback_mode = PlaybackMode.LOOP
+        sb = self.statusBar()
+        if sb:
+            sb.showMessage("Generated 360° Turntable Animation (120 frames)", 3000)
 

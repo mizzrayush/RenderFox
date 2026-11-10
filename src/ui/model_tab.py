@@ -437,10 +437,13 @@ class ModelTab(QWidget):
         self.batch_analyze_btn.setIcon(get_icon("chart"))
         self.export_report_btn = QPushButton("Export Report")
         self.export_report_btn.setIcon(get_icon("export"))
+        self.inspect_rig_btn = QPushButton("Inspect Rig / Skeleton")
+        self.inspect_rig_btn.setIcon(get_icon("animation"))
         
         analysis_section.addWidget(self.analyze_btn)
         analysis_section.addWidget(self.batch_analyze_btn)
         analysis_section.addWidget(self.export_report_btn)
+        analysis_section.addWidget(self.inspect_rig_btn)
         tools_layout.addLayout(analysis_section)
         
         # Conversion tools
@@ -2032,6 +2035,7 @@ class ModelTab(QWidget):
         self.analyze_btn.clicked.connect(self.analyze_selected_model)
         self.batch_analyze_btn.clicked.connect(self.batch_analyze_models)
         self.export_report_btn.clicked.connect(self.export_analysis_report)
+        self.inspect_rig_btn.clicked.connect(self.inspect_rig_skeleton)
         
         # Conversion tools
         self.convert_btn.clicked.connect(self.convert_selected_model)
@@ -2994,6 +2998,60 @@ class ModelTab(QWidget):
                 QMessageBox.information(self, "Export Complete", f"Analysis report exported to {file_path}")
             except Exception as e:
                 QMessageBox.warning(self, "Export Error", f"Failed to export report: {str(e)}")
+
+    def inspect_rig_skeleton(self):
+        """Inspect the selected or loaded model for skeletal rig and joint data."""
+        from ..core.animation_importer import AnimationImporter
+        path = self.current_model_path
+        if not path:
+            selected_items = self.model_tree.selectedItems()
+            if selected_items:
+                path = selected_items[0].data(0, Qt.ItemDataRole.UserRole)
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(self, "No Model", "Please select or load a model to inspect its rig.")
+            return
+
+        report = AnimationImporter.inspect(path)
+        if not report.success or not getattr(report, 'skeletons', None):
+            QMessageBox.information(
+                self, "Rig Analysis",
+                f"Asset: {os.path.basename(path)}\n\n"
+                f"Skeletal data: {report.message}\n"
+                "No bone armature or skinning detected in this file."
+            )
+            return
+
+        total_joints = sum(len(s.joints) for s in report.skeletons)
+        bones = AnimationImporter.get_bones(report)
+        clips = ', '.join(c.name for c in (report.clips or [])) or "None"
+        skin_names = ', '.join(s.name for s in report.skeletons)
+
+        msg = (
+            f"Asset: {os.path.basename(path)}\n\n"
+            f"Skins / Armatures ({len(report.skeletons)}): {skin_names}\n"
+            f"Total Joints: {total_joints}\n"
+            f"Bone Segments: {len(bones)}\n"
+            f"Animation Clips: {clips}\n\n"
+            "This asset contains a verified skeletal rig. You can view the bone hierarchy, "
+            "play animations, and inspect joints in the Animation studio."
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Rig & Skeleton Inspector")
+        box.setText(msg)
+        box.setIcon(QMessageBox.Icon.Information)
+        anim_btn = box.addButton("Open in Animation Studio", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+
+        if box.clickedButton() == anim_btn:
+            parent = self.window()
+            if hasattr(parent, 'switch_to_tab_by_name'):
+                parent.switch_to_tab_by_name("Animation")
+            elif hasattr(parent, 'tabs'):
+                for i in range(parent.tabs.count()):
+                    if parent.tabs.tabText(i).strip().lower() == "animation":
+                        parent.tabs.setCurrentIndex(i)
+                        break
     
     def refresh_library(self):
         """Refresh the model library."""

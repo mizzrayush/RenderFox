@@ -7,7 +7,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -28,12 +28,34 @@ class ImportedAnimation:
 
 
 @dataclass(frozen=True)
+class JointInfo:
+    node_index: int
+    name: str
+    parent_index: Optional[int] = None
+    children_indices: Tuple[int, ...] = field(default_factory=tuple)
+    local_translation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    local_rotation: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    local_scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+
+@dataclass(frozen=True)
+class SkeletonInfo:
+    skin_index: int
+    name: str
+    root_node_index: Optional[int]
+    joint_indices: Tuple[int, ...]
+    joints: Tuple[JointInfo, ...]
+
+
+@dataclass(frozen=True)
 class AnimationImportReport:
     success: bool
     message: str
     skeleton_count: int = 0
     joint_count: int = 0
     clips: List[ImportedAnimation] = None
+    skeletons: Tuple[SkeletonInfo, ...] = field(default_factory=tuple)
+    nodes_data: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
 
 
 def _document_and_buffers(path: str):
@@ -123,6 +145,79 @@ def _sample(channel: AnimationChannel, seconds: float) -> Tuple[float, ...]:
     return channel.values[-1]
 
 
+def _trs_to_matrix(translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0), scale=(1.0, 1.0, 1.0)):
+    import numpy as np
+    tx, ty, tz = translation
+    qx, qy, qz, qw = rotation
+    sx, sy, sz = scale
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+    R = np.array([
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy), 0.0],
+        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx), 0.0],
+        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy), 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+    S = np.diag([sx, sy, sz, 1.0]).astype(np.float32)
+    T = np.eye(4, dtype=np.float32)
+    T[0, 3] = tx
+    T[1, 3] = ty
+    T[2, 3] = tz
+    return T @ R @ S
+
+
+def _parse_skeletons(document: dict) -> Tuple[Tuple[SkeletonInfo, ...], Tuple[Dict[str, Any], ...]]:
+    nodes = document.get('nodes') or []
+    skins = document.get('skins') or []
+    child_to_parent: Dict[int, int] = {}
+    for parent_idx, node in enumerate(nodes):
+        for child_idx in (node.get('children') or []):
+            if isinstance(child_idx, int):
+                child_to_parent[child_idx] = parent_idx
+
+    skeletons_list = []
+    for skin_index, skin in enumerate(skins):
+        skin_name = skin.get('name') or f"Skin_{skin_index + 1}"
+        joint_indices = tuple(int(j) for j in (skin.get('joints') or []) if isinstance(j, int))
+        joint_set = set(joint_indices)
+        skeleton_root = skin.get('skeleton')
+        if skeleton_root is None and joint_indices:
+            for j in joint_indices:
+                if child_to_parent.get(j) not in joint_set:
+                    skeleton_root = j
+                    break
+            if skeleton_root is None:
+                skeleton_root = joint_indices[0]
+
+        joints_list = []
+        for j_idx in joint_indices:
+            node = nodes[j_idx] if 0 <= j_idx < len(nodes) else {}
+            j_name = node.get('name') or f"Joint_{j_idx}"
+            parent_idx = child_to_parent.get(j_idx)
+            children = tuple(int(c) for c in (node.get('children') or []) if isinstance(c, int))
+            t = tuple(float(v) for v in (node.get('translation') or (0.0, 0.0, 0.0)))
+            r = tuple(float(v) for v in (node.get('rotation') or (0.0, 0.0, 0.0, 1.0)))
+            s = tuple(float(v) for v in (node.get('scale') or (1.0, 1.0, 1.0)))
+            joints_list.append(JointInfo(
+                node_index=j_idx,
+                name=j_name,
+                parent_index=parent_idx,
+                children_indices=children,
+                local_translation=t,
+                local_rotation=r,
+                local_scale=s
+            ))
+        skeletons_list.append(SkeletonInfo(
+            skin_index=skin_index,
+            name=skin_name,
+            root_node_index=skeleton_root,
+            joint_indices=joint_indices,
+            joints=tuple(joints_list)
+        ))
+    return tuple(skeletons_list), tuple(nodes)
+
+
 class AnimationImporter:
     @staticmethod
     def inspect(path: str) -> AnimationImportReport:
@@ -140,7 +235,8 @@ class AnimationImporter:
                      for index, animation in enumerate(animations)]
             if not skins and not clips:
                 return AnimationImportReport(False, 'the glTF contains no skins or animation clips')
-            return AnimationImportReport(True, f'read {len(skins)} skin(s), {joints} joint(s), and {len(clips)} animation clip(s) from the file', len(skins), joints, clips)
+            skeletons, nodes_data = _parse_skeletons(document)
+            return AnimationImportReport(True, f'read {len(skins)} skin(s), {joints} joint(s), and {len(clips)} animation clip(s) from the file', len(skins), joints, clips, skeletons, nodes_data)
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
             return AnimationImportReport(False, f'could not read glTF animation data: {error}')
 
@@ -167,7 +263,7 @@ class AnimationImporter:
                     channels.append(AnimationChannel(int(target.get('node', 0)), path_name, times, values, interpolation))
                 duration = max((channel.times[-1] for channel in channels if channel.times), default=None)
                 clips.append(ImportedAnimation(animation.get('name') or f'Animation {clip_index + 1}', len(animation.get('channels') or []), duration, tuple(channels)))
-            return AnimationImportReport(True, report.message, report.skeleton_count, report.joint_count, clips)
+            return AnimationImportReport(True, report.message, report.skeleton_count, report.joint_count, clips, report.skeletons, report.nodes_data)
         except (KeyError, OSError, ValueError, IndexError, struct.error) as error:
             return AnimationImportReport(False, f'could not load glTF animation curves: {error}')
 
@@ -177,3 +273,70 @@ class AnimationImporter:
         for channel in clip.channels:
             result.setdefault(channel.node, {})[channel.path] = _sample(channel, seconds)
         return result
+
+    @staticmethod
+    def get_bones(report: AnimationImportReport) -> List[Tuple[int, int]]:
+        """Return list of (parent_node_index, child_node_index) for all joints in the rig."""
+        bones = []
+        for skel in (report.skeletons or ()):
+            joint_set = set(skel.joint_indices)
+            for joint in skel.joints:
+                if joint.parent_index is not None and joint.parent_index in joint_set:
+                    bones.append((joint.parent_index, joint.node_index))
+        return bones
+
+    @staticmethod
+    def get_skeleton_world_positions(report: AnimationImportReport,
+                                     clip: Optional[ImportedAnimation] = None,
+                                     seconds: float = 0.0) -> Dict[int, Tuple[float, float, float]]:
+        """Compute 3D world positions of all joints in the rig for the specified frame time."""
+        import numpy as np
+        if not report.skeletons or not report.nodes_data:
+            return {}
+
+        nodes = report.nodes_data
+        animated_sample = AnimationImporter.sample(clip, seconds) if clip else {}
+
+        child_to_parent: Dict[int, int] = {}
+        for p_idx, node in enumerate(nodes):
+            for c_idx in (node.get('children') or []):
+                if isinstance(c_idx, int):
+                    child_to_parent[c_idx] = p_idx
+
+        world_matrices: Dict[int, np.ndarray] = {}
+
+        def get_world(idx: int) -> np.ndarray:
+            if idx in world_matrices:
+                return world_matrices[idx]
+            node = nodes[idx] if 0 <= idx < len(nodes) else {}
+            if idx in animated_sample:
+                anim = animated_sample[idx]
+                t = anim.get('translation', node.get('translation', (0.0, 0.0, 0.0)))
+                r = anim.get('rotation', node.get('rotation', (0.0, 0.0, 0.0, 1.0)))
+                s = anim.get('scale', node.get('scale', (1.0, 1.0, 1.0)))
+                local_m = _trs_to_matrix(t, r, s)
+            elif 'matrix' in node:
+                local_m = np.array(node['matrix'], dtype=np.float32).reshape((4, 4), order='F')
+            else:
+                t = node.get('translation', (0.0, 0.0, 0.0))
+                r = node.get('rotation', (0.0, 0.0, 0.0, 1.0))
+                s = node.get('scale', (1.0, 1.0, 1.0))
+                local_m = _trs_to_matrix(t, r, s)
+
+            parent_idx = child_to_parent.get(idx)
+            if parent_idx is not None and parent_idx != idx:
+                world_m = get_world(parent_idx) @ local_m
+            else:
+                world_m = local_m
+
+            world_matrices[idx] = world_m
+            return world_m
+
+        for skel in report.skeletons:
+            for j_idx in skel.joint_indices:
+                get_world(j_idx)
+
+        positions = {}
+        for idx, mat in world_matrices.items():
+            positions[idx] = (float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3]))
+        return positions

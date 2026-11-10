@@ -110,4 +110,34 @@ class AnimationImporterContract(unittest.TestCase):
             tab.deleteLater()
 
 
+    def test_rig_inspector_populates_bones_and_turntable_generates_keys(self):
+        app = QApplication.instance() or QApplication([])
+        tab = AnimationTab()
+        try:
+            path = os.path.join(self.work, 'test_rig.gltf')
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump({
+                    'nodes': [
+                        {'name': 'Hips', 'children': [1], 'translation': [0.0, 1.0, 0.0]},
+                        {'name': 'Spine', 'translation': [0.0, 1.5, 0.0]}
+                    ],
+                    'skins': [{'name': 'CharacterRig', 'joints': [0, 1]}]
+                }, handle)
+            with mock.patch.object(tab.viewport, 'load_model', return_value=True):
+                tab.load_model_from_path(path)
+            self.assertIsNotNone(tab.skeleton_report)
+            self.assertEqual(2, len(tab.rig_inspector.joint_items))
+            tab.rig_inspector.joint_selected.emit(1)
+            self.assertEqual(1, tab.viewport.selected_joint)
+
+            tab.generate_turntable()
+            rot_track = next((t for t in tab.clip.tracks if t.property_path == 'rotation_y'), None)
+            self.assertIsNotNone(rot_track)
+            self.assertEqual(2, len(rot_track.keyframes))
+            self.assertEqual(0.0, rot_track.keyframes[0].value)
+            self.assertEqual(360.0, rot_track.keyframes[1].value)
+        finally:
+            tab.deleteLater()
+
+
 if __name__ == '__main__': unittest.main(verbosity=2)

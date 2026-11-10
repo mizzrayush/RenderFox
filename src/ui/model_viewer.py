@@ -8,7 +8,7 @@ import numpy as np
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QCheckBox, QTextEdit)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QWheelEvent, QMouseEvent, QPixmap, QPainter, QPen, QColor, QImage
+from PyQt6.QtGui import QWheelEvent, QMouseEvent, QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont
 import trimesh
 
 from ..utils import frame_clock
@@ -240,6 +240,11 @@ class ModelViewer3D(QOpenGLWidget):
         self.show_edges = False
         self.show_hidden_edges = False
         self.show_overlays = True
+        self.show_skeleton = True
+        self.skeleton_joints = {}
+        self.skeleton_bones = []
+        self.selected_joint = None
+        self.joint_names = {}
         self.zebra_direction = 0  # 0: Horizontal, 1: Vertical
         self.zebra_scale = 1.0
         self.curvature_scale = 1.0
@@ -1512,6 +1517,45 @@ class ModelViewer3D(QOpenGLWidget):
                     painter.setPen(QPen(QColor(self.axis_colors['z']), 2))
                     painter.drawLine(*origin, *pz)
                     painter.drawText(pz[0], pz[1], "Z")
+
+                # Skeleton & Rig bone hierarchy overlay
+                if getattr(self, 'show_skeleton', True) and getattr(self, 'skeleton_joints', None):
+                    screen_pts = {}
+                    for j_idx, pt3 in self.skeleton_joints.items():
+                        screen_pos = project(pt3)
+                        if screen_pos:
+                            screen_pts[j_idx] = screen_pos
+
+                    # Draw bone connections
+                    bone_pen = QPen(QColor(0, 229, 255, 180), 2)
+                    painter.setPen(bone_pen)
+                    for p_idx, c_idx in getattr(self, 'skeleton_bones', []):
+                        if p_idx in screen_pts and c_idx in screen_pts:
+                            p_pt = screen_pts[p_idx]
+                            c_pt = screen_pts[c_idx]
+                            painter.drawLine(p_pt[0], p_pt[1], c_pt[0], c_pt[1])
+
+                    # Draw joint markers
+                    joint_pen = QPen(QColor(0, 200, 255), 1)
+                    joint_brush = QBrush(QColor(0, 229, 255, 220))
+                    selected_pen = QPen(QColor(255, 64, 129), 2)
+                    selected_brush = QBrush(QColor(255, 64, 129, 240))
+                    font = QFont("Segoe UI", 9)
+                    font.setBold(True)
+                    painter.setFont(font)
+
+                    for j_idx, pt in screen_pts.items():
+                        if j_idx == getattr(self, 'selected_joint', None):
+                            painter.setPen(selected_pen)
+                            painter.setBrush(selected_brush)
+                            painter.drawEllipse(pt[0] - 5, pt[1] - 5, 10, 10)
+                            label = self.joint_names.get(j_idx, f"Joint {j_idx}")
+                            painter.setPen(QColor(255, 255, 255))
+                            painter.drawText(pt[0] + 8, pt[1] + 4, label)
+                        else:
+                            painter.setPen(joint_pen)
+                            painter.setBrush(joint_brush)
+                            painter.drawEllipse(pt[0] - 3, pt[1] - 3, 6, 6)
                     
                 painter.end()
             except Exception as e:
@@ -1851,6 +1895,27 @@ class ModelViewer3D(QOpenGLWidget):
     def set_show_overlays(self, show: bool):
         """Toggle the drawn-over UI: the axis labels beside the model."""
         self.show_overlays = bool(show)
+
+    def set_skeleton(self, joints, bones, active_joint=None, names=None):
+        """Set skeletal bone hierarchy and joint positions for viewport overlay."""
+        self.skeleton_joints = dict(joints or {})
+        self.skeleton_bones = list(bones or [])
+        self.selected_joint = active_joint
+        self.joint_names = dict(names or {})
+        self.update()
+
+    def clear_skeleton(self):
+        """Clear active skeleton overlay."""
+        self.skeleton_joints = {}
+        self.skeleton_bones = []
+        self.selected_joint = None
+        self.joint_names = {}
+        self.update()
+
+    def set_show_skeleton(self, show: bool):
+        """Toggle skeletal overlay display."""
+        self.show_skeleton = bool(show)
+        self.update()
         self.update()
 
     def reset_view(self):
