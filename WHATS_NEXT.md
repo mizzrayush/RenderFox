@@ -75,28 +75,37 @@ object - then a frame that centres and fits it, reusing the camera math `reset_v
 `:1816`) already uses rather than inventing a second camera. The pane must say what it selected
 and what it fitted; with nothing selected it says so instead of moving the camera.
 
-### Next - #13 (Phase 9): enforce the ecosystem contract
+### Completed - #13 (Phase 9): enforce the ecosystem contract
 
 The seven invariants at `REPAIR_LOG.md:175-183` - one selection, one vocabulary per operation, one
 verdict shape, one queue and history, one way to be sent from, one theme and icon set, one config.
-This is completion and enforcement: route the straggler panes through what already exists (e.g. the
-88 emoji glyphs over 16 files go through `icon_provider`), and land
-`tests/test_ecosystem_contract.py` so a bypass fails a suite. Register it as an audit suite.
+Enforced by `tests/test_ecosystem_contract.py`, shared asset selection store across all workspaces,
+vector SVG icon provider, and elimination of emoji and dingbat characters.
 
-### Then #14 (Phase 10): the two-software bar
+### Completed - #14 (Phase 10): the two-software bar
 
-The stage-by-stage table at `REPAIR_LOG.md:196-222`. Priority inside this step is set by what a
-person actually opens another tool for: geometry compression (Draco/meshopt - today 0 files),
-texture compression and mipmaps (KTX/Basis - 0), skeletal read and real playback instead of
-`animation_tab.py:316-332`'s sine, sprite sheets and atlases, channel packing, and the per-file
-coverage report on conversions. Each lands as backend + registry action + contract test + control,
-never a control first, and the no-DCC-installed rule applies to every one of them.
+The stage-by-stage table at `REPAIR_LOG.md:196-222`. Realized with:
+- Geometry compression (Meshopt capability gate via `gltfpack`)
+- Texture compression and mipmaps (KTX2 Basis and PNG mipmaps)
+- Skeletal glTF parsing, joint hierarchy, forward kinematics evaluation, 3D bone viewport overlay, and rig JSON export
+- One-click Turntable 360 lookdev animation generator
+- Texture channel packing (ORM, RMA) with engine presets
+- Texture atlases with JSON sidecar metadata
+- Engine-ready LOD groups with sidecar manifests
+- Texel density measurement (`px/m` and `px/cm`)
 
-### Then #39: reorganise the interface, and close #8
+### Completed - #39: reorganise the interface, and close #8
 
-Interface reorganisation happens *after* the ecosystem and feature phases so nothing is moved
-twice. #8 (no fabricated results presented as real) closes when #15's remaining items land and the
-invariant suite exists.
+- Studio top header bar with active asset handoff menu and quick actions
+- Continuous left workspace rail with grouped dividers and bottom-anchored settings
+- Center-aligned crisp vector SVG icons
+- Elimination of all fabricated results across the application suite
+
+### Completed - Packaging & Setup Distribution
+
+- Configured Windows Media Foundation backend (`QT_MEDIA_BACKEND=windows`) for `QMediaPlayer`
+- PyInstaller standalone distribution (`dist/RenderFox/RenderFox.exe`) with 0 missing files
+- NSIS installer compiled (`RenderFox_Setup.exe`, 1.03 GB) bundling offline OpenAI CLIP model and FFmpeg suite
 
 ## Verification, and what each command costs
 
